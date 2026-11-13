@@ -1,0 +1,11 @@
+# Chrome profiles (sesione, cookies, kredenciale personale)
+.profiles/
+
+# Dependencies
+node_modules/
+mcp/node_modules/
+
+# Logs & temp files
+*.log
+.DS_Store
+Thumbs.db

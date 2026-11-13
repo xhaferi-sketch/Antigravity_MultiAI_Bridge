@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "multi-ai-relay": {
+      "command": "node",
+      "args": [
+        "C:\\Vladi_project\\Antigravity_MultiAI_Bridge\\mcp\\server.js"
+      ]
+    }
+  }
+}

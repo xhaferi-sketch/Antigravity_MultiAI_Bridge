@@ -1,0 +1,6 @@
+{
+  "name": "multi-ai-orchestrator-bridge",
+  "displayName": "Multi-AI Orchestrator Bridge (5-Tab Zero-Token)",
+  "version": "3.2.0",
+  "description": "5-Tab Pool (2x M365 + 3x Gemini Pro Thinking) me Dashboard 127.0.0.1:4321 dhe 0-Token Node.js Executor."
+}

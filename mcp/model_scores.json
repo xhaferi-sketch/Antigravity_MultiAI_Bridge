@@ -1,0 +1,36 @@
+{
+  "positiveWeights": {
+    "think deeper": 160,
+    "6.sol": 150,
+    "5.6": 135,
+    "3.1 pro": 145,
+    "2.5 pro": 130,
+    "sol": 115,
+    "thinking": 110,
+    "high": 90,
+    "reasoning": 85,
+    "pro": 80
+  },
+  "negativeWeights": {
+    "deep research": -600,
+    "research": -300,
+    "auto": -250,
+    "quick response": -250,
+    "quick": -200,
+    "flash": -250,
+    "fast": -200,
+    "lite": -250,
+    "mini": -200,
+    "everyday": -150,
+    "standard": -50,
+    "upgrade": -500,
+    "locked": -500
+  },
+  "disqualifySelectors": [
+    "[disabled]",
+    "[aria-disabled='true']",
+    ".is-disabled",
+    ".mat-mdc-menu-item-disabled"
+  ],
+  "minimumAcceptableScore": 75
+}

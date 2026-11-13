@@ -1,0 +1,10 @@
+{
+  "name": "multi-ai-orchestrator-mcp",
+  "version": "3.2.0",
+  "private": true,
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.1",
+    "adm-zip": "^0.5.16",
+    "playwright": "^1.49.0"
+  }
+}
