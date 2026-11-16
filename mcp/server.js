@@ -1103,6 +1103,13 @@ instruction: 'Puna po vazhdon normalisht ne sfond. Thirr MENJEHERE mjetin check_
 async function executeCoreAction(action, payload) {
 const projectRoot = payload.projectRoot;
 const cleanRoot = path.resolve(projectRoot);
+
+// SHTYLLA 1: BLLOKADE FIZIKE ME KOD (CYCLE_EXCLUSIVE_LOCK)
+if (action !== 'run_full_cycle' && action !== 'check_cycle_progress') {
+  if (activeCycleJobs[cleanRoot] && activeCycleJobs[cleanRoot].running) {
+    throw new Error('ACTION_REJECTED_CYCLE_IN_PROGRESS: Cikli autopilot eshte aktiv per [' + cleanRoot + '] ne fazen [' + activeCycleJobs[cleanRoot].phase + ']. Ndalohet kategorikisht thirrja e mjeteve anesore! Thirr vetem check_cycle_progress(projectRoot).');
+  }
+}
 if (action === 'run_full_cycle') {
 if (!activeCycleJobs[cleanRoot] || !activeCycleJobs[cleanRoot].running) {
 runAutonomousPipeline(cleanRoot, payload.userRequest || '');
