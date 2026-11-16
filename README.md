@@ -81,3 +81,16 @@ python tests/hermes_bridge/scripts/test_failover_resilience.py
 python tests/hermes_bridge/scripts/test_service_refusal_catch.py
 ```
 Raportet fizike të çdo testi regjistrohen automatikisht në `tests/hermes_bridge/reports/report_<test_name>_<timestamp>.json`.
+
+---
+
+## 6. Auditimi i Integritetit dhe Statusi i Rregullimeve të Siguruara (V3.3 Milestone)
+
+Të gjitha rregullimet themelore janë testuar, integruar dhe verifikuar:
+1. **Model Lock Elitar (Score $\ge 800$):** Vetëm `Code & analysis` dhe `4 Argon` / `Thinking`. Refuzim i menjëhershëm me gabim kritik për Flash/Lite/Auto/Default pa fallback të fshehur.
+2. **Copilot Smart Attachment:** Skedarët e mëdhenj të specifikimeve (>25k karaktere) bashkëngjiten si skedarë fizikë në `exchange/spec_*.md`, duke eliminuar shkurtimin me `[COMPACTED]`.
+3. **Transparenca në Dashboard:** `/api/state` dhe `dashboard.html` pasqyrojnë listën reale të modeleve të zbuluara në ueb (`discoveredModels`).
+4. **Universal Workspace Packing:** Mbrojtje e plotë me `try/catch` dhe përjashtim i profileve/cache-it për të eliminuar përplasjet e lejeve `EPERM` në Windows.
+5. **Autopilot Deadlock Resolution:** Ekzekutimi i hapave të brendshëm me `{ _internal: true }` për të parandaluar vetë-bllokimin ndaj `CYCLE_EXCLUSIVE_LOCK`.
+6. **External Spec Files Ingestion:** Lexim dhe injektim i plotë i skedarëve të jashtëm të specifikimeve (si `agjent marketingu shitjesh free.txt`) te Planner dhe Coder.
+

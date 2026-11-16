@@ -199,3 +199,32 @@ python tests/hermes_bridge/scripts/test_service_refusal_catch.py
 Raportet fizike të suksesshme ruhen automatikisht në:
 `tests/hermes_bridge/reports/report_<test_name>_<timestamp>.json`
 
+---
+
+## 10. Auditimi i Integritetit dhe Rregullimet e Siguruara (Versioni 3.3 Milestone)
+
+Të gjitha rregullimet themelore janë testuar dhe verifikuar fizikisht në kod:
+
+1. **Pragu i Modelit Elitar (Score $\ge 800$):**
+   - Vetëm `Code & analysis`, `4 Argon`, `Thinking`, `Think Deeper` lejohen për ekzekutim.
+   - Çdo tentativë për kalim në `Flash`, `Lite`, `Auto`, `Default` refuzohet menjëherë me gabim kritik (`CRITICAL_MODEL_LOCK_REJECTED`).
+   - U hoq çdo `.catch` i fshehur; nuk lejohet asnjë rënie e heshtur në modele të dobëta.
+
+2. **Smart Attachment për Copilot (Eliminimi i `[COMPACTED]`):**
+   - Kur motori është Copilot (`!isGemini`) dhe kërkesa përmban specifikime mbi 25,000 karaktere, ato ruhen automatikisht si skedar fizik në `.antigravity/bridge/exchange/spec_<name>.md`.
+   - Skedari i bashkëngjitet fletës si attachment fizik përmes `attachFilesSafely`, ndërsa teksti i promptit mbetet i shkurtër pa u prerë me `[COMPACTED]`.
+
+3. **Transparenca e Zbulimit të Modeleve në Dashboard:**
+   - Endpoint-i `/api/state` dhe paneli grafik në portën 4321 shfaqin në kohë reale fushën `Modelet në ueb: <lista>` për çdo fletë aktive.
+
+4. **Universal Workspace Packing & Mbrojtja nga `EPERM`:**
+   - Paketuesi i projektit përjashton automatikisht të gjitha dosjet e profileve dhe cache-it të shfletuesve (`Default`, `GPUCache`, `IndexedDB`, `Local State`, `.profiles`, etj.).
+   - Çdo operacion në disk mbrohet me `try/catch` për të parandaluar ndërprerjen e serverit nga lejet e Windows.
+
+5. **Zgjidhja e Deadlock-ut në Autopilot:**
+   - Fazat e brendshme të tubacionit autonom thërriten me `{ _internal: true }`, duke eliminuar vetë-bllokimin ndaj `CYCLE_EXCLUSIVE_LOCK`.
+
+6. **Inxhinimi i Dokumenteve të Jashtme të Specifikimeve:**
+   - Funksioni `resolveAndEmbedExternalFiles` zbulon dhe lexon automatikisht skedarët e mëdhenj të specifikimeve nga disku i PC dhe i injekton të plota te Planner-i dhe Coder-i.
+
+
