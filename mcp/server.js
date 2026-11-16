@@ -242,8 +242,23 @@ async function ensureMaxReasoningMode(targetFrame, tabKey) {
     }
     closeMenus();
     await new Promise(function(r) { setTimeout(r, 250); });
+    const curScore = scoreText(curCombined, null);
+    if (curScore < cfg.minimumAcceptableScore) {
+      return { error: 'HIGH_REASONING_UNAVAILABLE', current: curDisplay, score: curScore };
+    }
     return curDisplay || 'Active';
-  }, { cfg: scoresConfig, isGemini: tabKey.startsWith('gemini') }).catch(function() { return 'Auto'; });
+  }, { cfg: scoresConfig, isGemini: tabKey.startsWith('gemini') }).catch(function(err) {
+    return { error: 'HIGH_REASONING_ERROR', message: err.message };
+  });
+
+  if (selectedLabel && typeof selectedLabel === 'object' && selectedLabel.error) {
+    const detail = selectedLabel.current ? ('Modeli ' + selectedLabel.current + ' ka pike nen ' + scoresConfig.minimumAcceptableScore + ' (' + selectedLabel.score + ')') : selectedLabel.message;
+    throw new Error('HIGH_REASONING_UNAVAILABLE ne [' + tabKey + ']: ' + detail + '. Ndalohet kategorikisht kalimi ne Auto/Flash/Lite.');
+  }
+  const lowSel = String(selectedLabel || '').toLowerCase();
+  if (!selectedLabel || lowSel.includes('flash') || lowSel.includes('auto') || lowSel.includes('lite') || lowSel.includes('fast')) {
+    throw new Error('HIGH_REASONING_UNAVAILABLE ne [' + tabKey + ']: Modeli aktiv (' + selectedLabel + ') eshte nivel i ulet/ekonomik. Ndalohet kalimi ne Auto/Flash.');
+  }
 
   tabActiveModel[tabKey] = selectedLabel;
   return selectedLabel;
@@ -306,7 +321,22 @@ const SERVICE_ERROR_PATTERNS = [
   'oops! something happened',
   "looks like i can't chat about this",
   "let's try a different topic",
-  'i prefer not to continue this conversation'
+  'i prefer not to continue this conversation',
+  'having a hard time fulfilling your request',
+  'i encountered an error',
+  "can't help with that",
+  'something went wrong',
+  'limit reached',
+  'reached your limit',
+  'quota exceeded',
+  'resets nov',
+  'resets dec',
+  'resets jan',
+  'resets in',
+  'resets at',
+  'try again later',
+  'upgrade to advanced',
+  'unlock 4 carbon'
 ];
 
 async function attachFilesSafely(page, targetFrame, tabKey, projectRoot, validFiles) {
@@ -489,13 +519,14 @@ async function waitAndExtractCleanResponse(page, targetFrame, tabKey, projectRoo
     }
 
     if (!state.generating && state.hasNewTurn && state.text.length > 0) {
+      const lowCheck = state.text.toLowerCase();
+      if (SERVICE_ERROR_PATTERNS.some(function(p) { return lowCheck.includes(p); })) {
+        await captureSupportEvidence(page, projectRoot, tabKey, 'QUOTA_OR_SERVICE_REFUSAL', state.text.slice(0, 150));
+        throw new Error('QUOTA_OR_SERVICE_REFUSAL ne [' + tabKey + ']: ' + state.text.slice(0, 150));
+      }
       if (state.text === lastText) {
         stableTicks++;
         if (stableTicks >= 4) {
-          const low = state.text.toLowerCase();
-          if (state.text.length < 240 && SERVICE_ERROR_PATTERNS.some(function(p) { return low.includes(p); })) {
-            throw new Error('WEB_SERVICE_REFUSAL ne [' + tabKey + ']: ' + state.text.slice(0, 120));
-          }
           return state.text;
         }
       } else {
@@ -1104,7 +1135,11 @@ projectRoot: cleanRoot,
 promptText: prompt,
 attachmentPaths: [bundle.path]
 });
-if (!response || response.trim().length < 20) throw new Error('PLANNER_EMPTY_OUTPUT nga [' + engine + '].');
+const lowPlan = (response || '').toLowerCase();
+const isPlanRefusal = SERVICE_ERROR_PATTERNS.some(function(p) { return lowPlan.includes(p); });
+if (!response || response.trim().length < 100 || isPlanRefusal) {
+  throw new Error('PLANNER_INVALID_OR_REFUSED_OUTPUT nga [' + engine + ']: Plani u refuzua ose eshte teper i shkurter (' + (response || '').slice(0, 120).trim() + ').');
+}
 fs.writeFileSync(planPath, response, 'utf8');
 writeProjectState(cleanRoot, { phase: 'PLANNED', retryCount: 0, lastStatus: 'PLAN_READY' });
 return { status: 'EXTERNAL_COMPLETED', engine: engine, activeModel: tabActiveModel[engine], outputFile: planPath };
@@ -1132,6 +1167,11 @@ projectRoot: cleanRoot,
 promptText: rule + extraPrompt,
 attachmentPaths: [bundle.path]
 });
+const lowCode = (response || '').toLowerCase();
+const isCodeRefusal = SERVICE_ERROR_PATTERNS.some(function(p) { return lowCode.includes(p); });
+if (!response || response.trim().length < 60 || isCodeRefusal) {
+  throw new Error('CODER_INVALID_OR_REFUSED_OUTPUT nga [' + engine + ']: Kodi u refuzua ose eshte teper i shkurter (' + (response || '').slice(0, 120).trim() + ').');
+}
 const validation = validateGeneratedCodeMarkdown(response);
 if (!validation.valid) {
 response = await dispatchToWebTab({

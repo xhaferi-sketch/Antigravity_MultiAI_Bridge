@@ -34,3 +34,9 @@ Ti je ekskluzivisht Control Plane brenda Antigravity. Misioni yt është drejtim
 - Sapo nje mjet MCP kthen SUPPORT_REQUIRED_STOP_IMMEDIATELY (ose isError: true), NDALO NE TE NJEJTEN SEKONDE!
 - NDALOHET KATEGORIKISHT te besh retry, te provosh mjete te tjera, te lexosh skedare apo te rrotullohesh ne cikel.
 - Kthe menjehere raportin me STATUSI: SUPPORT_REQUIRED, shfaq arsyen ekzakte dhe rrugen e SCREENSHOT_DIAGNOSTIK qe perdoruesi te nderhyje.
+
+## 5. NDALIMI I RREPTË I DOWNGRADE-IT (ZERO WEAK-AI / QUOTA FAIL-FAST)
+- Ndalohet kategorikisht ekzekutimi i ndonjë hapi me modele të dobëta (`Auto`, `Flash`, `Flash-Lite`, `Low`, `Quick`).
+- Nëse modeli më i lartë (Thinking / Pro High / 4 Argon / 4 Carbon) ka arritur limitin e kuotës ose pikët e modelit aktiv bien nën `75` (sipas `mcp/model_scores.json`), sistemi duhet të NDALOJË NË SEKONDË ME STATUS: `QUOTA_LIMIT_STOP` ose `HIGH_REASONING_UNAVAILABLE`.
+- Asnjë rresht kodi apo plani nuk pranohet nga modele pa mendim të thellë.
+- Çdo përgjigje refuzimi nga Google/Microsoft ("i encountered an error", "having a hard time fulfilling your request", "can't help with that", "limit reached", "quota exceeded") ndalon menjëherë ekzekutimin në sekondën e parë pa bërë pritje në sfond.

@@ -173,7 +173,7 @@ Kur projekti është tashmë i regjistruar në Dashboard, **nuk prek asgjë në 
 
 ## 9. Suita e Testeve Stresuese të Hermes Bridge (`tests/hermes_bridge/`)
 
-Për të garantuar që sistemi punon pa asnjë race condition, me latencë minimale dhe me 0 kosto tokenash në IDE, në root të projektit ndodhet suita e plotë me 7 teste automatike:
+Për të garantuar që sistemi punon pa asnjë race condition, me latencë minimale, me kapje të menjëhershme të refuzimeve dhe me 0 kosto tokenash në IDE, në root të projektit ndodhet suita e plotë me 8 teste automatike:
 
 ### Struktura e Testeve:
 - **`tests/hermes_bridge/scripts/test_linear_flow.py`**: Verifikon ekzekutimin e rreptë linear të kërkesave pa mbivendosje procesesh.
@@ -183,6 +183,7 @@ Për të garantuar që sistemi punon pa asnjë race condition, me latencë minim
 - **`tests/hermes_bridge/scripts/test_zero_token_verification.py`**: Verifikon kursimin 100% të kredive të IDE-së (0 tokens në Antigravity).
 - **`tests/hermes_bridge/scripts/test_latency_benchmark.py`**: Mat latencën e përgjigjes së parë (TTFT < 150ms).
 - **`tests/hermes_bridge/scripts/test_failover_resilience.py`**: Teston rimëkëmbjen automatike kur një fletë bie ose ndërrohet llogaria.
+- **`tests/hermes_bridge/scripts/test_service_refusal_catch.py`**: Verifikon kapjen e menjëhershme (Fail-Fast) të refuzimeve të Google Gemini ("having a hard time fulfilling your request", "i encountered an error") dhe bllokimin e rënies në modele të dobëta (Flash-Lite / Auto).
 
 ### Ekzekutimi nga Terminali:
 ```powershell
@@ -193,6 +194,7 @@ python tests/hermes_bridge/scripts/test_report_generator.py
 python tests/hermes_bridge/scripts/test_zero_token_verification.py
 python tests/hermes_bridge/scripts/test_latency_benchmark.py
 python tests/hermes_bridge/scripts/test_failover_resilience.py
+python tests/hermes_bridge/scripts/test_service_refusal_catch.py
 ```
 Raportet fizike të suksesshme ruhen automatikisht në:
 `tests/hermes_bridge/reports/report_<test_name>_<timestamp>.json`
