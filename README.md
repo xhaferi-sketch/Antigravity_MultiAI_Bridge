@@ -22,17 +22,29 @@
 
 ---
 
-## 2. Te 5 Mjetet MCP te Serverit `multi-ai-relay`
+## 2. Te 7 Mjetet MCP te Serverit `multi-ai-relay` (Autopilot 25s & Zero-Token)
 
-1. **`pack_workspace(projectRoot, mode)`**: Paketon projektin (`FULL` ose `DELTA` me Git) me rruge `/` ne `.antigravity/bridge/exchange/project_bundle.txt` (ose `.zip.md` me SHA-256 per M365).
-2. **`run_planner(projectRoot, userRequest)`**: Dergon paketen te fleta e Planner-it ne modalitetin Thinking/Think Deeper dhe ruan `exchange/plan.md`.
-3. **`run_coder(projectRoot, mode)`**: Gjeneron kodin 100% te plote ne `exchange/code.md` (`IMPLEMENT` ose `FIX_ERROR`) me kontroll automatik kunder placeholder-ave (`TODO`, `... rest of code`).
-4. **`apply_and_test(projectRoot)`**: **0-Token Node.js Executor** — zberthen blloqet `### FILE: path/to/file.ext`, kontrollon path-traversal, shkruan skedaret ne disk dhe ekzekuton `buildCmd` + `testCmd`. Ne deshtim ruan log-un e kompresuar (10k head + 10k tail) te `last_error.txt`.
-5. **`run_reviewer(projectRoot)`**: **Release Gate** — krahason `plan.md` + `code.md` + `build_test.log` dhe kthen `PASSED` ose `CHANGES_REQUIRED`.
+1. **`run_full_cycle(projectRoot, userRequest)`**: **Mjeti Kryesor Autopilot** — nis në Node.js të gjithë ciklin (`pack` -> `planner` -> `coder` -> `apply_and_test` -> `reviewer`) pa djegur asnjë kredi AI në IDE. Kthen rezultatin ose `STILL_RUNNING_CALL_CHECK_PROGRESS` pas 25 sekondash për të evituar timeout-in e Antigravity-t.
+2. **`check_cycle_progress(projectRoot)`**: Monitoron dhe pret në blloqe adaptive 25-sekondëshe derisa cikli autonom të përfundojë plotësisht me `CYCLE_COMPLETED`.
+3. **`pack_workspace(projectRoot, mode)`**: Paketon projektin (`FULL` ose `DELTA` me Git) në `.antigravity/bridge/exchange/project_bundle.txt` (për Gemini) ose `.zip.md` (me SHA-256 për M365 Copilot).
+4. **`run_planner(projectRoot, userRequest)`**: Dërgon paketën te fleta e zgjedhur e Planner-it në modalitetin Thinking/Think Deeper dhe ruan `exchange/plan.md`.
+5. **`run_coder(projectRoot, mode)`**: Gjeneron kodin 100% të plotë në `exchange/code.md` (`IMPLEMENT`, `FIX_ERROR`, ose `REVIEW_FIX`) me kontroll të rreptë anti-placeholder (`TODO`, `... rest of code`).
+6. **`apply_and_test(projectRoot)`**: **0-Token Node.js Deterministic Executor** — zbërthen blloqet `### FILE: path/to/file.ext`, kontrollon path-traversal, shkruan skedarët në disk dhe ekzekuton `buildCmd` + `testCmd`. Në dështim ruan log-un e kompresuar (10k fillim + 10k fund) te `last_error.txt`.
+7. **`run_reviewer(projectRoot)`**: **Release Gate** — krahason `plan.md` + `code.md` + `build_test.log` dhe kthen verdiktin `PASSED` ose `CHANGES_REQUIRED`. Në rast suksesi (`PASSED`), ekzekuton menjëherë **Auto-Purge** mbi mbetjet e rënda të shkëmbimit.
 
 ---
 
-## 3. Verifikimi Sintaksor pas cdo Modifikimi ne `server.js`
+## 3. Menaxhimi i Projekteve në Dashboard (`http://127.0.0.1:4321`)
+
+Paneli grafik në portën 4321 përmban veçori të avancuara të menaxhimit:
+- **🗑️ Fshi Projektin (`DELETE /api/delete-project`):** Fshin regjistrimin e projektit nga lista e Dashboard-it me dialog konfirmimi të sigurt (pa prekur asnjë skedar të projektit në disk).
+- **🧹 Pastro Mbetjet e Shkëmbimit (`POST /api/purge-exchange`):** Fshin menjëherë skedarët e rëndë të përkohshëm (`project_bundle.txt`, `.zip.md`, `last_error.txt`, screenshots) për të mbajtur diskun të pastër.
+- **Auto-Purge Automatike:** Sapo Reviewer-i jep verdiktin `STATUS: PASSED`, serveri pastron automatikisht skedarët e shkëmbimit pa kërkuar ndërhyrje me dorë.
+- **Zgjedhja e Formatit të Paketimit (`bundleFormat`):** Mundësi zgjedhjeje mes `project_bundle.txt` (për Gemini) dhe `project_bundle.zip.md` (për M365 Copilot).
+
+---
+
+## 4. Verifikimi Sintaksor pas cdo Modifikimi ne `server.js`
 
 ```cmd
 node --check "C:\Vladi_project\Antigravity_MultiAI_Bridge\mcp\server.js"
@@ -40,7 +52,7 @@ node --check "C:\Vladi_project\Antigravity_MultiAI_Bridge\mcp\server.js"
 
 ---
 
-## 4. Ekzekutimi i Testeve Stresuese të Hermes Bridge (Suita Universale)
+## 5. Ekzekutimi i Testeve Stresuese të Hermes Bridge (Suita Universale)
 
 Kjo suitë testimi ndodhet në root të projektit dhe përdoret për të verifikuar në mënyrë 100% lineare qëndrueshmërinë, mungesën e race conditions, transferimin e attachments, gjenerimin e patch-eve dhe përdorimin e veglave (plugins).
 

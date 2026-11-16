@@ -35,16 +35,22 @@ Ky manual permban cdo detaj per **perdorimin e perditshem**, **strukturen e sked
      - **Planner:** p.sh. `gemini1` ose `web1` (analizon kodin, gjen Root Cause dhe cakton `ALLOWED_FILES`).
      - **Coder:** p.sh. `gemini2` ose `web2` (shkruan kodin e plote te prodhimit me etiketen `### FILE:`).
      - **Reviewer (Release Gate):** p.sh. `gemini3` ose `web1` (auditon kodin + log-et dhe jep `STATUS: PASSED`), ose `Off` per ndryshime shume te vogla.
-   - **Paketimi:** Zgjidh `project_bundle.txt` per shumicen e rasteve, ose `project_bundle.zip.md` per projekte te medha kur perdor M365 Copilot (`web1` / `web2`).
-   - **Komandat Build dhe Test (0-Token):** Vendos komandat e projektit (p.sh. `npm run build` dhe `npm test`, ose `pytest`) dhe kliko **Ruaj Konfigurimin**.
-3. **Ekzekuto ne Chat-in e Antigravity:**
+3. **Rregullat e Paketimit dhe Formatet (`bundleFormat`):**
+   - **`project_bundle.txt` (Për Gemini):** Skedarët bashkohen në një bllok të vetëm teksti me etiketa `--- FILE: rruga ---` dhe injektohen direkt me tastierë në kutinë e chat-it. Kjo bëhet sepse kur përdoruesi çaktivizon *Gemini Apps Activity = OFF* për privatësi, Google bllokon butonin fizik `+` të ngarkimit. Injektimi i tekstit është 100% imun dhe ka 0 sekonda vonesë ngarkimi.
+   - **`project_bundle.zip.md` (Për M365 Copilot):** Copilot ka kufi të ngurtë në shkrim (~29,500 karaktere) dhe bllokon skedarët me prapashtesë `.zip`. Ura krijon arkiv real `.zip`, e riemërton në `.zip.md` me SHA-256 dhe e ngarkon si dokument Markdown të lejuar nga Microsoft-i.
+4. **Butonat e Menaxhimit te Karta e Projektit:**
+   - **🗑️ Fshi Projektin:** Heq regjistrimin e projektit nga Dashboard-i (pa prekur asnjë skedar të projektit në disk).
+   - **🧹 Pastro Mbetjet e Shkëmbimit:** Pastron menjëherë skedarët e rëndë të paketimit dhe log-eve nga `.antigravity/bridge/exchange/`.
+   - **💾 Ruaj Konfigurimin:** Ruan rolet, formatin e paketimit dhe komandat Build/Test.
+5. **Ekzekuto ne Chat-in e Antigravity:**
    - Shkruaj: `/run-cycle <pershkruaj qarte detyren ose funksionin qe do te shtosh/rregullosh>`.
-4. **Cfare Ndodh Vete pas Kuintave (Zero Kredi IDE):**
+6. **Cfare Ndodh Vete pas Kuintave (Zero Kredi IDE & Autopilot 25s):**
    - `pack_workspace` -> krijon paketen e paster te kodit me rruge `/`.
    - `run_planner` -> zgjedh modelin me me shume pike ne Headless dhe ruan `exchange/plan.md`.
    - `run_coder` -> gjeneron skedaret e plote ne `exchange/code.md` (dhe refuzon automatikisht cdo shkurtim `TODO` ose `... rest of code`).
    - `apply_and_test` -> Node.js shkruan skedaret direkt ne disk me **0 tokena AI** dhe ekzekuton Build/Test. Nese del gabim ne terminal, kryen vete deri ne **2 cikle Auto-Heal (`FIX_ERROR`)**.
    - `run_reviewer` -> kontrollon planin + kodin + `build_test.log` dhe mbyll fazen vetem me `STATUS: PASSED`.
+   - **Auto-Purge Automatike:** Sapo arrihet verdikti `STATUS: PASSED`, serveri pastron automatikisht skedarët e rëndë nga `exchange/` (`project_bundle.txt`, `.zip.md`, `last_error.txt`, screenshots) duke lënë projektin 100% të pastër.
 
 ---
 
@@ -162,4 +168,32 @@ Kur projekti është tashmë i regjistruar në Dashboard, **nuk prek asgjë në 
 ### Skenari D: Kur Cikli Ndalet (`BLOCKED` ose `MAX_RETRIES_EXCEEDED`)
 - **Nëse del `AUTH_EXPIRED`:** Hap `http://localhost:4321`, kliko **Login** për atë llogari, prit të hapet chat-i, mbylle me `X`, dhe shkruaj në Antigravity: `Vazhdo ciklin nga hapi ku mbeti.`
 - **Nëse del `MAX_RETRIES_EXCEEDED` (pas 2 dështimeve në Build/Test):** Hap skedarin `<Projekti>/.antigravity/bridge/exchange/last_error.txt` për të parë gabimin e terminalit, ose ndërro motorin e `Coder`-it në Dashboard (p.sh. nga `gemini2` në `web2`), kliko **Ruaj Konfigurimin** dhe nis një kërkesë të re.
+
+---
+
+## 9. Suita e Testeve Stresuese të Hermes Bridge (`tests/hermes_bridge/`)
+
+Për të garantuar që sistemi punon pa asnjë race condition, me latencë minimale dhe me 0 kosto tokenash në IDE, në root të projektit ndodhet suita e plotë me 7 teste automatike:
+
+### Struktura e Testeve:
+- **`tests/hermes_bridge/scripts/test_linear_flow.py`**: Verifikon ekzekutimin e rreptë linear të kërkesave pa mbivendosje procesesh.
+- **`tests/hermes_bridge/scripts/test_attachments_patch.py`**: Verifikon bashkëngjitjet dhe aplikimin e saktë të file diff `.patch`.
+- **`tests/hermes_bridge/scripts/test_plugin_usage.py`**: Verifikon thirrjet e mjeteve MCP dhe integrimin në output.
+- **`tests/hermes_bridge/scripts/test_report_generator.py`**: Verifikon prodhimin fizik të raporteve JSON në disk.
+- **`tests/hermes_bridge/scripts/test_zero_token_verification.py`**: Verifikon kursimin 100% të kredive të IDE-së (0 tokens në Antigravity).
+- **`tests/hermes_bridge/scripts/test_latency_benchmark.py`**: Mat latencën e përgjigjes së parë (TTFT < 150ms).
+- **`tests/hermes_bridge/scripts/test_failover_resilience.py`**: Teston rimëkëmbjen automatike kur një fletë bie ose ndërrohet llogaria.
+
+### Ekzekutimi nga Terminali:
+```powershell
+python tests/hermes_bridge/scripts/test_linear_flow.py
+python tests/hermes_bridge/scripts/test_attachments_patch.py
+python tests/hermes_bridge/scripts/test_plugin_usage.py
+python tests/hermes_bridge/scripts/test_report_generator.py
+python tests/hermes_bridge/scripts/test_zero_token_verification.py
+python tests/hermes_bridge/scripts/test_latency_benchmark.py
+python tests/hermes_bridge/scripts/test_failover_resilience.py
+```
+Raportet fizike të suksesshme ruhen automatikisht në:
+`tests/hermes_bridge/reports/report_<test_name>_<timestamp>.json`
 
