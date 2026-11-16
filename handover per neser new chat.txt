@@ -1,0 +1,38 @@
+# HANDOVER TEKNIK — ANTIGRAVITY MULTI-AI ORCHESTRATOR BRIDGE (V3.2)
+
+## 1. KU JEMI (GJENDJA AKTUALE E PROJEKTIT)
+- **Folderi kryesor (Source of Truth):** `C:\Vladi_project\Antigravity_MultiAI_Bridge`
+- **Lidhja me Google Antigravity:**
+  - Plugin Junction: `%USERPROFILE%\.gemini\config\plugins\multi-ai-orchestrator-bridge` -> lidhur me folderin kryesor.
+  - Auto-Start MCP: `%USERPROFILE%\.gemini\config\mcp_config.json` -> serveri **`multi-ai-relay`** ndizet automatikisht sa herë hapet Antigravity (7 mjete MCP aktive: `run_full_cycle`, `check_cycle_progress`, `pack_workspace`, `run_planner`, `run_coder`, `apply_and_test`, `run_reviewer`).
+  - Dashboard Lokal & Singleton Proxy: `http://127.0.0.1:4321`
+  - **Izolim 100%:** Nuk prek kurrë sistemin Hermes (`15550`, `15555`, `15556`, `18000`, `19005`).
+- **Profilet e Login-it (`.profiles/`):** `m365` (`web1`, `web2`), `gemini1`, `gemini2`, `gemini3`. U rregullua ruajtja e përhershme në Windows Keychain (u hoqën `--password-store=basic` dhe `--use-mock-keychain` nga `ignoreDefaultArgs`).
+- **Rregullat & Dokumentacioni:**
+  - `README.md` (harta e skedarëve) & `USER_MANUAL.md` (manuali operativ + troubleshooting).
+  - `rules/AGENTS.md`, `rules/planner_rules.md` (me planifikim proporcional 15–25 rreshta për detyra të vogla), `rules/coder_rules.md`, `rules/reviewer_rules.md`.
+  - Dashboard (`mcp/dashboard.html`) u rregullua që të mos fshijë zgjedhjet në Dropdown gjatë rifreskimit.
+- **Arkitektura e Dërgimit (Me "Gemini Apps Activity = OFF"):**
+  - Për `gemini1..3`: skedarët tekst (`.txt`, `.md`) bashkohen direkt brenda prompt-it dhe shkruhen me Playwright `.fill()` (nuk përdoret upload me buton `+` sepse kur *Gemini Apps Activity* është OFF, Google bllokon ngarkimin e skedarëve).
+  - Për `web1..2` (M365 Copilot): dërgohet automatikisht `project_bundle.zip.md` me SHA-256.
+  - Autopilot 25-sekondësh (`run_full_cycle` + `check_cycle_progress`) i ndan thirrjet MCP në feta 25s që Antigravity të mos bëjë timeout në 60s.
+
+---
+
+## 2. ÇFARË U PROVU DHE KU MBETËM (1 BUG I FUNDIT PËR T'U MBYLLUR)
+- **Testi direkt në CMD (API Proxy) KALO ME SUKSES 100%:**
+  - Kur thirrëm `run_planner` direkt në `http://127.0.0` mbi projektin provë `C:\Vladi_project\Test_Bridge`, ktheu:
+    `{"status":"EXTERNAL_COMPLETED","engine":"gemini1","activeModel":"Thinking level","outputFile":"...\\plan.md"}`
+- **Bllokimi i fundit kur u lëshua brenda Antigravity (`run_full_cycle`):**
+  - Doli raporti Fail-Fast:
+    `MOTORI I BLLOKUAR: gemini1 (Roli: Planner) | FAZA: TIMEOUT — Gjenerimi kaloi 210s | SCREENSHOT: C:\Vladi_project\Test_Bridge\.antigravity\bridge\exchange\support_gemini1_1794621573764.png`
+- **Shkaku teknik i dyshuar në `mcp/server.js` (`waitAndExtractCleanResponse`):**
+  1. Selektori `const stopBtn = document.querySelector('button[aria-label*="Stop" i], ...')` nuk kontrollon nëse butoni është i dukshëm (`offsetParent !== null`), ose mbetet i kapur në DOM duke mbajtur `state.generating = true` për 210 sekonda.
+  2. Ose kur `gemini1` hapi chat të dytë në të njëjtën fletë, `containers.length <= arg.prevCount` nuk pa përgjigjen e re (duhet parë fotoja e fundit `support_gemini1_1794621573764.png` për konfirmim 100% vizual).
+
+---
+
+## 3. HAPI I PARË NESËR NË CHAT-IN E RI (ZERO LEXIM SKEDARËSH)
+1. **Ngarko foton e fundit diagnostike:** `C:\Vladi_project\Test_Bridge\.antigravity\bridge\exchange\support_gemini1_1794621573764.png` që të shohim saktësisht gjendjen e ekranit të `gemini1` në sekondën e 210-të.
+2. **Rregullo `waitAndExtractCleanResponse` në `C:\Vladi_project\Antigravity_MultiAI_Bridge\mcp\server.js`** (kontrolli `offsetParent !== null` te `stopBtn` + leximi i saktë i përgjigjes në biseda pasuese), pastaj mbyll procesin e vjetër `node.exe` të portës `4321`.
+3. **Mbyll DoD Proof Gate:** Ekzekuto `/run-cycle` brenda Antigravity mbi `C:\Vladi_project\Test_Bridge` derisa skedari `app.js` të ndryshohet në disk (`a + b` + `console.log`) dhe cikli të kthejë `CYCLE_COMPLETED`.

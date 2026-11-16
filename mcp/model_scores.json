@@ -1,5 +1,11 @@
 {
   "positiveWeights": {
+    "argon 4 pro high": 250,
+    "argon 4 pro": 240,
+    "argon": 220,
+    "4 pro high": 210,
+    "4 pro": 200,
+    "pro high": 190,
     "think deeper": 160,
     "6.sol": 150,
     "5.6": 135,

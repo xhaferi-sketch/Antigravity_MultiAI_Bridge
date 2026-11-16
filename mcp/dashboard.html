@@ -128,6 +128,8 @@
             <input class="full" id="tst_${i}" value="${escapeAttr(p.testCmd)}" placeholder="p.sh. npm test" />
 
             <button style="width:100%; margin-top:12px;" onclick="saveRouting('${p.projectRoot.replace(/\\/g, '/')}', ${i})">💾 Ruaj Konfigurimin</button>
+            <button style="width:100%; margin-top:6px; background:#475569; border-color:#64748b;" onclick="purgeExchange('${p.projectRoot.replace(/\\/g, '/')}')">🧹 Pastro Mbetjet e Shkëmbimit</button>
+            <button style="width:100%; margin-top:6px; background:#b91c1c; border-color:#ef4444;" onclick="deleteProject('${p.projectRoot.replace(/\\/g, '/')}', '${escapeAttr(p.projectName)}')">🗑️ Fshi Projektin</button>
           </div>
         `;
       }).join('');
@@ -150,7 +152,7 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
-      alert('Konfigurimi u ruajt në routing.json të projektit!');
+      const b=event&&event.target;if(b&&b.tagName==="BUTTON"){const t=b.innerText;b.style.background="#16a34a";b.innerText="✅ U Ruajt!";setTimeout(()=>{b.style.background="";b.innerText=t;},2000);}
       loadState();
     }
 
@@ -164,6 +166,41 @@
       });
       document.getElementById('newProjPath').value = '';
       loadState();
+    }
+
+    async function deleteProject(projectRoot, projectName) {
+      if (!confirm(`A jeni i sigurt që doni të fshini projektin [${projectName || projectRoot}] nga Antigravity?`)) return;
+      try {
+        const r = await fetch('/api/delete-project', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ projectRoot })
+        });
+        const d = await r.json();
+        if (d.ok) {
+          loadState();
+        } else {
+          alert('Gabim gjatë fshirjes: ' + (d.error || 'I panjohur'));
+        }
+      } catch (err) {
+        alert('Gabim komunikimi: ' + err.message);
+      }
+    }
+
+    async function purgeExchange(projectRoot) {
+      if (!confirm(`A jeni i sigurt që doni të pastroni të gjitha mbetjet e përkohshme të shkëmbimit?`)) return;
+      try {
+        const r = await fetch('/api/purge-exchange', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ projectRoot: projectRoot || '' })
+        });
+        const d = await r.json();
+        alert(`U pastruan me sukses ${d.totalRemovedFiles !== undefined ? d.totalRemovedFiles : (d.removedCount || 0)} skedarë mbeturinash.`);
+        loadState();
+      } catch (err) {
+        alert('Gabim gjatë pastrimit: ' + err.message);
+      }
     }
 
     async function loginProfile(profileName) {
@@ -192,7 +229,7 @@
     }
 
     loadState();
-    setInterval(loadState, 5000);
+    setInterval(()=>{const a=document.activeElement;if(!a||(a.tagName!=="SELECT"&&a.tagName!=="INPUT"))loadState();},5000);
   </script>
 </body>
 </html>

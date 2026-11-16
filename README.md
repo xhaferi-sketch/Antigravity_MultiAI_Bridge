@@ -37,3 +37,33 @@
 ```cmd
 node --check "C:\Vladi_project\Antigravity_MultiAI_Bridge\mcp\server.js"
 ```
+
+---
+
+## 4. Ekzekutimi i Testeve Stresuese të Hermes Bridge (Suita Universale)
+
+Kjo suitë testimi ndodhet në root të projektit dhe përdoret për të verifikuar në mënyrë 100% lineare qëndrueshmërinë, mungesën e race conditions, transferimin e attachments, gjenerimin e patch-eve dhe përdorimin e veglave (plugins).
+
+### Struktura e Dosjeve (Suita e Plotë me 7 Teste):
+- `tests/hermes_bridge/scripts/`: Përmban skriptet ekzekutive të testimit.
+  - `test_linear_flow.py`: Verifikimi i ekzekutimit të rreptë linear të kërkesave pa mbivendosje procesesh.
+  - `test_attachments_patch.py`: Verifikimi i menaxhimit të bashkëngjitjeve dhe gjenerimit të saktë të file diff .patch.
+  - `test_plugin_usage.py`: Verifikimi i thirrjes së suksesshme të veglave/plugins dhe integrimit të tyre në output.
+  - `test_report_generator.py`: Verifikimi i prodhimit fizik të raporteve të strukturuara JSON në disk.
+  - `test_zero_token_verification.py`: Verifikimi i ekzekutimit 100% 0-Token dhe delegimit lokal pa djegur kredi IDE.
+  - `test_latency_benchmark.py`: Matja e latencës së rrugëtimit dhe shpejtësisë së përgjigjes (TTFT).
+  - `test_failover_resilience.py`: Verifikimi i kalimit automatik (Failover) dhe qëndrueshmërisë së sesioneve.
+- `tests/hermes_bridge/reports/`: Dosja e raporteve fizike JSON të prodhuara nga çdo ekzekutim testimi për analizë nga Orchestratori dhe Web 1.
+
+### Ekzekutimi i Testeve me Interpretuesin Lokal të Python:
+Nga root-i i projektit ekzekutohen një nga një:
+```powershell
+python tests/hermes_bridge/scripts/test_linear_flow.py
+python tests/hermes_bridge/scripts/test_attachments_patch.py
+python tests/hermes_bridge/scripts/test_plugin_usage.py
+python tests/hermes_bridge/scripts/test_report_generator.py
+python tests/hermes_bridge/scripts/test_zero_token_verification.py
+python tests/hermes_bridge/scripts/test_latency_benchmark.py
+python tests/hermes_bridge/scripts/test_failover_resilience.py
+```
+Raportet fizike të çdo testi regjistrohen automatikisht në `tests/hermes_bridge/reports/report_<test_name>_<timestamp>.json`.
