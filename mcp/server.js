@@ -29,17 +29,40 @@ if (!fs.existsSync(REGISTRY_PATH)) fs.writeFileSync(REGISTRY_PATH, JSON.stringif
 
 const contexts = {};
 const contextModes = {};
-const tabs = { web1: null, web2: null, gemini1: null, gemini2: null, gemini3: null };
-const tabAuthStatus = { web1: 'UNKNOWN', web2: 'UNKNOWN', gemini1: 'UNKNOWN', gemini2: 'UNKNOWN', gemini3: 'UNKNOWN' };
-const tabActiveModel = { web1: '-', web2: '-', gemini1: '-', gemini2: '-', gemini3: '-' };
-const tabDiscoveredModels = { web1: '-', web2: '-', gemini1: '-', gemini2: '-', gemini3: '-' };
+const tabs = {
+  web1: null, web2: null,
+  gemini1: null, gemini2: null, gemini3: null,
+  google_search_1: null, google_search_2: null, google_search_3: null
+};
+const tabAuthStatus = {
+  web1: 'UNKNOWN', web2: 'UNKNOWN',
+  gemini1: 'UNKNOWN', gemini2: 'UNKNOWN', gemini3: 'UNKNOWN',
+  google_search_1: 'UNKNOWN', google_search_2: 'UNKNOWN', google_search_3: 'UNKNOWN'
+};
+const tabActiveModel = {
+  web1: '-', web2: '-',
+  gemini1: '-', gemini2: '-', gemini3: '-',
+  google_search_1: '4 Carbon - Most complex work',
+  google_search_2: '4 Carbon - Most complex work',
+  google_search_3: '4 Carbon - Most complex work'
+};
+const tabDiscoveredModels = {
+  web1: '-', web2: '-',
+  gemini1: '-', gemini2: '-', gemini3: '-',
+  google_search_1: '4 Carbon (Most complex work)',
+  google_search_2: '4 Carbon (Most complex work)',
+  google_search_3: '4 Carbon (Most complex work)'
+};
 const activeProjectPerTab = {};
 const tabLocks = {
   web1: Promise.resolve(),
   web2: Promise.resolve(),
   gemini1: Promise.resolve(),
   gemini2: Promise.resolve(),
-  gemini3: Promise.resolve()
+  gemini3: Promise.resolve(),
+  google_search_1: Promise.resolve(),
+  google_search_2: Promise.resolve(),
+  google_search_3: Promise.resolve()
 };
 
 function withTabLock(tabKey, fn) {
@@ -49,11 +72,19 @@ function withTabLock(tabKey, fn) {
   return prev.then(function() { return fn(); }).finally(function() { release(); });
 }
 
+const GOOGLE_SEARCH_AI_URL = 'https://www.google.com/search?q=test&udm=50&arv=4';
+
 function getProfileNameForTab(tabKey) {
-  return tabKey.startsWith('web') ? 'm365' : tabKey;
+  if (tabKey.startsWith('web')) return 'm365';
+  if (tabKey.startsWith('google_search_')) {
+    const num = tabKey.replace('google_search_', '');
+    return 'gemini' + num;
+  }
+  return tabKey;
 }
 
 function getTargetUrl(tabKey) {
+  if (tabKey.startsWith('google_search_')) return GOOGLE_SEARCH_AI_URL;
   return tabKey.startsWith('gemini') ? GEMINI_APP_URL : M365_CHAT_URL;
 }
 
@@ -112,13 +143,40 @@ async function getOrCreateTab(tabKey) {
   if (tabs[tabKey] && !tabs[tabKey].isClosed()) return tabs[tabKey];
 
   const ctx = await getOrLaunchContext(profileName, true);
+  const isSearch = tabKey.startsWith('google_search_');
+  const targetUrl = getTargetUrl(tabKey);
+  const domain = targetUrl.replace('https://', '').split('/')[0];
+
+  let page = null;
   const existingPages = ctx.pages();
-  const page = existingPages.length > 0 ? existingPages[0] : await ctx.newPage();
-  const domain = getTargetUrl(tabKey).replace('https://', '').split('/')[0];
-  if (!page.url().includes(domain)) {
-    await page.goto(getTargetUrl(tabKey), { waitUntil: 'domcontentloaded', timeout: 45000 });
+  for (const p of existingPages) {
+    if (p.isClosed()) continue;
+    const pu = p.url() || '';
+    if (isSearch && pu.includes('google.com/search') && !Object.entries(tabs).some(([k, t]) => t === p && k !== tabKey)) {
+      page = p;
+      break;
+    } else if (!isSearch && pu.includes(domain) && !Object.entries(tabs).some(([k, t]) => t === p && k !== tabKey)) {
+      page = p;
+      break;
+    }
   }
-  await page.waitForTimeout(1500);
+
+  if (!page) {
+    page = (existingPages.length > 0 && !isSearch && !Object.values(tabs).includes(existingPages[0]))
+      ? existingPages[0]
+      : await ctx.newPage();
+  }
+
+  if (isSearch) {
+    if (!page.url().includes('google.com/search') || !page.url().includes('udm=50')) {
+      await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      await page.waitForTimeout(2000);
+    }
+  } else if (!page.url().includes(domain)) {
+    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.waitForTimeout(1500);
+  }
+
   tabs[tabKey] = page;
   return page;
 }
@@ -377,6 +435,14 @@ async function ensureMaxReasoningMode(targetFrame, tabKey) {
 }
 
 async function resetChatIfNeeded(page, tabKey, projectRoot, force) {
+  if (tabKey.startsWith('google_search_')) {
+    if (force || activeProjectPerTab[tabKey] !== projectRoot) {
+      await page.goto(GOOGLE_SEARCH_AI_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      await page.waitForTimeout(2000);
+      activeProjectPerTab[tabKey] = projectRoot;
+    }
+    return;
+  }
   if (!force && activeProjectPerTab[tabKey] === projectRoot) return;
   const isGemini = tabKey.startsWith('gemini');
   const target = findChatFrameOrPage(page);
@@ -859,6 +925,126 @@ async function dispatchToWebTab(opts) {
   });
 }
 
+async function dispatchToGoogleSearchAiTab(opts) {
+  const { tabKey, projectRoot, promptText, bundlePath } = opts;
+  const cleanRoot = path.resolve(projectRoot);
+
+  return withTabLock(tabKey, async function() {
+    activeProjectPerTab[tabKey] = cleanRoot;
+    const page = await getOrCreateTab(tabKey);
+
+    // Siguro qe jemi ne Google Search AI Mode me arv=4 (4 Carbon - Most complex work)
+    if (!page.url().includes('google.com/search') || !page.url().includes('udm=50')) {
+      await page.goto(GOOGLE_SEARCH_AI_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      await page.waitForTimeout(3000);
+    }
+
+    const boxLoc = page.locator('textarea[placeholder="Ask anything"], textarea.ITIRGe, textarea').first();
+    await boxLoc.waitFor({ state: 'visible', timeout: 25000 });
+
+    // Protokolli dinamik i Ndarjes me Faza (Pjesa 1, Pjesa 2, ... Pjesa N)
+    const chunkProtocolInstruction = 
+      NL + NL + '=== RREGULL I DETYRUESHEM I GJATESISE SE PERGJIGJES ME PJEZIM ===' + NL +
+      'Që të shmanget shkurtimi apo ndërprerja e përgjigjes, zbato rreptësisht këtë protokoll:' + NL +
+      '1. Jep përgjigje të thelluar dhe të plotë arkitekturore për projektin: ' + cleanRoot + NL +
+      '2. Nëse përgjigja kërkon më shumë se 300 rreshta, NDALU dhe në fund të mesazhit shkruaj ekzaktësisht etiketën: [VAZHDON_PJESA_TJETER].' + NL +
+      '3. Kur i gjithë plani arkitekturor të ketë përfunduar 100%, në fund të mesazhit shkruaj: [PLANI_PERFUNDOI_100%].' + NL +
+      '===============================================================' + NL;
+
+    let fullPrompt = promptText + chunkProtocolInstruction;
+    if (bundlePath && fs.existsSync(bundlePath)) {
+      try {
+        const bundleTxt = fs.readFileSync(bundlePath, 'utf8');
+        if (bundleTxt.length < 450000) {
+          fullPrompt += NL + NL + '=== PERMBAJTJA E SKEDAREVE TE PROJEKTIT (WORKSPACE BUNDLE) ===' + NL + bundleTxt;
+        }
+      } catch (_) {}
+    }
+
+    let collectedParts = [];
+    const maxChunks = 4;
+
+    for (let chunkIdx = 1; chunkIdx <= maxChunks; chunkIdx++) {
+      console.error('[SEARCH_AI_PLANNER] tabKey=' + tabKey + ' dispatching Chunk ' + chunkIdx + ' for ' + path.basename(cleanRoot));
+      await boxLoc.click({ force: true });
+      
+      const textToSend = chunkIdx === 1
+        ? fullPrompt
+        : 'Vazhdo me Pjesën ' + chunkIdx + ' të planit arkitekturor nga pika ku mbete, pa përsëritur atë që ke shkruar. Nëse ka përfunduar plotësisht, vendos etiketën [PLANI_PERFUNDOI_100%].';
+
+      await boxLoc.fill(textToSend);
+      await page.waitForTimeout(400);
+      await page.keyboard.press('Enter');
+
+      // Monitoro gjenerimin derisa te perfundoje
+      const startWait = Date.now();
+      let stableCount = 0;
+      let lastLen = 0;
+      let partText = '';
+
+      while (Date.now() - startWait < 90000) {
+        await page.waitForTimeout(2000);
+
+        const currentExtraction = await page.evaluate(function() {
+          const bubbles = Array.from(document.querySelectorAll('div, section, article')).filter(function(el) {
+            if (el.tagName === 'SCRIPT' || el.tagName === 'STYLE') return false;
+            const t = (el.innerText || '').trim();
+            return t.length > 80 && !t.includes('(this||self)') && !t.includes('Skip to main content') && !t.includes('Google apps');
+          });
+
+          bubbles.sort(function(a, b) { return (b.innerText || '').length - (a.innerText || '').length; });
+          const best = bubbles[0];
+          const busy = document.querySelectorAll('[aria-busy="true"], [class*="generating" i], [class*="searching" i]');
+          return {
+            text: best ? best.innerText.trim() : '',
+            len: best ? best.innerText.trim().length : 0,
+            isBusy: busy.length > 0
+          };
+        });
+
+        if (currentExtraction.len > 100 && currentExtraction.len === lastLen) {
+          stableCount++;
+          if (stableCount >= 3 && !currentExtraction.isBusy) {
+            partText = currentExtraction.text;
+            break;
+          }
+        } else {
+          stableCount = 0;
+          lastLen = currentExtraction.len;
+          if (currentExtraction.len > 100) partText = currentExtraction.text;
+        }
+      }
+
+      if (!partText || partText.length < 50) {
+        await captureSupportEvidence(page, cleanRoot, tabKey, 'SEARCH_AI_EMPTY_RESPONSE', 'Modeli nuk ktheu pergjigje.');
+        throw new Error('SEARCH_AI_EMPTY_RESPONSE nga [' + tabKey + ']: Modeli nuk ktheu pergjigje brenda kohes.');
+      }
+
+      // Pastro etiketimin e mesazheve te Google
+      let cleanPart = partText;
+      const marker = 'AI Mode reply for ';
+      const lastMarkerIdx = cleanPart.lastIndexOf(marker);
+      if (lastMarkerIdx !== -1) {
+        const afterMarker = cleanPart.slice(lastMarkerIdx + marker.length);
+        const newlineIdx = afterMarker.indexOf('\n');
+        cleanPart = newlineIdx !== -1 ? afterMarker.slice(newlineIdx).trim() : afterMarker.trim();
+      }
+
+      collectedParts.push(cleanPart);
+
+      if (cleanPart.includes('[PLANI_PERFUNDOI_100%]') || !cleanPart.includes('[VAZHDON_PJESA_TJETER]')) {
+        break;
+      }
+    }
+
+    tabAuthStatus[tabKey] = 'AUTHENTICATED';
+    tabActiveModel[tabKey] = '4 Carbon - Most complex work';
+    tabDiscoveredModels[tabKey] = '4 Carbon (Most complex work)';
+
+    return collectedParts.join(NL + NL + '--- VAZHDIMI I PLANIT ARKITEKTUROR ---' + NL + NL);
+  });
+}
+
 // ---------------- PJESA 2: PACKER, 0-TOKEN EXECUTOR, 25S AUTOPILOT & MCP SERVER ----------------
 
 function compactErrorLog(rawText, maxChars) {
@@ -1319,12 +1505,23 @@ const bundle = getBundleAttachmentAndNote(cleanRoot, engine);
 const rule = fs.readFileSync(path.join(PLUGIN_ROOT, 'rules', 'planner_rules.md'), 'utf8');
 const embeddedSpecs = resolveAndEmbedExternalFiles(payload.userRequest);
 const prompt = rule + bundle.note + embeddedSpecs + NL + NL + 'KERKESA E PERDORUESIT:' + NL + (payload.userRequest || 'Analizo dhe planifiko ndryshimet.');
-const response = await dispatchToWebTab({
-tabKey: engine,
-projectRoot: cleanRoot,
-promptText: prompt,
-attachmentPaths: [bundle.path]
-});
+
+let response;
+if (engine.startsWith('google_search_')) {
+  response = await dispatchToGoogleSearchAiTab({
+    tabKey: engine,
+    projectRoot: cleanRoot,
+    promptText: prompt,
+    bundlePath: bundle.path
+  });
+} else {
+  response = await dispatchToWebTab({
+    tabKey: engine,
+    projectRoot: cleanRoot,
+    promptText: prompt,
+    attachmentPaths: [bundle.path]
+  });
+}
 const lowPlan = (response || '').toLowerCase();
 const isPlanRefusal = SERVICE_ERROR_PATTERNS.some(function(p) { return lowPlan.includes(p); });
 if (!response || response.trim().length < 100 || isPlanRefusal) {

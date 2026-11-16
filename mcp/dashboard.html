@@ -63,9 +63,22 @@
       { v: 'antigravity', l: '⚡ Antigravity (Local)' }
     ];
 
-    function buildSelect(id, selected, includeOff = false) {
+    const PLANNER_ENGINES = [
+      { v: 'google_search_1', l: '🔍 Google Search AI 1 (4 Carbon - Most complex work)' },
+      { v: 'google_search_2', l: '🔍 Google Search AI 2 (4 Carbon - Most complex work)' },
+      { v: 'google_search_3', l: '🔍 Google Search AI 3 (4 Carbon - Most complex work)' },
+      { v: 'gemini1', l: 'Gemini 1 (Argon High - Thinking)' },
+      { v: 'gemini2', l: 'Gemini 2 (Argon High - Thinking)' },
+      { v: 'gemini3', l: 'Gemini 3 (Argon High - Thinking)' },
+      { v: 'web1',    l: 'M365 Web 1 (Think Deeper)' },
+      { v: 'web2',    l: 'M365 Web 2 (Think Deeper)' },
+      { v: 'antigravity', l: '⚡ Antigravity (Local)' }
+    ];
+
+    function buildSelect(id, selected, includeOff = false, isPlanner = false) {
       let opts = includeOff ? `<option value="off" ${selected === 'off' ? 'selected' : ''}>🚫 Off (Skip)</option>` : '';
-      for (const e of ENGINES) {
+      const list = isPlanner ? PLANNER_ENGINES : ENGINES;
+      for (const e of list) {
         opts += `<option value="${e.v}" ${selected === e.v ? 'selected' : ''}>${e.l}</option>`;
       }
       return `<select id="${id}">${opts}</select>`;
@@ -112,7 +125,7 @@
             </div>
             <small style="color:#94a3b8; word-break:break-all;">${p.projectRoot}</small>
 
-            <div class="row" style="margin-top:12px;"><span>Planner:</span> ${buildSelect(`pl_${i}`, p.roles.planner)}</div>
+            <div class="row" style="margin-top:12px;"><span>Planner:</span> ${buildSelect(`pl_${i}`, p.roles.planner, false, true)}</div>
             <div class="row"><span>Coder:</span> ${buildSelect(`cd_${i}`, p.roles.coder)}</div>
             <div class="row"><span>Reviewer (Gate):</span> ${buildSelect(`rv_${i}`, p.roles.reviewer, true)}</div>
             <div class="row"><span>Paketimi:</span>
