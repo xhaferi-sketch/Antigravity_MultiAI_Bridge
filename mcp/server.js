@@ -32,6 +32,7 @@ const contextModes = {};
 const tabs = { web1: null, web2: null, gemini1: null, gemini2: null, gemini3: null };
 const tabAuthStatus = { web1: 'UNKNOWN', web2: 'UNKNOWN', gemini1: 'UNKNOWN', gemini2: 'UNKNOWN', gemini3: 'UNKNOWN' };
 const tabActiveModel = { web1: '-', web2: '-', gemini1: '-', gemini2: '-', gemini3: '-' };
+const tabDiscoveredModels = { web1: '-', web2: '-', gemini1: '-', gemini2: '-', gemini3: '-' };
 const activeProjectPerTab = {};
 const tabLocks = {
   web1: Promise.resolve(),
@@ -368,6 +369,9 @@ async function ensureMaxReasoningMode(targetFrame, tabKey) {
   }
 
   tabActiveModel[tabKey] = result.activeModel;
+  if (result.summary) {
+    tabDiscoveredModels[tabKey] = result.summary;
+  }
   console.error('[MODEL_DISCOVERY_SUCCESS] tabKey=' + tabKey + ' activeModel=' + result.activeModel + ' summary=[' + (result.summary || '') + ']');
   return result.activeModel;
 }
@@ -697,6 +701,25 @@ async function dispatchToWebTab(opts) {
 
       let combinedText = promptText;
       const filesToUpload = [];
+
+      // Smart Attachment per Copilot: Nese motori eshte Copilot dhe specifikimet eksterne jane mbi 25k, i ngarkon si attachment fizik
+      if (!isGemini && combinedText.length > 25000) {
+        const specRegex = /=== DOKUMENTI I PLOTE I SPECIFIKIMEVE NGA PERDORUESI:\s*([^\r\n=]+)\s*===([\s\S]*?)=== FUNDI I SPECIFIKIMEVE[^=]*===/g;
+        let match;
+        while ((match = specRegex.exec(promptText)) !== null) {
+          const specName = (match[1] || 'specifikimet').trim().replace(/[^a-zA-Z0-9._-]/g, '_');
+          const specBody = match[2];
+          if (specBody && specBody.length > 5000) {
+            const exchangeDir = path.join(path.resolve(projectRoot), '.antigravity', 'bridge', 'exchange');
+            if (!fs.existsSync(exchangeDir)) fs.mkdirSync(exchangeDir, { recursive: true });
+            const tempSpecFile = path.join(exchangeDir, 'spec_' + specName + '.md');
+            fs.writeFileSync(tempSpecFile, specBody.trim(), 'utf8');
+            filesToUpload.push(tempSpecFile);
+            combinedText = combinedText.replace(match[0], NL + NL + '[UDHEZIM PER COPILOT: Dokumenti i plote i specifikimeve (' + specName + ') eshte bashkangjitur si skedar fizik. ZBATO TE GJITHA RREGULLAT 100%, ZERO-FAKE, ZERO-PLACEHOLDERS.]' + NL);
+          }
+        }
+      }
+
       for (const fp of attachmentPaths) {
         if (!fp || !fs.existsSync(fp)) continue;
         if (isGemini && !fp.endsWith('.zip.md')) {
@@ -1416,6 +1439,7 @@ tabStates[k] = {
 open: Boolean(tabs[k] && !tabs[k].isClosed()),
 auth: tabAuthStatus[k],
 model: tabActiveModel[k],
+discoveredModels: tabDiscoveredModels[k] || '-',
 activeProject: activeProjectPerTab[k] ? path.basename(activeProjectPerTab[k]) : 'Asnje'
 };
 }

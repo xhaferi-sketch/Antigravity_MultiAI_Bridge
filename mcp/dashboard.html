@@ -89,6 +89,7 @@
               <span class="badge ${badgeCls}">${t.open ? 'HAPUR' : 'NË GJUMË'} | ${t.auth}</span>
             </div>
             <div style="font-size:13px; margin:4px 0;">Modeli aktiv: <b>${t.model || '-'}</b></div>
+            <div style="font-size:11px; color:#94a3b8; margin:4px 0; word-break:break-word;">Modelet në ueb: <i>${t.discoveredModels && t.discoveredModels !== '-' ? t.discoveredModels : 'Ende pa zbuluar'}</i></div>
             <div style="font-size:13px;">Projekti aktiv: <b>${t.activeProject}</b></div>
             <div style="margin-top:10px;">
               <button class="sec" onclick="resetTab('${k}')">🧹 Force New Chat</button>
