@@ -180,88 +180,196 @@ async function checkAuthExpired(page, tabKey) {
 }
 
 async function ensureMaxReasoningMode(targetFrame, tabKey) {
-  const scoresConfig = JSON.parse(fs.readFileSync(SCORES_PATH, 'utf8'));
-  const selectedLabel = await targetFrame.evaluate(async function(arg) {
-    const cfg = arg.cfg;
+  const result = await targetFrame.evaluate(async function(arg) {
     const isGemini = arg.isGemini;
     const closeMenus = function() {
       document.querySelectorAll('.cdk-overlay-backdrop').forEach(function(b) { b.click(); });
       document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }));
     };
-    const isDisqualified = function(el) {
-      if (!el) return true;
-      for (const sel of (cfg.disqualifySelectors || [])) {
-        if ((el.matches && el.matches(sel)) || (el.querySelector && el.querySelector(sel))) return true;
-      }
-      return Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true');
-    };
-    const scoreText = function(txt, el) {
-      if (el && isDisqualified(el)) return -9999;
-      const lower = (txt || '').toLowerCase().trim();
-      if (!lower) return -9999;
-      let score = 0;
-      if (lower.includes('argon')) score += 120;
-      for (const [w, p] of Object.entries(cfg.positiveWeights)) if (lower.includes(w)) score += p;
-      for (const [w, p] of Object.entries(cfg.negativeWeights)) if (lower.includes(w)) score += p;
-      return score;
-    };
+
+    // 1. Gjej butonin e modelit ne DOM
     const sels = isGemini
-      ? ['button[data-test-id*="model"]', 'bard-mode-switcher button', 'button[aria-label*="model" i]', 'button[aria-label*="Thinking" i]', '.input-area-switch button']
-      : ['button[aria-label*="mode" i]', 'button[aria-label*="model" i]', 'button[aria-label*="Think" i]', '[data-testid*="mode-selector"]', '[data-testid*="model-switcher"]'];
+      ? [
+          'button[data-test-id*="model"]',
+          'bard-mode-switcher button',
+          'button[aria-label*="model" i]',
+          'button[aria-label*="Thinking" i]',
+          'button[aria-label*="Mode" i]',
+          '.input-area-switch button',
+          'button:has(.model-title)',
+          'button:has(mat-icon[data-mat-icon-name*="spark"])'
+        ]
+      : [
+          'button[aria-label*="Model Selector" i]',
+          'button[aria-label*="mode" i]',
+          'button[aria-label*="model" i]',
+          'button[aria-label*="Think" i]',
+          '[data-testid*="mode-selector"]',
+          '[data-testid*="model-switcher"]',
+          '.fui-Dropdown'
+        ];
+
     let btn = null;
     for (const s of sels) {
       const el = document.querySelector(s);
       if (el && el.offsetParent !== null) { btn = el; break; }
     }
-    if (!btn) return 'Default';
-    const curCombined = ((btn.innerText || '') + ' ' + (btn.getAttribute('aria-label') || '')).trim();
-    const curDisplay = (btn.innerText || btn.getAttribute('aria-label') || 'Active').trim();
-    if (scoreText(curCombined, null) >= cfg.minimumAcceptableScore) return curDisplay;
 
+    if (!btn) {
+      return { status: 'NO_BUTTON_FOUND', activeModel: 'Unknown' };
+    }
+
+    const curCombined = ((btn.innerText || '') + ' ' + (btn.getAttribute('aria-label') || '')).trim();
+    const curDisplay = (btn.innerText || btn.getAttribute('aria-label') || 'Active').split('\n')[0].trim();
+
+    // Universal Semantic Capability Scorer (Sipas CopilotTransport.cs - Baseline: Code & analysis / 4 Argon e lart)
+    const scoreModel = function(title, fullText, isDisabled) {
+      if (isDisabled) return -10000;
+      const combined = ((title || '') + ' ' + (fullText || '')).toLowerCase();
+      let s = 100;
+
+      // Kategoria ELITE (+800 deri +1000): "Code & analysis", "4 Argon", "Argon", "Thinking", "Think Deeper"
+      if (combined.includes('code & analysis') || combined.includes('code and analysis') ||
+          combined.includes('argon') || combined.includes('4 argon') ||
+          combined.includes('think') || combined.includes('thinking') ||
+          combined.includes('deeper') || combined.includes('reason') ||
+          combined.includes('arsyet') || combined.includes('thellë')) {
+        s += 800;
+      }
+      // Kategoria PRO / ADVANCED (+500): "Pro", "Advanced", "Precise", "Smart"
+      else if (combined.includes('pro') || combined.includes('advanced') || combined.includes('precise') || combined.includes('smart')) {
+        s += 500;
+      }
+      // Kategoria e shpejte (+200): pamjaftueshme per arsyetim te thelle
+      else if (combined.includes('quick') || combined.includes('fast') || combined.includes('shpejt')) {
+        s += 200;
+      }
+      // Kategoria e skualifikuar (-1000): Flash, Lite, Auto, Default, Everyday
+      if (combined.includes('flash') || combined.includes('lite') || combined.includes('mini') ||
+          combined.includes('auto') || combined.includes('everyday') || combined.includes('default') || combined.includes('standard')) {
+        s -= 1000;
+      }
+      return s;
+    };
+
+    // Nese butoni aktual eshte tashme ELITE (Score >= 800)
+    if (scoreModel(curDisplay, curCombined, false) >= 800) {
+      return { status: 'SUCCESS_ALREADY_ACTIVE', activeModel: curDisplay, summary: curDisplay + ' (Aktiv)' };
+    }
+
+    // 2. Hap menynë
     btn.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
     btn.click();
     await new Promise(function(r) { setTimeout(r, 450); });
 
-    const items = Array.from(document.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="option"], .mat-mdc-menu-item'));
-    let best = null, bestScore = -9999, bestTxt = curDisplay;
-    for (const it of items) {
-      const t = ((it.innerText || '') + ' ' + (it.getAttribute('aria-label') || '')).trim();
-      const sc = scoreText(t, it);
-      if (sc > bestScore) {
-        bestScore = sc;
-        best = it;
-        bestTxt = (it.innerText || t).split('\n')[0].trim();
+    // Zgjedh nen-menyte nese ekzistojne
+    const subTriggers = Array.from(document.querySelectorAll('[data-testid*="gptSubMenuModelTrigger"], [role="menuitem"][aria-haspopup="menu"]'));
+    for (const sub of subTriggers) {
+      try {
+        sub.dispatchEvent(new PointerEvent('pointerover', { bubbles: true }));
+        sub.click();
+        await new Promise(function(r) { setTimeout(r, 250); });
+      } catch (_) {}
+    }
+
+    // 3. Mbledhja e te gjitha opsioneve nga DOM (Dynamic DOM Discovery)
+    const candidateNodes = Array.from(document.querySelectorAll(
+      '[role="menuitemradio"], [role="menuitemcheckbox"], [role="option"], [role="menuitem"], .mat-mdc-menu-item, .fui-MenuItem, [data-testid*="gptSubMenuModelTrigger-"]'
+    ));
+
+    const discovered = [];
+    for (const node of candidateNodes) {
+      if (node.getAttribute('aria-haspopup') === 'menu') continue;
+      const rawText = (node.innerText || node.textContent || '').trim();
+      const ariaLabel = (node.getAttribute('aria-label') || '').trim();
+      const displayText = rawText || ariaLabel;
+      if (!displayText) continue;
+
+      const title = displayText.split('\n')[0].trim();
+      const isChecked = node.getAttribute('aria-checked') === 'true'
+        || node.classList.contains('is-checked')
+        || node.classList.contains('fui-MenuItem--selected')
+        || node.classList.contains('active');
+      const isDisabled = node.getAttribute('aria-disabled') === 'true'
+        || node.hasAttribute('disabled')
+        || node.classList.contains('is-disabled')
+        || node.classList.contains('mat-mdc-menu-item-disabled');
+
+      if (!discovered.some(function(d) { return d.title.toLowerCase() === title.toLowerCase(); })) {
+        discovered.push({
+          el: node,
+          title: title,
+          fullText: displayText,
+          isChecked: isChecked,
+          isDisabled: isDisabled,
+          score: scoreModel(title, displayText, isDisabled)
+        });
       }
     }
-    if (best && bestScore >= cfg.minimumAcceptableScore) {
-      best.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
-      best.click();
-      await new Promise(function(r) { setTimeout(r, 350); });
+
+    const modelListSummary = discovered.map(function(d) {
+      return d.title + (d.isChecked ? ' (Aktiv)' : '') + (d.isDisabled ? ' (Çaktivizuar)' : '');
+    }).join(' | ');
+
+    if (discovered.length === 0) {
       closeMenus();
-      return bestTxt;
+      const curScore = scoreModel(curDisplay, curCombined, false);
+      if (curScore >= 800) return { status: 'SUCCESS_CURRENT', activeModel: curDisplay, summary: curDisplay };
+      return { status: 'NO_OPTIONS_DISCOVERED', activeModel: curDisplay, summary: 'Nuk u zbulua asnje opsion ne menu' };
     }
+
+    // Renditja sipas pikeve zbrese
+    const sorted = discovered.slice().sort(function(a, b) { return b.score - a.score; });
+    const target = sorted[0];
+
+    // Verifikim i hekurt: Pragu minimal ELITE (Score >= 800: Code & analysis / 4 Argon e lart)
+    if (!target || target.isDisabled || target.score < 800) {
+      closeMenus();
+      return {
+        status: 'DISQUALIFIED_BELOW_BASELINE',
+        activeModel: curDisplay,
+        bestCandidate: target ? target.title : 'None',
+        summary: modelListSummary
+      };
+    }
+
+    if (target.isChecked) {
+      closeMenus();
+      return { status: 'SUCCESS_ALREADY_ACTIVE', activeModel: target.title, summary: modelListSummary };
+    }
+
+    // Klikim fizik i modelit me te mire
+    target.el.scrollIntoView({ block: 'nearest' });
+    target.el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+    target.el.click();
+    await new Promise(function(r) { setTimeout(r, 400); });
     closeMenus();
-    await new Promise(function(r) { setTimeout(r, 250); });
-    const curScore = scoreText(curCombined, null);
-    if (curScore < cfg.minimumAcceptableScore) {
-      return { error: 'HIGH_REASONING_UNAVAILABLE', current: curDisplay, score: curScore };
-    }
-    return curDisplay || 'Active';
-  }, { cfg: scoresConfig, isGemini: tabKey.startsWith('gemini') }).catch(function(err) {
-    return { error: 'HIGH_REASONING_ERROR', message: err.message };
+
+    return { status: 'SUCCESS_SWITCHED', activeModel: target.title, summary: modelListSummary };
+  }, { isGemini: tabKey.startsWith('gemini') }).catch(function(err) {
+    return { status: 'EVALUATE_EXCEPTION', error: err.message };
   });
 
-  if (selectedLabel && typeof selectedLabel === 'object' && selectedLabel.error) {
-    const detail = selectedLabel.current ? ('Modeli ' + selectedLabel.current + ' ka pike nen ' + scoresConfig.minimumAcceptableScore + ' (' + selectedLabel.score + ')') : selectedLabel.message;
-    throw new Error('HIGH_REASONING_UNAVAILABLE ne [' + tabKey + ']: ' + detail + '. Ndalohet kategorikisht kalimi ne Auto/Flash/Lite.');
-  }
-  const lowSel = String(selectedLabel || '').toLowerCase();
-  if (!selectedLabel || lowSel.includes('flash') || lowSel.includes('auto') || lowSel.includes('lite') || lowSel.includes('fast')) {
-    throw new Error('HIGH_REASONING_UNAVAILABLE ne [' + tabKey + ']: Modeli aktiv (' + selectedLabel + ') eshte nivel i ulet/ekonomik. Ndalohet kalimi ne Auto/Flash.');
+  if (result.status === 'DISQUALIFIED_BELOW_BASELINE') {
+    throw new Error('CRITICAL_MODEL_LOCK_REJECTED ne [' + tabKey + ']: Modeli me i mire i gjetur [' + (result.bestCandidate || '') + '] nuk arrin nivelin baze "Code & analysis" / "4 Argon" (Score < 800). Opsionet ne ekran: [' + result.summary + ']. Ndalohet kategorikisht vazhdimi me modele te uleta!');
   }
 
-  tabActiveModel[tabKey] = selectedLabel;
-  return selectedLabel;
+  if (result.status === 'NO_OPTIONS_DISCOVERED' || result.status === 'NO_BUTTON_FOUND') {
+    const curLow = (result.activeModel || '').toLowerCase();
+    if (curLow.includes('code & analysis') || curLow.includes('argon') || curLow.includes('think') || curLow.includes('pro')) {
+      tabActiveModel[tabKey] = result.activeModel;
+      return result.activeModel;
+    }
+    throw new Error('CRITICAL_MODEL_LOCK_FAILED ne [' + tabKey + ']: Nuk u arrit zbulimi i menusë dhe modeli aktual eshte [' + result.activeModel + ']. Refuzohet kalimi ne Default/Flash.');
+  }
+
+  if (result.status === 'EVALUATE_EXCEPTION') {
+    throw new Error('MODEL_DISCOVERY_ERROR ne [' + tabKey + ']: ' + result.error);
+  }
+
+  tabActiveModel[tabKey] = result.activeModel;
+  console.error('[MODEL_DISCOVERY_SUCCESS] tabKey=' + tabKey + ' activeModel=' + result.activeModel + ' summary=[' + (result.summary || '') + ']');
+  return result.activeModel;
 }
 
 async function resetChatIfNeeded(page, tabKey, projectRoot, force) {
@@ -566,7 +674,8 @@ async function dispatchToWebTab(opts) {
       if (routing.autoNewChatOnProjectSwitch || attempt === 2) {
         await resetChatIfNeeded(page, tabKey, projectRoot, attempt === 2);
       }
-      await ensureMaxReasoningMode(targetFrame, tabKey).catch(function() {});
+      const verifiedModel = await ensureMaxReasoningMode(targetFrame, tabKey);
+      tabActiveModel[tabKey] = verifiedModel;
       await page.keyboard.press('Escape').catch(function() {});
       await targetFrame.evaluate(function() {
         document.querySelectorAll('.cdk-overlay-backdrop').forEach(function(b) { b.click(); });
@@ -843,7 +952,12 @@ function packWorkspace(projectRoot, mode) {
   const zipPath = path.join(exchangeDir, 'project_bundle.zip');
   const zipMdPath = path.join(exchangeDir, 'project_bundle.zip.md');
 
-  const ignoredDirs = new Set(['.git', 'node_modules', '.antigravity', '.hermes', 'dist', 'build', '.next', 'venv', '.venv', '__pycache__', 'coverage']);
+  const ignoredDirs = new Set([
+    '.git', '.svn', 'node_modules', '.antigravity', '.hermes', 'dist', 'build', '.next',
+    'venv', '.venv', '__pycache__', 'coverage', '.profiles', '.cache', '.vscode',
+    'default', 'crashpad', 'gpucache', 'blob_storage', 'session storage', 'indexeddb',
+    'service worker', 'temp', 'tmp'
+  ]);
   const ignoredFiles = new Set(['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'bun.lockb']);
   const allowedExts = new Set(['.js', '.mjs', '.cjs', '.ts', '.jsx', '.tsx', '.py', '.json', '.md', '.html', '.css', '.scss', '.sql', '.yaml', '.yml', '.sh', '.ps1', '.cs']);
 
@@ -862,23 +976,36 @@ function packWorkspace(projectRoot, mode) {
   const collectedFiles = [];
 
   function walk(dir) {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        if (!ignoredDirs.has(entry.name)) walk(full);
-      } else if (entry.isFile()) {
-        if (ignoredFiles.has(entry.name)) continue;
-        if (!allowedExts.has(path.extname(entry.name).toLowerCase())) continue;
-        const stat = fs.statSync(full);
-        if (stat.size > 500 * 1024) continue;
-        if (deltaSet && !deltaSet.has(path.resolve(full))) continue;
+    try {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        const full = path.join(dir, entry.name);
+        const low = entry.name.toLowerCase();
+        if (entry.isDirectory()) {
+          if (ignoredDirs.has(entry.name) || ignoredDirs.has(low)) continue;
+          if (low === 'dock' || low === '_build_archive') continue;
+          try {
+            if (fs.existsSync(path.join(full, 'Local State')) || fs.existsSync(path.join(full, 'IndexedDB'))) continue;
+          } catch (_) {}
+          walk(full);
+        } else if (entry.isFile()) {
+          try {
+            if (ignoredFiles.has(entry.name)) continue;
+            if (!allowedExts.has(path.extname(entry.name).toLowerCase())) continue;
+            const stat = fs.statSync(full);
+            if (stat.size > 500 * 1024) continue;
+            if (deltaSet && !deltaSet.has(path.resolve(full))) continue;
 
-        const relNormalized = path.relative(cleanRoot, full).replace(/\\/g, '/');
-        const content = fs.readFileSync(full, 'utf8');
-        output += NL + '--- FILE: ' + relNormalized + ' ---' + NL + content + NL;
-        collectedFiles.push({ relNormalized: relNormalized, content: content });
+            const relNormalized = path.relative(cleanRoot, full).replace(/\\/g, '/');
+            const content = fs.readFileSync(full, 'utf8');
+            output += NL + '--- FILE: ' + relNormalized + ' ---' + NL + content + NL;
+            collectedFiles.push({ relNormalized: relNormalized, content: content });
+          } catch (_) {
+            continue;
+          }
+        }
       }
-    }
+    } catch (_) {}
   }
 
   walk(cleanRoot);
@@ -1020,45 +1147,45 @@ const activeCycleJobs = {};
 async function runAutonomousPipeline(cleanRoot, userRequest) {
 activeCycleJobs[cleanRoot] = { running: true, phase: 'PACKING', startedAt: Date.now(), result: null, error: null };
 try {
-await executeCoreAction('pack_workspace', { projectRoot: cleanRoot, mode: 'FULL' });
+await executeCoreAction('pack_workspace', { projectRoot: cleanRoot, mode: 'FULL', _internal: true });
 activeCycleJobs[cleanRoot].phase = 'PLANNING';
-const planRes = await executeCoreAction('run_planner', { projectRoot: cleanRoot, userRequest: userRequest });
+const planRes = await executeCoreAction('run_planner', { projectRoot: cleanRoot, userRequest: userRequest, _internal: true });
 if (planRes.status === 'DELEGATE_TO_ANTIGRAVITY') {
 activeCycleJobs[cleanRoot] = { running: false, phase: 'DELEGATED', result: planRes, error: null };
 return;
 }
 activeCycleJobs[cleanRoot].phase = 'CODING';
-let codeRes = await executeCoreAction('run_coder', { projectRoot: cleanRoot, mode: 'IMPLEMENT' });
+let codeRes = await executeCoreAction('run_coder', { projectRoot: cleanRoot, mode: 'IMPLEMENT', userRequest: userRequest, _internal: true });
 if (codeRes.status === 'DELEGATE_TO_ANTIGRAVITY') {
 activeCycleJobs[cleanRoot] = { running: false, phase: 'DELEGATED', result: codeRes, error: null };
 return;
 }
 activeCycleJobs[cleanRoot].phase = 'APPLYING_AND_TESTING';
-let applyRes = await executeCoreAction('apply_and_test', { projectRoot: cleanRoot });
+let applyRes = await executeCoreAction('apply_and_test', { projectRoot: cleanRoot, _internal: true });
 while (applyRes.status === 'BUILD_OR_TEST_FAILED' && !applyRes.maxRetriesReached) {
 activeCycleJobs[cleanRoot].phase = 'AUTO_HEAL_RETRY_' + applyRes.retryCount;
-codeRes = await executeCoreAction('run_coder', { projectRoot: cleanRoot, mode: 'FIX_ERROR' });
-applyRes = await executeCoreAction('apply_and_test', { projectRoot: cleanRoot });
+codeRes = await executeCoreAction('run_coder', { projectRoot: cleanRoot, mode: 'FIX_ERROR', userRequest: userRequest, _internal: true });
+applyRes = await executeCoreAction('apply_and_test', { projectRoot: cleanRoot, _internal: true });
 }
 if (applyRes.status !== 'APPLIED_AND_GREEN') {
 activeCycleJobs[cleanRoot] = { running: false, phase: 'STOPPED_ON_APPLY', result: applyRes, error: null };
 return;
 }
 activeCycleJobs[cleanRoot].phase = 'REVIEWING';
-let revRes = await executeCoreAction('run_reviewer', { projectRoot: cleanRoot });
+let revRes = await executeCoreAction('run_reviewer', { projectRoot: cleanRoot, _internal: true });
 if (revRes.verdict === 'CHANGES_REQUIRED') {
 const exchangeDir = path.join(cleanRoot, '.antigravity', 'bridge', 'exchange');
 const revContent = fs.existsSync(path.join(exchangeDir, 'review.md')) ? fs.readFileSync(path.join(exchangeDir, 'review.md'), 'utf8') : '';
 const revCheck = validateGeneratedCodeMarkdown(revContent);
 if (revCheck.valid) {
 fs.writeFileSync(path.join(exchangeDir, 'code.md'), revContent, 'utf8');
-applyRes = await executeCoreAction('apply_and_test', { projectRoot: cleanRoot });
+applyRes = await executeCoreAction('apply_and_test', { projectRoot: cleanRoot, _internal: true });
 revRes = { verdict: 'PASSED (APPLIED_REVIEWER_FIX)', engine: revRes.engine };
 } else {
 activeCycleJobs[cleanRoot].phase = 'REVIEW_FIX';
-codeRes = await executeCoreAction('run_coder', { projectRoot: cleanRoot, mode: 'REVIEW_FIX' });
-applyRes = await executeCoreAction('apply_and_test', { projectRoot: cleanRoot });
-revRes = await executeCoreAction('run_reviewer', { projectRoot: cleanRoot });
+codeRes = await executeCoreAction('run_coder', { projectRoot: cleanRoot, mode: 'REVIEW_FIX', userRequest: userRequest, _internal: true });
+applyRes = await executeCoreAction('apply_and_test', { projectRoot: cleanRoot, _internal: true });
+revRes = await executeCoreAction('run_reviewer', { projectRoot: cleanRoot, _internal: true });
 }
 }
 activeCycleJobs[cleanRoot] = {
@@ -1079,8 +1206,40 @@ error: null
 activeCycleJobs[cleanRoot] = { running: false, phase: 'FAILED', result: null, error: err.message };
 }
 }
+
+function resolveAndEmbedExternalFiles(userRequest) {
+  if (!userRequest || typeof userRequest !== 'string') return '';
+  let embedded = '';
+  const quotedRegex = /["']([A-Za-z]:\\[^"'\r\n*?<>|]+|\/[^"'\r\n]+)["']/g;
+  const extRegex = /(?:[A-Za-z]:\\[^"'\r\n\t*?<>|]+?\.(?:txt|md|yaml|yml|json|py|js|ts|sh|ps1|csv|xml|html|zip|diff|patch)|\/[^"'\s\r\n\t]+?\.(?:txt|md|yaml|yml|json|py|js|ts|sh|ps1|csv|xml|html|zip|diff|patch))\b/gi;
+
+  const candidatePaths = [];
+  let qMatch;
+  while ((qMatch = quotedRegex.exec(userRequest)) !== null) {
+    candidatePaths.push(qMatch[1]);
+  }
+  const extMatches = userRequest.match(extRegex) || [];
+  candidatePaths.push(...extMatches);
+
+  const readPaths = new Set();
+  for (let rawPath of candidatePaths) {
+    let clean = rawPath.trim().replace(/^["']|["']$/g, '').replace(/[.,;:]$/, '');
+    if (readPaths.has(clean)) continue;
+    try {
+      if (fs.existsSync(clean) && fs.statSync(clean).isFile()) {
+        readPaths.add(clean);
+        const content = fs.readFileSync(clean, 'utf8');
+        embedded += NL + NL + '=== DOKUMENTI I PLOTE I SPECIFIKIMEVE NGA PERDORUESI: ' + path.basename(clean) + ' ===' + NL +
+                    content + NL +
+                    '=== FUNDI I SPECIFIKIMEVE (ZBATIM 100% I DETYRUESHEM, ZERO-FAKE, ZERO-PLACEHOLDERS) ===';
+      }
+    } catch (_) {}
+  }
+  return embedded;
+}
+
 async function waitJobSlice(cleanRoot, maxSliceMs) {
-if (!maxSliceMs) maxSliceMs = 25000;
+if (!maxSliceMs) maxSliceMs = 5000;
 const start = Date.now();
 while (Date.now() - start < maxSliceMs) {
 const job = activeCycleJobs[cleanRoot];
@@ -1105,7 +1264,7 @@ const projectRoot = payload.projectRoot;
 const cleanRoot = path.resolve(projectRoot);
 
 // SHTYLLA 1: BLLOKADE FIZIKE ME KOD (CYCLE_EXCLUSIVE_LOCK)
-if (action !== 'run_full_cycle' && action !== 'check_cycle_progress') {
+if (action !== 'run_full_cycle' && action !== 'check_cycle_progress' && !payload._internal) {
   if (activeCycleJobs[cleanRoot] && activeCycleJobs[cleanRoot].running) {
     throw new Error('ACTION_REJECTED_CYCLE_IN_PROGRESS: Cikli autopilot eshte aktiv per [' + cleanRoot + '] ne fazen [' + activeCycleJobs[cleanRoot].phase + ']. Ndalohet kategorikisht thirrja e mjeteve anesore! Thirr vetem check_cycle_progress(projectRoot).');
   }
@@ -1114,10 +1273,10 @@ if (action === 'run_full_cycle') {
 if (!activeCycleJobs[cleanRoot] || !activeCycleJobs[cleanRoot].running) {
 runAutonomousPipeline(cleanRoot, payload.userRequest || '');
 }
-return await waitJobSlice(cleanRoot, 25000);
+return await waitJobSlice(cleanRoot, 5000);
 }
 if (action === 'check_cycle_progress') {
-return await waitJobSlice(cleanRoot, 25000);
+return await waitJobSlice(cleanRoot, 5000);
 }
 if (action === 'pack_workspace') {
 const info = packWorkspace(cleanRoot, payload.mode || 'FULL');
@@ -1135,7 +1294,8 @@ const engine = routing.roles.planner;
 if (engine === 'antigravity') return { status: 'DELEGATE_TO_ANTIGRAVITY', role: 'planner', targetFile: planPath };
 const bundle = getBundleAttachmentAndNote(cleanRoot, engine);
 const rule = fs.readFileSync(path.join(PLUGIN_ROOT, 'rules', 'planner_rules.md'), 'utf8');
-const prompt = rule + bundle.note + NL + NL + 'KERKESA E PERDORUESIT:' + NL + (payload.userRequest || 'Analizo dhe planifiko ndryshimet.');
+const embeddedSpecs = resolveAndEmbedExternalFiles(payload.userRequest);
+const prompt = rule + bundle.note + embeddedSpecs + NL + NL + 'KERKESA E PERDORUESIT:' + NL + (payload.userRequest || 'Analizo dhe planifiko ndryshimet.');
 const response = await dispatchToWebTab({
 tabKey: engine,
 projectRoot: cleanRoot,
@@ -1161,7 +1321,8 @@ return { status: 'MAX_RETRIES_EXCEEDED', errorFile: errorPath };
 const bundle = getBundleAttachmentAndNote(cleanRoot, engine);
 const rule = fs.readFileSync(path.join(PLUGIN_ROOT, 'rules', 'coder_rules.md'), 'utf8');
 const planTxt = fs.existsSync(planPath) ? fs.readFileSync(planPath, 'utf8') : '';
-let extraPrompt = bundle.note + NL + NL + '=== PLANI ARKITEKTUROR (plan.md) ===' + NL + planTxt;
+const embeddedSpecs = resolveAndEmbedExternalFiles(payload.userRequest);
+let extraPrompt = bundle.note + embeddedSpecs + NL + NL + '=== PLANI ARKITEKTUROR (plan.md) ===' + NL + planTxt;
 if (payload.mode === 'FIX_ERROR' && fs.existsSync(errorPath)) {
 extraPrompt += NL + NL + '=== GABIMI I TERMINALIT (AUTO-HEAL) ===' + NL + fs.readFileSync(errorPath, 'utf8').slice(-12000);
 }
