@@ -1,5 +1,7 @@
 {
   "positiveWeights": {
+    "4 carbon": 260,
+    "carbon": 250,
     "argon 4 pro high": 250,
     "argon 4 pro": 240,
     "argon": 220,
@@ -15,6 +17,8 @@
     "thinking": 110,
     "high": 90,
     "reasoning": 85,
+    "4 hydrogen": 100,
+    "hydrogen": 95,
     "pro": 80
   },
   "negativeWeights": {
@@ -27,7 +31,6 @@
     "fast": -200,
     "lite": -250,
     "mini": -200,
-    "everyday": -150,
     "standard": -50,
     "upgrade": -500,
     "locked": -500

@@ -42,16 +42,16 @@ const tabAuthStatus = {
 const tabActiveModel = {
   web1: '-', web2: '-',
   gemini1: '-', gemini2: '-', gemini3: '-',
-  google_search_1: '4 Carbon - Most complex work',
-  google_search_2: '4 Carbon - Most complex work',
-  google_search_3: '4 Carbon - Most complex work'
+  google_search_1: '4 Hydrogen · Everyday help & 4 Carbon · Most complex work',
+  google_search_2: '4 Hydrogen · Everyday help & 4 Carbon · Most complex work',
+  google_search_3: '4 Hydrogen · Everyday help & 4 Carbon · Most complex work'
 };
 const tabDiscoveredModels = {
   web1: '-', web2: '-',
   gemini1: '-', gemini2: '-', gemini3: '-',
-  google_search_1: '4 Carbon (Most complex work)',
-  google_search_2: '4 Carbon (Most complex work)',
-  google_search_3: '4 Carbon (Most complex work)'
+  google_search_1: '4 Hydrogen · Everyday help, 4 Carbon · Most complex work',
+  google_search_2: '4 Hydrogen · Everyday help, 4 Carbon · Most complex work',
+  google_search_3: '4 Hydrogen · Everyday help, 4 Carbon · Most complex work'
 };
 const activeProjectPerTab = {};
 const tabLocks = {
@@ -924,52 +924,83 @@ async function dispatchToWebTab(opts) {
   });
 }
 
-async function ensureGoogleSearchAi4CarbonMode(page, tabKey) {
+async function selectGoogleSearchAiModel(page, targetKeyword, tabKey) {
+  const target = (targetKeyword || 'carbon').toLowerCase();
+  const isCarbon = target.includes('carbon') || target.includes('complex');
+  const targetLabel = isCarbon ? '4 Carbon · Most complex work' : '4 Hydrogen · Everyday help';
+
   try {
     const curUrl = page.url() || '';
-    if (curUrl.includes('google.com') && !curUrl.includes('arv=4')) {
-      const sep = curUrl.includes('?') ? '&' : '?';
-      await page.goto(curUrl + sep + 'arv=4', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(function() {});
+    if (!isCarbon && curUrl.includes('arv=4')) {
+      const cleanUrl = curUrl.replace(/([?&])arv=4&?/g, '$1').replace(/[?&]$/, '');
+      await page.goto(cleanUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(function() {});
       await page.waitForTimeout(1500);
     }
 
-    await page.evaluate(async function() {
-      const allButtons = Array.from(document.querySelectorAll('button, [role="button"], [role="combobox"], [aria-haspopup="menu"]'));
+    const res = await page.evaluate(async function(args) {
+      const wantCarbon = args.wantCarbon;
+
+      // 1. Kontrollo nese modeli aktiv eshte tashme ai i duhuri
+      const allButtons = Array.from(document.querySelectorAll('button, [role="button"], [role="combobox"]'));
       const modelBtn = allButtons.find(function(b) {
         const txt = ((b.innerText || '') + ' ' + (b.getAttribute('aria-label') || '')).toLowerCase();
-        return (txt.includes('carbon') || txt.includes('model') || txt.includes('mode') || txt.includes('complex work')) && b.offsetParent !== null;
+        return (txt.includes('carbon') || txt.includes('hydrogen') || txt.includes('complex work') || txt.includes('everyday help') || txt.includes('everyday') || txt.includes('auto')) && b.offsetParent !== null;
       });
 
       if (modelBtn) {
-        const btnTxt = ((modelBtn.innerText || '') + ' ' + (modelBtn.getAttribute('aria-label') || '')).toLowerCase();
-        if (btnTxt.includes('4 carbon') || btnTxt.includes('most complex work')) return;
-
-        modelBtn.click();
-        await new Promise(function(r) { setTimeout(r, 400); });
-
-        const items = Array.from(document.querySelectorAll('[role="menuitem"], [role="option"], [role="menuitemradio"], li, div[role="button"]'));
-        const carbonItem = items.find(function(it) {
-          const t = ((it.innerText || '') + ' ' + (it.getAttribute('aria-label') || '')).toLowerCase();
-          return t.includes('4 carbon') || (t.includes('carbon') && t.includes('complex'));
-        });
-
-        if (carbonItem) {
-          carbonItem.click();
-          await new Promise(function(r) { setTimeout(r, 400); });
-        } else {
-          document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }));
+        const curTxt = ((modelBtn.innerText || '') + ' ' + (modelBtn.getAttribute('aria-label') || '')).toLowerCase();
+        const matches = wantCarbon 
+          ? ((curTxt.includes('carbon') || curTxt.includes('complex')) && !curTxt.includes('hydrogen') && !curTxt.includes('everyday') && !curTxt.includes('auto'))
+          : ((curTxt.includes('hydrogen') || curTxt.includes('everyday') || curTxt.includes('auto')) && !curTxt.includes('carbon') && !curTxt.includes('complex'));
+        if (matches) {
+          return { switched: true, alreadyActive: true, name: modelBtn.innerText || curTxt };
         }
       }
-    }).catch(function() {});
 
-    tabActiveModel[tabKey] = '4 Carbon - Most complex work';
-    tabDiscoveredModels[tabKey] = '4 Carbon (Most complex work)';
-    console.error('[MODEL_LOCKED_4_CARBON] tabKey=' + tabKey + ' -> 4 Carbon - Most complex work');
-    return '4 Carbon - Most complex work';
+      // 2. Hap menynë me butonin [+] ose me butonin e modelit
+      const triggerBtn = modelBtn || document.querySelector('button[aria-label*="Shto skedarë, vegla dhe zgjidh një model" i], button[aria-label*="Add files" i], button.OEueve');
+      if (!triggerBtn) return { switched: false, reason: 'Trigger button not found' };
+
+      triggerBtn.click();
+      await new Promise(function(r) { setTimeout(r, 600); });
+
+      // 3. Gjej artikullin e duhur te modelit (STRIKTISHT: 4 Hydrogen · Everyday help OSE 4 Carbon · Most complex work)
+      const items = Array.from(document.querySelectorAll('[role="menuitemradio"], [role="menuitem"], [role="option"], li, button, div[role="button"]'));
+      const chosenItem = items.find(function(it) {
+        const txt = ((it.innerText || '') + ' ' + (it.getAttribute('aria-label') || '')).toLowerCase();
+        if (wantCarbon) {
+          return (txt.includes('carbon') || txt.includes('complex work') || txt.includes('most complex')) && !txt.includes('hydrogen') && !txt.includes('everyday');
+        } else {
+          return (txt.includes('hydrogen') || txt.includes('everyday help') || txt.includes('everyday') || txt.includes('auto')) && !txt.includes('carbon') && !txt.includes('complex');
+        }
+      });
+
+      if (chosenItem) {
+        chosenItem.click();
+        await new Promise(function(r) { setTimeout(r, 500); });
+        return { switched: true, alreadyActive: false, name: chosenItem.innerText };
+      } else {
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }));
+        return { switched: false, reason: 'Target model not found in menu' };
+      }
+    }, { wantCarbon: isCarbon });
+
+    if (tabKey) {
+      tabActiveModel[tabKey] = targetLabel;
+      tabDiscoveredModels[tabKey] = '4 Hydrogen · Everyday help, 4 Carbon · Most complex work';
+    }
+
+    console.error('[SEARCH_AI_MODEL_SELECT] tabKey=' + tabKey + ' -> ' + targetLabel + ' (sukses=' + res.switched + ', alreadyActive=' + res.alreadyActive + ')');
+    return targetLabel;
   } catch (err) {
-    tabActiveModel[tabKey] = '4 Carbon - Most complex work';
-    return '4 Carbon - Most complex work';
+    if (tabKey) tabActiveModel[tabKey] = targetLabel;
+    console.error('[SEARCH_AI_MODEL_SELECT_ERROR] ' + err.message);
+    return targetLabel;
   }
+}
+
+async function ensureGoogleSearchAi4CarbonMode(page, tabKey) {
+  return selectGoogleSearchAiModel(page, 'carbon', tabKey);
 }
 
 function generateSmartArchitectureMap(projectRoot) {
@@ -1146,8 +1177,21 @@ async function dispatchToGoogleSearchAiTab(opts) {
       await page.waitForTimeout(2500);
     }
 
-    // Selekto me force "4 Carbon - Most complex work"
-    await ensureGoogleSearchAi4CarbonMode(page, tabKey);
+    const isPlannerTask = Boolean(
+      opts.isPlanner || 
+      promptText.includes('CHIEF_ARCHITECT') || 
+      promptText.includes('PLANIFIKUESIT') ||
+      promptText.includes('plan.md')
+    );
+
+    // Zgjedhja e Modelit Fillestar:
+    // Planner-i niset ne 4 Hydrogen (Everyday help) per upload me Python Sandbox
+    // Coder dhe Reviewer nisen direkt ne 4 Carbon (Most complex work)
+    if (isPlannerTask) {
+      await selectGoogleSearchAiModel(page, 'hydrogen', tabKey);
+    } else {
+      await selectGoogleSearchAiModel(page, 'carbon', tabKey);
+    }
 
     if (await checkAuthExpired(page, tabKey)) {
       await captureSupportEvidence(page, cleanRoot, tabKey, 'AUTH_EXPIRED', 'Kerkon Login ne Google Search AI ne Dashboard (http://127.0.0.1:4321).');
@@ -1158,51 +1202,37 @@ async function dispatchToGoogleSearchAiTab(opts) {
 
     const exchangeDir = path.join(cleanRoot, '.antigravity', 'bridge', 'exchange');
     const txtBundlePath = path.join(exchangeDir, 'project_bundle.txt');
-    if (!fs.existsSync(txtBundlePath)) {
+    const zipBundlePath = path.join(exchangeDir, 'project_bundle.zip');
+    if (!fs.existsSync(txtBundlePath) || !fs.existsSync(zipBundlePath)) {
       packWorkspace(cleanRoot, 'FULL');
     }
 
-    const isPlannerTask = Boolean(
-      opts.isPlanner || 
-      promptText.includes('CHIEF_ARCHITECT') || 
-      promptText.includes('PLANIFIKUESIT') ||
-      promptText.includes('plan.md')
-    );
-
-    // BASHKANGJITJA E SKEDAREVE ME BUTONIN [+] (VETEM KUR NUK ESHTE PLANNER)
-    // Per Planner zbatohet Protokolli Universal me Handshake dhe Slices ne tekst per te shmangur limitin 150 KB
     const filesToAttach = [];
     let cleanPrompt = promptText;
 
-    if (!isPlannerTask) {
+    if (isPlannerTask) {
+      // Ne 4 Hydrogen, bashkangjitim arkivin e pastruar .zip (ose .txt)
+      if (fs.existsSync(zipBundlePath)) {
+        filesToAttach.push(zipBundlePath);
+      } else if (fs.existsSync(txtBundlePath)) {
+        filesToAttach.push(txtBundlePath);
+      }
+    } else {
       if (fs.existsSync(txtBundlePath)) {
         filesToAttach.push(txtBundlePath);
       }
+    }
 
-      const specRegex = /=== DOKUMENTI I PLOTE I SPECIFIKIMEVE NGA PERDORUESI:\s*([^\r\n=]+)\s*===([\s\S]*?)=== FUNDI I SPECIFIKIMEVE[^=]*===/g;
-      let match;
-      while ((match = specRegex.exec(promptText)) !== null) {
-        const specName = (match[1] || 'specifikimet').trim().replace(/[^a-zA-Z0-9._-]/g, '_');
-        const specBody = match[2];
-        if (specBody && specBody.length > 4000) {
-          const tempSpecFile = path.join(exchangeDir, 'spec_' + specName + '.txt');
-          fs.writeFileSync(tempSpecFile, specBody.trim(), 'utf8');
-          filesToAttach.push(tempSpecFile);
-          cleanPrompt = cleanPrompt.replace(match[0], NL + NL + '[UDHEZIM: Dokumenti i plote i specifikimeve (' + specName + ') eshte bashkangjitur si skedar fizik me lart. Zbato 100% te gjitha kerkesat.]' + NL);
-        }
-      }
-
-      if (filesToAttach.length > 0) {
-        console.error('[SEARCH_AI] Duke bashkangjitur skedaret fizike permes butonit [+]: ' + filesToAttach.map(f => path.basename(f)).join(', '));
-        const plusBtn = page.locator('button[aria-label*="Shto skedarë" i], button[aria-label*="Add files" i]').first();
-        if (await plusBtn.count() > 0) {
-          await plusBtn.click({ force: true }).catch(function() {});
-          await page.waitForTimeout(600);
-          const fileInput = page.locator('button[aria-label*="Shto skedarë" i] input[type="file"], input[type="file"]').first();
-          if (await fileInput.count() > 0) {
-            await fileInput.setInputFiles(filesToAttach).catch(function() {});
-            await page.waitForTimeout(2500);
-          }
+    if (filesToAttach.length > 0) {
+      console.error('[SEARCH_AI] Duke bashkangjitur skedarin: ' + filesToAttach.map(f => path.basename(f)).join(', '));
+      const plusBtn = page.locator('button[aria-label*="Shto skedarë, vegla dhe zgjidh një model" i], button[aria-label*="Shto skedarë" i], button[aria-label*="Add files" i], button.OEueve').first();
+      if (await plusBtn.count() > 0) {
+        await plusBtn.click({ force: true }).catch(function() {});
+        await page.waitForTimeout(600);
+        const fileInput = page.locator('button[aria-label*="Shto skedarë" i] input[type="file"], input[type="file"]').first();
+        if (await fileInput.count() > 0) {
+          await fileInput.setInputFiles(filesToAttach).catch(function() {});
+          await page.waitForTimeout(2500);
         }
       }
     }
@@ -1454,22 +1484,36 @@ async function dispatchToGoogleSearchAiTab(opts) {
           console.error('[SEARCH_AI_PLANNER] [CHAT_RESET] Modeli nuk u bind. Duke hapur CHAT TË RI të pastër (Tentativa ' + chatAttempt + ')...');
           await page.goto(GOOGLE_SEARCH_AI_URL, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(function() {});
           await page.waitForTimeout(3000);
-          await ensureGoogleSearchAi4CarbonMode(page, tabKey);
+          await selectGoogleSearchAiModel(page, 'hydrogen', tabKey);
+
+          if (filesToAttach.length > 0) {
+            console.error('[SEARCH_AI] Duke ri-bashkangjitur skedarët në bisedën e re...');
+            const plusBtn = page.locator('button[aria-label*="Shto skedarë, vegla dhe zgjidh një model" i], button[aria-label*="Shto skedarë" i], button[aria-label*="Add files" i], button.OEueve').first();
+            if (await plusBtn.count() > 0) {
+              await plusBtn.click({ force: true }).catch(function() {});
+              await page.waitForTimeout(600);
+              const fileInput = page.locator('button[aria-label*="Shto skedarë" i] input[type="file"], input[type="file"]').first();
+              if (await fileInput.count() > 0) {
+                await fileInput.setInputFiles(filesToAttach).catch(function() {});
+                await page.waitForTimeout(2500);
+              }
+            }
+          }
         }
 
-        // ==================== HAPI 1: PROTOKOLLI HANDSHAKE ====================
-        console.error('[SEARCH_AI_PLANNER] [HAPI_1_HANDSHAKE] Dërgimi i Hartës Arkitekturore për konfirmim...');
+        // ==================== HAPI 1: PROTOKOLLI HANDSHAKE NË 4 HYDROGEN ====================
+        console.error('[SEARCH_AI_PLANNER] [HAPI_1_HANDSHAKE] Dërgimi i kërkesës së shpaketimit në 4 Hydrogen...');
         const handshakePrompt = 
-          '=== PROTOKOLLI I PLANIFIKIMIT (HAPI 1: HARTA ARKITEKTURORE E PROJEKTIT) ===' + NL +
+          '=== PROTOKOLLI I INGESTION-IT (4 HYDROGEN - HAPI 1) ===' + NL +
           '[ROLI: KRYEARKITEKT SISTEMESH & PLANIFIKUES TEKNIK I MULTI-AI RELAY]' + NL +
           'Projekti: ' + path.basename(cleanRoot) + NL + NL +
           archMap + NL + NL +
-          '=== URDHËR OPERATIV HANDSHAKE (KONFIRMIM I DETYRUESHËM) ===' + NL +
-          'Lexo dhe memorizo me kujdes strukturën, kontratat dhe modulet ekzistuese të këtij projekti më lart.' + NL +
+          (filesToAttach.length > 0 ? ('Ke të bashkëngjitur arkivin e pastruar të kodit të projektit (' + filesToAttach.map(f => path.basename(f)).join(', ') + ').' + NL +
+          'Përdor mjedisin tënd të brendshëm Python për ta shpaketuar, lexuar pemën e dosjeve dhe indeksuar modulet.' + NL) : '') +
           'Në këtë hap, MOS shkruaj plan, MOS gjenero kod dhe MOS bëj asnjë propozim ndryshimesh.' + NL +
           'Përgjigju TANI VETËM me fjalët ekzakte:' + NL +
           '"OK e lexova, vazhdojmë me hapin e radhës."' + NL +
-          '================================================================';
+          '========================================================';
 
         let handshakeSuccess = false;
         let lastAnswerText = '';
@@ -1480,8 +1524,7 @@ async function dispatchToGoogleSearchAiTab(opts) {
             hPrompt = 
               '=== VËREJTJE OPERATIVE DISIPLINORE PËR HANDSHAKE (NIVELI 2) ===' + NL +
               'Përgjigja jote devijoi nga urdhri!' + NL +
-              'NDALOHET ÇDO SHPJEGIM OSE PROPOZIM KODI NË KËTË HAP.' + NL +
-              'Përgjigju TANI VETËM me fjalët ekzakte pa asnjë fjalë tjetër:' + NL +
+              'Shpaketo skedarin me Python dhe përgjigju TANI VETËM me fjalët ekzakte pa asnjë fjalë tjetër:' + NL +
               '"OK e lexova, vazhdojmë me hapin e radhës."';
           } else if (hLevel === 3) {
             hPrompt = 
@@ -1495,7 +1538,7 @@ async function dispatchToGoogleSearchAiTab(opts) {
             lastAnswerText = hRes;
             const lowH = (hRes || '').toLowerCase();
             if (lowH.includes('ok') || lowH.includes('lexova') || lowH.includes('vazhdo') || lowH.includes('hapin e radhës') || lowH.includes('hapin e radhes')) {
-              console.error('[SEARCH_AI_PLANNER] [HANDSHAKE_SUKSES] Modeli konfirmoi arkitekturën (' + hRes.trim().slice(0, 80) + ')');
+              console.error('[SEARCH_AI_PLANNER] [HANDSHAKE_SUKSES] Modeli 4 Hydrogen konfirmoi shpaketimin (' + hRes.trim().slice(0, 80) + ')');
               handshakeSuccess = true;
               break;
             } else {
@@ -1513,19 +1556,24 @@ async function dispatchToGoogleSearchAiTab(opts) {
           throw new Error('PLANNER_HANDSHAKE_FAILED: Modeli nuk konfirmoi leximin e arkitekturës.');
         }
 
-        // ==================== HAPI 2..N: FAZAT E SPECIFIKIMIT DHE PLANIFIKIMIT ====================
+        // ==================== TRANZICIONI NË 4 CARBON ====================
+        console.error('[SEARCH_AI_PLANNER] [TRANZICIONI] Modeli 4 Hydrogen e indeksoi kodin me sukses. Duke kaluar sesionin ne 4 Carbon - Most complex work...');
+        await selectGoogleSearchAiModel(page, 'carbon', tabKey);
+        await page.waitForTimeout(1000);
+
+        // ==================== HAPI 2..N: FAZAT E SPECIFIKIMIT DHE PLANIFIKIMIT (4 CARBON) ====================
         const phasePlans = [];
         let allPhasesValid = true;
 
         for (let fIdx = 0; fIdx < totalFaza; fIdx++) {
           const fazaNum = fIdx + 1;
           const sliceText = specSlices[fIdx];
-          console.error('[SEARCH_AI_PLANNER] Ekzekutimi i Fazës ' + fazaNum + ' nga ' + totalFaza + ' (' + sliceText.length + ' karaktere)...');
+          console.error('[SEARCH_AI_PLANNER] [4_CARBON] Ekzekutimi i Fazës ' + fazaNum + ' nga ' + totalFaza + ' (' + sliceText.length + ' karaktere)...');
 
           const slicePromptL1 = 
-            '=== PROTOKOLLI I PLANIFIKIMIT (FAZA ' + fazaNum + ' NGA ' + totalFaza + ': SPECIFIKIMI I KËRKESËS) ===' + NL +
+            '=== PROTOKOLLI I PLANIFIKIMIT (4 CARBON - FAZA ' + fazaNum + ' NGA ' + totalFaza + ') ===' + NL +
             '[URDHER OPERATIV NGA ORCHESTRATORI - ZBATO PA ASNJË DEVIJIM]' + NL +
-            'Mbi bazën e arkitekturës së projektit që miratove në Handshake, ja pjesa ' + fazaNum + '/' + totalFaza + ' e specifikimeve funksionale:' + NL + NL +
+            'Mbi bazën e arkitekturës dhe kodit të shpaketuar që miratove në Handshake, ja pjesa ' + fazaNum + '/' + totalFaza + ' e specifikimeve funksionale:' + NL + NL +
             sliceText + NL + NL +
             'KUFIZIM I DETYRUESHËM ANTI-TIMEOUT (120–180 RRESHTA / MAKSIMUMI 8–10 KB):' + NL +
             'Përgjigja jote për këtë fazë DUHET të jetë STRIKTISHT midis 120 dhe 180 rreshtave tekst/kod (jo më shumë se 8–10 KB).' + NL +
@@ -2166,12 +2214,24 @@ extraPrompt += NL + NL + '=== GABIMI I TERMINALIT (AUTO-HEAL) ===' + NL + fs.rea
 if (payload.mode === 'REVIEW_FIX' && fs.existsSync(reviewPath)) {
 extraPrompt += NL + NL + '=== VEREJTJET E AUDITORIT (review.md) ===' + NL + fs.readFileSync(reviewPath, 'utf8');
 }
-let response = await dispatchToWebTab({
-tabKey: engine,
-projectRoot: cleanRoot,
-promptText: rule + extraPrompt,
-attachmentPaths: [bundle.path]
-});
+let response;
+if (engine.startsWith('google_search_')) {
+  response = await dispatchToGoogleSearchAiTab({
+    tabKey: engine,
+    projectRoot: cleanRoot,
+    promptText: rule + extraPrompt,
+    bundlePath: bundle.path,
+    isPlanner: false,
+    userRequest: payload.userRequest
+  });
+} else {
+  response = await dispatchToWebTab({
+    tabKey: engine,
+    projectRoot: cleanRoot,
+    promptText: rule + extraPrompt,
+    attachmentPaths: [bundle.path]
+  });
+}
 const lowCode = (response || '').toLowerCase();
 const isCodeRefusal = SERVICE_ERROR_PATTERNS.some(function(p) { return lowCode.includes(p); });
 if (!response || response.trim().length < 60 || isCodeRefusal) {
@@ -2179,12 +2239,22 @@ if (!response || response.trim().length < 60 || isCodeRefusal) {
 }
 const validation = validateGeneratedCodeMarkdown(response);
 if (!validation.valid) {
-response = await dispatchToWebTab({
-tabKey: engine,
-projectRoot: cleanRoot,
-promptText: 'KORRIGJIM FORMATI I DETYRUESHEM: ' + validation.reason + NL + 'Kthe kodin 100% te plote per cdo skedar me etiketen e sakte ### FILE: rruga/skedari.ext.',
-attachmentPaths: []
-});
+  const corrPrompt = 'KORRIGJIM FORMATI I DETYRUESHEM: ' + validation.reason + NL + 'Kthe kodin 100% te plote per cdo skedar me etiketen e sakte ### FILE: rruga/skedari.ext.';
+  if (engine.startsWith('google_search_')) {
+    response = await dispatchToGoogleSearchAiTab({
+      tabKey: engine,
+      projectRoot: cleanRoot,
+      promptText: corrPrompt,
+      isPlanner: false
+    });
+  } else {
+    response = await dispatchToWebTab({
+      tabKey: engine,
+      projectRoot: cleanRoot,
+      promptText: corrPrompt,
+      attachmentPaths: []
+    });
+  }
 }
 fs.writeFileSync(codePath, response, 'utf8');
 writeProjectState(cleanRoot, { phase: 'CODED', lastStatus: 'CODE_READY' });
@@ -2204,12 +2274,23 @@ const rule = fs.readFileSync(path.join(PLUGIN_ROOT, 'rules', 'reviewer_rules.md'
 const planTxt = fs.existsSync(planPath) ? fs.readFileSync(planPath, 'utf8') : '';
 const logTxt = fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8').slice(-8000) : 'NOT_RUN';
 const revPrompt = rule + NL + NL + '=== PLANI ===' + NL + planTxt + NL + NL + '=== BUILD/TEST LOG ===' + NL + logTxt;
-const response = await dispatchToWebTab({
-tabKey: engine,
-projectRoot: cleanRoot,
-promptText: revPrompt,
-attachmentPaths: [codePath]
-});
+let response;
+if (engine.startsWith('google_search_')) {
+  response = await dispatchToGoogleSearchAiTab({
+    tabKey: engine,
+    projectRoot: cleanRoot,
+    promptText: revPrompt,
+    bundlePath: codePath,
+    isPlanner: false
+  });
+} else {
+  response = await dispatchToWebTab({
+    tabKey: engine,
+    projectRoot: cleanRoot,
+    promptText: revPrompt,
+    attachmentPaths: [codePath]
+  });
+}
 fs.writeFileSync(reviewPath, response, 'utf8');
 const approved = response.includes('STATUS: APPROVED') || response.includes('STATUS: PASSED');
 writeProjectState(cleanRoot, {
@@ -2329,9 +2410,6 @@ return res.end(JSON.stringify({ ok: true }));
       const pages = visibleCtx.pages();
       const loginPage = (pages.length > 0 && !pages[0].isClosed()) ? pages[0] : await visibleCtx.newPage();
       await loginPage.goto(targetUrl, { waitUntil: 'domcontentloaded' }).catch(function() {});
-      if (reqName.startsWith('google_search_')) {
-        await ensureGoogleSearchAi4CarbonMode(loginPage, reqName).catch(function() {});
-      }
       await loginPage.bringToFront().catch(function() {});
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
