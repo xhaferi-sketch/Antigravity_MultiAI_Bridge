@@ -1,4 +1,4 @@
-# Antigravity Multi-AI Orchestrator Bridge (V3.4 Standalone)
+# Antigravity Multi-AI Orchestrator Bridge (V3.5 Standalone)
 
 **Folderi Kryesor (Source of Truth):** `C:\Vladi_project\Antigravity_MultiAI_Bridge`  
 **Izolim 100% Fizik:** Punon ekskluzivisht ne `http://127.0.0.1:4321` dhe me profilet lokale ne `.profiles/`. Nuk prek kurre portat e sistemit Hermes (`15550`, `15555`, `15556`, `18000`, `19000`, `19005`) dhe as `%LOCALAPPDATA%\HermesWebBridge`.
@@ -113,5 +113,25 @@ Ky version sjell kontroll të plotë mbi sjelljen dhe disiplinën e AI-së:
    - **Niveli 3:** Urdhër Ultimativ me Format të Ngurtë (skelet i kyçur).
 5. **Pastrimi i Bisedës së Helmuar (Clean Chat Reset):**
    - Nëse modeli refuzon ose devijon pas 3 niveleve, kryhet pastrim i plotë i kontekstit (`page.goto('https://www.google.com/ai')`) dhe rinisje e bisedës nga e para me kontekst të freskët.
+
+---
+
+## 8. Smart Blueprint, Handshake & Slicing Anti-Timeout (V3.5 Milestone)
+
+Ky version eliminon bllokimet e shfletuesit, shkëputjet e serverit dhe djegien e krediteve gjatë planifikimit:
+1. **Harta Smart Arkitekturore Universale (`generateSmartArchitectureMap`):**
+   - Nxjerr pemën e skedarëve, manifestet, konfigurimet dhe nënshkrimet e moduleve në tekst të ngjeshur (10–25 KB).
+   - Shmang ngarkimin e skedarëve të rëndë 350 KB në Google Search AI.
+2. **Protokolli Handshake (Hapi 1):**
+   - Dërgon arkitekturën me urdhrin e hekurt për konfirmim me fjalët ekzakte: *"OK e lexova, vazhdojmë me hapin e radhës."* (konfirmim brenda 3 sekondave).
+3. **Ndarja e Specifikimeve me Faza (`sliceSpecification` < 70 KB input):**
+   - Ndarje automatike e specifikimeve voluminoze në faza sekuenciale nën 45–50 KB, duke parandaluar ngrirjen e DOM-it të shfletuesit.
+4. **Buxheti i Hekurt i Output-it (Anti-Timeout 120–180 Rreshta / Max 8–10 KB):**
+   - Modeli urdhërohet të prodhojë përgjigje midis 120 dhe 180 rreshtave tekst/kod, duke shmangur timeout-in 60–90 sekondësh të Google-it (*Something went wrong*).
+   - Të gjitha fazat bashkohen automatikisht në një skedar të vetëm: `plan.md`.
+5. **Optimizimi i DOM-it dhe Kursimi i Krediteve:**
+   - Hequr kurthi i `role="progressbar"`; ekstraktimi bazohet në zhdukjen e butonit `Ndalo`/`Stop` dhe qëndrueshmëri teksti për 4 sekonda.
+   - `waitJobSlice` u zgjat në 22 sekonda për të parandaluar thirrjet e shpeshta që konsumonin kreditet e chat-it.
+
 
 

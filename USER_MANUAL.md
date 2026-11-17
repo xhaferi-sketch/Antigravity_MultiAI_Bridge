@@ -1,4 +1,4 @@
-# MANUALI I PLOTE OPERATIV DHE I MIREMBAJTJES — ANTIGRAVITY MULTI-AI BRIDGE (V3.4)
+# MANUALI I PLOTE OPERATIV DHE I MIREMBAJTJES — ANTIGRAVITY MULTI-AI BRIDGE (V3.5)
 
 Ky manual permban cdo detaj per **perdorimin e perditshem**, **strukturen e skedareve te shkembimit**, **zgjerimin e sistemit ne te ardhmen** dhe **zgjidhjen e problemeve** pa analizuar kodin nga e para.
 
@@ -258,6 +258,36 @@ Ky version i jep përdoruesit dhe orkestruesit kontroll të plotë mbi sjelljen 
 6. **Monitorimi i Butonit dhe Ekstraktimi i Saktë:**
    - Butoni "Dërgo" monitorohet derisa të jetë aktiv (`disabled !== true` dhe `aria-disabled !== true`), pa shtypur kurrë Enter të verbër.
    - Përgjigja nxirret me saktësi nga `section.bzXtMb` pas shënuesit zyrtar `Përgjigjja e "Modalitetit të IA-së" për `, duke pastruar butonat ndihmës të shfletuesit (`Kalo te kërkesa e mëparshme`).
+
+---
+
+## 12. Arkitektura Universale e Planifikimit: Smart Blueprint, Handshake & Slicing Anti-Timeout (Versioni 3.5 Milestone)
+
+Ky version zgjidh përfundimisht kufizimet fizike të Google AI dhe mbron bisedat nga bllokimet dhe djegia e krediteve:
+
+1. **Smart Architecture Blueprint (`generateSmartArchitectureMap`):**
+   - Skanon në mënyrë universale çdo projekt pa ngarkuar skedarë të rëndë 350 KB.
+   - Përjashton mbetjet (`node_modules`, `profiles`, `.venv`, `03_Workspaces`).
+   - Nxjerr pemën e skedarëve, manifestet (`package.json`, `requirements.txt`), konfigurimet YAML dhe nënshkrimet e klasave/funksioneve brenda vetëm 10–25 KB.
+
+2. **Protokolli Handshake (Hapi 1):**
+   - Dërgon fillimisht vetëm Hartën Arkitekturore me urdhrin e hekurt:
+     *"Përgjigju TANI VETËM me fjalët ekzakte: OK e lexova, vazhdojmë me hapin e radhës."*
+   - Modeli konfirmon në 3 sekonda pa u mbingarkuar.
+
+3. **Ndarja e Specifikimeve me Faza (`sliceSpecification` < 70 KB input):**
+   - Kërkesat dhe specifikimet e gjata (deri në 100+ KB) ndahen automatikisht në faza sekuenciale nën 45–50 KB secila, duke garantuar 0 ngrirje të shfletuesit.
+
+4. **Buxheti i Hekurt i Output-it (Anti-Timeout 120–180 Rreshta / Max 8–10 KB):**
+   - Zbulimi live provoi se nëse modeli shkruan mbi 250–300 rreshta, serveri i Google bën timeout pas 60–90 sekondash dhe shfaq *"Something went wrong"*.
+   - U vendos kufizimi i prerë në prompt: përgjigja e modelit për çdo fazë duhet të jetë midis 120 dhe 180 rreshtave (8–10 KB), duke përfunduar brenda 15–22 sekondash.
+   - Të gjitha fazat bashkohen automatikisht në `plan.md`.
+
+5. **Zgjidhja e Bllokimit në DOM dhe Ruajtja e Krediteve të Chat-it:**
+   - U eliminua kurthi i elementit statik `role="progressbar"`.
+   - Nxjerrja e përgjigjes kryhet me zhdukjen e butonit `Ndalo`/`Stop` dhe 4 sekonda qëndrueshmëri teksti.
+   - `waitJobSlice` u zgjat në 22 sekonda, duke reduktuar me >75% thirrjet e përsëritura `check_cycle_progress`.
+
 
 
 

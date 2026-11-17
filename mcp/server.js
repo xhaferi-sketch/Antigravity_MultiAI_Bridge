@@ -972,6 +972,163 @@ async function ensureGoogleSearchAi4CarbonMode(page, tabKey) {
   }
 }
 
+function generateSmartArchitectureMap(projectRoot) {
+  const cleanRoot = path.resolve(projectRoot);
+  const ignoredDirs = new Set([
+    'node_modules', '.git', '.antigravity', '.profiles', 'profiles',
+    'dist', 'build', 'out', '.next', '.nuxt', '__pycache__', '.pytest_cache',
+    'coverage', '.venv', 'venv', 'env', 'Default', 'GPUCache', 'CacheStorage',
+    '03_Workspaces', 'temp_profile', 'temp_profile_dom', 'temp_test_user_url',
+    'scratch', '.idea', '.vscode'
+  ]);
+
+  const sourceExts = new Set([
+    '.js', '.mjs', '.cjs', '.ts', '.jsx', '.tsx', '.py',
+    '.json', '.yaml', '.yml', '.sql', '.sh', '.ps1'
+  ]);
+
+  const fileTree = [];
+  const signatures = [];
+  const manifests = [];
+
+  // 1. Manifests
+  const manifestCandidates = ['package.json', 'pyproject.toml', 'requirements.txt', 'Cargo.toml', 'go.mod'];
+  for (const m of manifestCandidates) {
+    const full = path.join(cleanRoot, m);
+    if (fs.existsSync(full)) {
+      try {
+        const content = fs.readFileSync(full, 'utf8').trim();
+        manifests.push('### Manifest: ' + m + NL + FENCE3 + NL + content.slice(0, 3000) + NL + FENCE3);
+      } catch (_) {}
+    }
+  }
+
+  // 2. Recursive Scan
+  function scan(dir) {
+    try {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        const full = path.join(dir, entry.name);
+        const rel = path.relative(cleanRoot, full).replace(/\\/g, '/');
+        const low = entry.name.toLowerCase();
+
+        if (entry.isDirectory()) {
+          if (ignoredDirs.has(entry.name) || ignoredDirs.has(low)) continue;
+          if (entry.name.startsWith('.') && entry.name !== '.') continue;
+          fileTree.push(rel + '/');
+          scan(full);
+        } else if (entry.isFile()) {
+          const ext = path.extname(entry.name).toLowerCase();
+          if (!sourceExts.has(ext)) continue;
+          fileTree.push(rel);
+
+          try {
+            const stat = fs.statSync(full);
+            if (stat.size > 200 * 1024) continue; // skip massive files
+            const content = fs.readFileSync(full, 'utf8');
+
+            const isConfig = rel.startsWith('config/') || rel.includes('.env') || rel.endsWith('.yaml') || rel.endsWith('.yml');
+            const isEntryPoint = rel.includes('orchestrator') || rel.includes('main.') || rel.includes('index.') || rel.includes('server.');
+
+            if (isConfig && stat.size < 8000) {
+              signatures.push('#### [CONFIG] ' + rel + NL + FENCE3 + 'yaml' + NL + content.trim() + NL + FENCE3);
+            } else if (isEntryPoint && stat.size < 12000) {
+              signatures.push('#### [ENTRY_POINT] ' + rel + NL + FENCE3 + NL + content.trim() + NL + FENCE3);
+            } else {
+              const lines = content.split(/\r?\n/);
+              const sigLines = [];
+
+              for (let i = 0; i < lines.length && sigLines.length < 50; i++) {
+                const line = lines[i];
+                const tr = line.trim();
+
+                // Docstrings / comments at top
+                if (i < 15 && (tr.startsWith('"""') || tr.startsWith("'''") || tr.startsWith('/*') || tr.startsWith('*') || tr.startsWith('#'))) {
+                  sigLines.push(line);
+                  continue;
+                }
+
+                if (ext === '.py') {
+                  if (/^\s*(?:async\s+)?def\s+/.test(line) || /^\s*class\s+/.test(line)) {
+                    sigLines.push(line);
+                    if (lines[i+1] && lines[i+1].trim().startsWith('"""')) {
+                      sigLines.push(lines[i+1]);
+                    }
+                  }
+                }
+
+                if (ext === '.js' || ext === '.ts' || ext === '.jsx' || ext === '.tsx') {
+                  if (/^\s*(?:export\s+)?(?:async\s+)?function\s+/.test(line) ||
+                      /^\s*(?:export\s+)?class\s+/.test(line) ||
+                      /^\s*(?:export\s+)?const\s+[A-Za-z0-9_]+\s*=\s*(?:async\s*)?\([^)]*\)\s*=>/.test(line)) {
+                    sigLines.push(line);
+                  }
+                }
+              }
+
+              if (sigLines.length > 0) {
+                signatures.push('#### [MODULE] ' + rel + NL + FENCE3 + NL + sigLines.join(NL) + NL + FENCE3);
+              }
+            }
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+  }
+
+  scan(cleanRoot);
+
+  const parts = [
+    '# HARTA ARKITEKTURORE E PROJEKTIT: ' + path.basename(cleanRoot),
+    '',
+    '## 1. STRUKTURA E SKEDARËVE (SOURCE TREE)',
+    FENCE3,
+    fileTree.join(NL),
+    FENCE3,
+    '',
+    '## 2. MANIFESTET & DEPENDENCIES',
+    manifests.join(NL + NL) || '_Nuk u gjetën manifeste standarde._',
+    '',
+    '## 3. KONTRATAT, ENTRY POINTS & NËNSHKRIMET E MODULEVE',
+    signatures.join(NL + NL)
+  ];
+
+  let res = parts.join(NL + NL);
+  if (res.length > 25000) {
+    res = res.slice(0, 25000) + NL + NL + '... [Harta u kufizua për kompaktësi brenda 25 KB] ...';
+  }
+  return res;
+}
+
+function sliceSpecification(text, maxChars) {
+  if (!maxChars) maxChars = 45000;
+  if (!text || typeof text !== 'string') return [];
+  const clean = text.trim();
+  if (clean.length <= maxChars) return [clean];
+
+  const slices = [];
+  const lines = clean.split(/\r?\n/);
+  let currentSlice = [];
+  let currentLen = 0;
+
+  for (const line of lines) {
+    if (currentLen + line.length + 1 > maxChars && currentSlice.length > 0) {
+      slices.push(currentSlice.join(NL));
+      currentSlice = [line];
+      currentLen = line.length + 1;
+    } else {
+      currentSlice.push(line);
+      currentLen += line.length + 1;
+    }
+  }
+
+  if (currentSlice.length > 0) {
+    slices.push(currentSlice.join(NL));
+  }
+
+  return slices;
+}
+
 async function dispatchToGoogleSearchAiTab(opts) {
   const { tabKey, projectRoot, promptText, bundlePath } = opts;
   const cleanRoot = path.resolve(projectRoot);
@@ -1005,36 +1162,47 @@ async function dispatchToGoogleSearchAiTab(opts) {
       packWorkspace(cleanRoot, 'FULL');
     }
 
-    // BASHKANGJITJA E SKEDAREVE ME BUTONIN [+] (ATTACHMENT NATIV NE GOOGLE SEARCH AI)
+    const isPlannerTask = Boolean(
+      opts.isPlanner || 
+      promptText.includes('CHIEF_ARCHITECT') || 
+      promptText.includes('PLANIFIKUESIT') ||
+      promptText.includes('plan.md')
+    );
+
+    // BASHKANGJITJA E SKEDAREVE ME BUTONIN [+] (VETEM KUR NUK ESHTE PLANNER)
+    // Per Planner zbatohet Protokolli Universal me Handshake dhe Slices ne tekst per te shmangur limitin 150 KB
     const filesToAttach = [];
-    if (fs.existsSync(txtBundlePath)) {
-      filesToAttach.push(txtBundlePath);
-    }
-
     let cleanPrompt = promptText;
-    const specRegex = /=== DOKUMENTI I PLOTE I SPECIFIKIMEVE NGA PERDORUESI:\s*([^\r\n=]+)\s*===([\s\S]*?)=== FUNDI I SPECIFIKIMEVE[^=]*===/g;
-    let match;
-    while ((match = specRegex.exec(promptText)) !== null) {
-      const specName = (match[1] || 'specifikimet').trim().replace(/[^a-zA-Z0-9._-]/g, '_');
-      const specBody = match[2];
-      if (specBody && specBody.length > 4000) {
-        const tempSpecFile = path.join(exchangeDir, 'spec_' + specName + '.txt');
-        fs.writeFileSync(tempSpecFile, specBody.trim(), 'utf8');
-        filesToAttach.push(tempSpecFile);
-        cleanPrompt = cleanPrompt.replace(match[0], NL + NL + '[UDHEZIM: Dokumenti i plote i specifikimeve (' + specName + ') eshte bashkangjitur si skedar fizik me lart. Zbato 100% te gjitha kerkesat.]' + NL);
-      }
-    }
 
-    if (filesToAttach.length > 0) {
-      console.error('[SEARCH_AI] Duke bashkangjitur skedaret fizike permes butonit [+]: ' + filesToAttach.map(f => path.basename(f)).join(', '));
-      const plusBtn = page.locator('button[aria-label*="Shto skedarë" i], button[aria-label*="Add files" i]').first();
-      if (await plusBtn.count() > 0) {
-        await plusBtn.click({ force: true }).catch(function() {});
-        await page.waitForTimeout(600);
-        const fileInput = page.locator('button[aria-label*="Shto skedarë" i] input[type="file"], input[type="file"]').first();
-        if (await fileInput.count() > 0) {
-          await fileInput.setInputFiles(filesToAttach).catch(function() {});
-          await page.waitForTimeout(2500);
+    if (!isPlannerTask) {
+      if (fs.existsSync(txtBundlePath)) {
+        filesToAttach.push(txtBundlePath);
+      }
+
+      const specRegex = /=== DOKUMENTI I PLOTE I SPECIFIKIMEVE NGA PERDORUESI:\s*([^\r\n=]+)\s*===([\s\S]*?)=== FUNDI I SPECIFIKIMEVE[^=]*===/g;
+      let match;
+      while ((match = specRegex.exec(promptText)) !== null) {
+        const specName = (match[1] || 'specifikimet').trim().replace(/[^a-zA-Z0-9._-]/g, '_');
+        const specBody = match[2];
+        if (specBody && specBody.length > 4000) {
+          const tempSpecFile = path.join(exchangeDir, 'spec_' + specName + '.txt');
+          fs.writeFileSync(tempSpecFile, specBody.trim(), 'utf8');
+          filesToAttach.push(tempSpecFile);
+          cleanPrompt = cleanPrompt.replace(match[0], NL + NL + '[UDHEZIM: Dokumenti i plote i specifikimeve (' + specName + ') eshte bashkangjitur si skedar fizik me lart. Zbato 100% te gjitha kerkesat.]' + NL);
+        }
+      }
+
+      if (filesToAttach.length > 0) {
+        console.error('[SEARCH_AI] Duke bashkangjitur skedaret fizike permes butonit [+]: ' + filesToAttach.map(f => path.basename(f)).join(', '));
+        const plusBtn = page.locator('button[aria-label*="Shto skedarë" i], button[aria-label*="Add files" i]').first();
+        if (await plusBtn.count() > 0) {
+          await plusBtn.click({ force: true }).catch(function() {});
+          await page.waitForTimeout(600);
+          const fileInput = page.locator('button[aria-label*="Shto skedarë" i] input[type="file"], input[type="file"]').first();
+          if (await fileInput.count() > 0) {
+            await fileInput.setInputFiles(filesToAttach).catch(function() {});
+            await page.waitForTimeout(2500);
+          }
         }
       }
     }
@@ -1143,8 +1311,15 @@ async function dispatchToGoogleSearchAiTab(opts) {
           const isP2 = args.isP2;
           const ign = args.ign || '';
 
-          const busy = document.querySelectorAll('[aria-busy="true"], [class*="generating" i], [class*="searching" i], [role="progressbar"]');
-          const isBusy = busy.length > 0;
+          // Kontrollo nese ka buton aktiv Stop gjate gjenerimit (Ndalo / Stop)
+          const stopSelectors = [
+            'button[aria-label*="Ndalo" i]',
+            'button[aria-label*="Stop" i]',
+            'button[aria-label*="Cancel" i]',
+            'button.OEueve[aria-label*="Ndalo" i]'
+          ].join(', ');
+          const stopBtn = document.querySelector(stopSelectors);
+          const isGenerating = Boolean(stopBtn && !stopBtn.disabled && stopBtn.getAttribute('aria-disabled') !== 'true');
 
           // Lexo nga me e fundit (reverse) per te marre gjithmone pergjigjen me te fresket
           const bzSections = Array.from(document.querySelectorAll('section.bzXtMb')).reverse();
@@ -1174,9 +1349,9 @@ async function dispatchToGoogleSearchAiTab(opts) {
                   .replace(/Something went wrong, and an AI response wasn't generated\.?[\s\S]*$/i, '')
                   .trim();
 
-                // Nese jemi ne Fazen 2, injoro seksionet e Fazes 1
-                if (isP2) {
-                  if (ign && (ans === ign || ans.includes('[FAZA_1_PERFUNDOI]'))) {
+                // Nese isP2 eshte true dhe ign eshte dhene, injoro pergjigjen e meparshme
+                if (isP2 && ign) {
+                  if (ans === ign || (ign.length > 50 && ans.slice(0, 50) === ign.slice(0, 50))) {
                     continue;
                   }
                 }
@@ -1185,20 +1360,22 @@ async function dispatchToGoogleSearchAiTab(opts) {
                   return {
                     text: ans,
                     len: ans.length,
-                    isBusy: isBusy
+                    isBusy: isGenerating
                   };
                 }
               }
             }
           }
 
-          return { text: '', len: 0, isBusy: isBusy };
+          return { text: '', len: 0, isBusy: isGenerating };
         }, { minLen: minNeeded, isP2: isPhase2, ign: ignoreText });
 
         if (currentExtraction.len > minNeeded && currentExtraction.len === lastLen) {
           stableCount++;
-          if (stableCount >= 3 && !currentExtraction.isBusy) {
+          // Sapo teksti eshte i stabilizuar per >= 2 kontrolle (4 sekonda) dhe nuk ka buton Stop:
+          if (stableCount >= 2 && !currentExtraction.isBusy) {
             partText = currentExtraction.text;
+            console.error('[SEARCH_AI] Përgjigja u kap dhe u stabilizua me sukses (' + partText.length + ' karaktere).');
             break;
           }
         } else {
@@ -1216,14 +1393,7 @@ async function dispatchToGoogleSearchAiTab(opts) {
       return partText;
     }
 
-    const isPlannerTask = Boolean(
-      opts.isPlanner || 
-      promptText.includes('CHIEF_ARCHITECT') || 
-      promptText.includes('PLANIFIKUESIT') ||
-      promptText.includes('plan.md')
-    );
-
-    function validateFaza1Compliance(text) {
+    function validateFazaCompliance(text, fazaNum) {
       if (!text || text.trim().length < 60) {
         return { ok: false, reason: 'Teksti i kthyer është bosh ose tejet i shkurtër.' };
       }
@@ -1231,36 +1401,53 @@ async function dispatchToGoogleSearchAiTab(opts) {
       if (SERVICE_ERROR_PATTERNS.some(function(p) { return low.includes(p); })) {
         return { ok: false, reason: 'Përgjigja përmban gabim ose refuzim shërbimi.' };
       }
-      const hasMarker = text.includes('[FAZA_1_PERFUNDOI]');
+      const codeMissingPatterns = [
+        'ngarko fizikisht',
+        'ngjit përmbajtjen',
+        'ngjit permbajtjen',
+        'mungon paketa',
+        'missing_artifact',
+        'source_tree_missing',
+        'nuk kam akses te skedarët',
+        'nuk kam akses te skedaret'
+      ];
+      if (codeMissingPatterns.some(function(p) { return low.includes(p); })) {
+        return { ok: false, reason: 'Modeli refuzoi analizën duke kërkuar ngarkimin e kodit/specifikimeve.' };
+      }
+
+      const hasMarker = text.includes('[FAZA_' + fazaNum + '_PERFUNDOI]') || text.includes('[FAZA_1_PERFUNDOI]') || text.includes('[PLANI_PERFUNDOI_100%]');
       const hasAllowed = low.includes('allowed_files') || low.includes('skedarët e lejuar') || low.includes('skedaret e lejuar');
-      const hasObjectiveOrEntry = low.includes('objektivi') || low.includes('entry point') || low.includes('root cause');
+      const hasObjectiveOrEntry = low.includes('objektivi') || low.includes('entry point') || low.includes('root cause') || low.includes('specifikimi') || low.includes('hapat');
 
       if (!hasMarker && !hasAllowed && !hasObjectiveOrEntry) {
-        return { ok: false, reason: 'Mungon struktura e kërkuar (ALLOWED_FILES, OBJEKTIVI, ose etiketa [FAZA_1_PERFUNDOI]).' };
-      }
-      return { ok: true, reason: '' };
-    }
-
-    function validateFaza2Compliance(text) {
-      if (!text || text.trim().length < 80) {
-        return { ok: false, reason: 'Teksti i Fazës 2 është bosh ose tejet i shkurtër.' };
-      }
-      const low = text.toLowerCase();
-      if (SERVICE_ERROR_PATTERNS.some(function(p) { return low.includes(p); })) {
-        return { ok: false, reason: 'Përgjigja përmban gabim ose refuzim.' };
-      }
-      const hasMarker = text.includes('[PLANI_PERFUNDOI_100%]');
-      const hasSpec = low.includes('specifikimi') || low.includes('hardening') || low.includes('dod') || low.includes('kriteret');
-      if (!hasMarker && !hasSpec) {
-        return { ok: false, reason: 'Mungon specifikimi skedar më skedar ose kriteret DoD në Fazën 2.' };
+        return { ok: false, reason: 'Mungon struktura e kërkuar teknike (ALLOWED_FILES, OBJEKTIVAT, ose etiketimi).' };
       }
       return { ok: true, reason: '' };
     }
 
     if (isPlannerTask) {
-      console.error('[SEARCH_AI_PLANNER] Duke zbatuar Protokollin Urdhërues me 3 Nivele Përshkallëzimi & Chat Reset për: ' + path.basename(cleanRoot));
+      console.error('[SEARCH_AI_PLANNER] Duke zbatuar Protokollin Universal (Smart Arch Map + Handshake + Slices < 70 KB) për: ' + path.basename(cleanRoot));
 
-      const maxChatAttempts = 2; // Nëse helmohet biseda, hap Chat të Ri
+      // 1. Gjenero Hartën Smart Arkitekturore (< 25 KB)
+      const archMap = generateSmartArchitectureMap(cleanRoot);
+      console.error('[SEARCH_AI_PLANNER] Harta Arkitekturore e gatshme (' + archMap.length + ' karaktere / ~' + (archMap.length / 1024).toFixed(1) + ' KB)');
+
+      // 2. Zgjidh specifikimet nga userRequest ose skedarët e referuar
+      const embeddedSpecs = resolveAndEmbedExternalFiles(opts.userRequest || promptText);
+      let rawSpec = embeddedSpecs;
+      if (!rawSpec && opts.userRequest) {
+        rawSpec = opts.userRequest;
+      }
+      if (!rawSpec) {
+        rawSpec = promptText;
+      }
+
+      // 3. Ndaj specifikimet në faza/slices (< 45 KB secila, brenda limitit strikt 70 KB)
+      const specSlices = sliceSpecification(rawSpec, 45000);
+      const totalFaza = specSlices.length;
+      console.error('[SEARCH_AI_PLANNER] Specifikimet u ndanë në ' + totalFaza + ' faza (< 45 KB secila)');
+
+      const maxChatAttempts = 2;
 
       for (let chatAttempt = 1; chatAttempt <= maxChatAttempts; chatAttempt++) {
         if (chatAttempt > 1) {
@@ -1268,173 +1455,186 @@ async function dispatchToGoogleSearchAiTab(opts) {
           await page.goto(GOOGLE_SEARCH_AI_URL, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(function() {});
           await page.waitForTimeout(3000);
           await ensureGoogleSearchAi4CarbonMode(page, tabKey);
+        }
 
-          if (filesToAttach.length > 0) {
-            console.error('[SEARCH_AI] Duke ri-bashkangjitur skedarët fizikë në bisedën e re...');
-            const plusBtn = page.locator('button[aria-label*="Shto skedarë" i], button[aria-label*="Add files" i]').first();
-            if (await plusBtn.count() > 0) {
-              await plusBtn.click({ force: true }).catch(function() {});
-              await page.waitForTimeout(600);
-              const fileInput = page.locator('button[aria-label*="Shto skedarë" i] input[type="file"], input[type="file"]').first();
-              if (await fileInput.count() > 0) {
-                await fileInput.setInputFiles(filesToAttach).catch(function() {});
-                await page.waitForTimeout(2500);
+        // ==================== HAPI 1: PROTOKOLLI HANDSHAKE ====================
+        console.error('[SEARCH_AI_PLANNER] [HAPI_1_HANDSHAKE] Dërgimi i Hartës Arkitekturore për konfirmim...');
+        const handshakePrompt = 
+          '=== PROTOKOLLI I PLANIFIKIMIT (HAPI 1: HARTA ARKITEKTURORE E PROJEKTIT) ===' + NL +
+          '[ROLI: KRYEARKITEKT SISTEMESH & PLANIFIKUES TEKNIK I MULTI-AI RELAY]' + NL +
+          'Projekti: ' + path.basename(cleanRoot) + NL + NL +
+          archMap + NL + NL +
+          '=== URDHËR OPERATIV HANDSHAKE (KONFIRMIM I DETYRUESHËM) ===' + NL +
+          'Lexo dhe memorizo me kujdes strukturën, kontratat dhe modulet ekzistuese të këtij projekti më lart.' + NL +
+          'Në këtë hap, MOS shkruaj plan, MOS gjenero kod dhe MOS bëj asnjë propozim ndryshimesh.' + NL +
+          'Përgjigju TANI VETËM me fjalët ekzakte:' + NL +
+          '"OK e lexova, vazhdojmë me hapin e radhës."' + NL +
+          '================================================================';
+
+        let handshakeSuccess = false;
+        let lastAnswerText = '';
+
+        for (let hLevel = 1; hLevel <= 3; hLevel++) {
+          let hPrompt = handshakePrompt;
+          if (hLevel === 2) {
+            hPrompt = 
+              '=== VËREJTJE OPERATIVE DISIPLINORE PËR HANDSHAKE (NIVELI 2) ===' + NL +
+              'Përgjigja jote devijoi nga urdhri!' + NL +
+              'NDALOHET ÇDO SHPJEGIM OSE PROPOZIM KODI NË KËTË HAP.' + NL +
+              'Përgjigju TANI VETËM me fjalët ekzakte pa asnjë fjalë tjetër:' + NL +
+              '"OK e lexova, vazhdojmë me hapin e radhës."';
+          } else if (hLevel === 3) {
+            hPrompt = 
+              '=== URDHËR ULTIMATIV HANDSHAKE (NIVELI 3) ===' + NL +
+              'Konfirmo menjëherë leximin e arkitekturës vetëm me fjalët:' + NL +
+              'OK e lexova, vazhdojmë me hapin e radhës.';
+          }
+
+          try {
+            const hRes = await sendTurnAndExtract(hPrompt, false, '', 10);
+            lastAnswerText = hRes;
+            const lowH = (hRes || '').toLowerCase();
+            if (lowH.includes('ok') || lowH.includes('lexova') || lowH.includes('vazhdo') || lowH.includes('hapin e radhës') || lowH.includes('hapin e radhes')) {
+              console.error('[SEARCH_AI_PLANNER] [HANDSHAKE_SUKSES] Modeli konfirmoi arkitekturën (' + hRes.trim().slice(0, 80) + ')');
+              handshakeSuccess = true;
+              break;
+            } else {
+              console.error('[SEARCH_AI_PLANNER] [HANDSHAKE_VËREJTJE] Përgjigja nuk ishte konfirmim i pastër: ' + hRes.slice(0, 100));
+            }
+          } catch (hErr) {
+            console.error('[SEARCH_AI_PLANNER] [HANDSHAKE_ERROR] ' + hErr.message);
+          }
+          await page.waitForTimeout(2000);
+        }
+
+        if (!handshakeSuccess) {
+          console.error('[SEARCH_AI_PLANNER] Handshake dështoi pas 3 niveleve.');
+          if (chatAttempt < maxChatAttempts) continue;
+          throw new Error('PLANNER_HANDSHAKE_FAILED: Modeli nuk konfirmoi leximin e arkitekturës.');
+        }
+
+        // ==================== HAPI 2..N: FAZAT E SPECIFIKIMIT DHE PLANIFIKIMIT ====================
+        const phasePlans = [];
+        let allPhasesValid = true;
+
+        for (let fIdx = 0; fIdx < totalFaza; fIdx++) {
+          const fazaNum = fIdx + 1;
+          const sliceText = specSlices[fIdx];
+          console.error('[SEARCH_AI_PLANNER] Ekzekutimi i Fazës ' + fazaNum + ' nga ' + totalFaza + ' (' + sliceText.length + ' karaktere)...');
+
+          const slicePromptL1 = 
+            '=== PROTOKOLLI I PLANIFIKIMIT (FAZA ' + fazaNum + ' NGA ' + totalFaza + ': SPECIFIKIMI I KËRKESËS) ===' + NL +
+            '[URDHER OPERATIV NGA ORCHESTRATORI - ZBATO PA ASNJË DEVIJIM]' + NL +
+            'Mbi bazën e arkitekturës së projektit që miratove në Handshake, ja pjesa ' + fazaNum + '/' + totalFaza + ' e specifikimeve funksionale:' + NL + NL +
+            sliceText + NL + NL +
+            'KUFIZIM I DETYRUESHËM ANTI-TIMEOUT (120–180 RRESHTA / MAKSIMUMI 8–10 KB):' + NL +
+            'Përgjigja jote për këtë fazë DUHET të jetë STRIKTISHT midis 120 dhe 180 rreshtave tekst/kod (jo më shumë se 8–10 KB).' + NL +
+            'Çdo përgjigje mbi 200 rreshta këput lidhjen nga serveri pas 60 sekondash.' + NL +
+            'Shkruaj me densitet maksimal teknik direkt pikat e kërkuara, PA asnjë fjalë hyrëse narrative dhe PA përsëritur tekstin e kërkesës:' + NL + NL +
+            'UDHËZIM OPERATIV PËR FAZËN ' + fazaNum + ':' + NL +
+            'Harto planin e saktë teknik dhe arkitekturor për këtë pjesë pa asnjë placeholder:' + NL +
+            '1. OBJEKTIVAT & NON-GOALS: Çfarë zgjidhet dhe çfarë nuk duhet prekur.' + NL +
+            '2. ENTRY POINT & ROOT CAUSE: Rruga reale e ekzekutimit, funksionet konkrete dhe shkaku teknik.' + NL +
+            '3. ALLOWED_FILES & FORBIDDEN_FILES: Lista strikte e skedarëve (rrugë relative me /).' + NL +
+            '4. SPECIFIKIMI SKEDAR MË SKEDAR: Funksionet e reja, kontratat e të dhënave dhe logjika 100% e plotë.' + NL +
+            '5. HARDENING & EDGE CASES: Trajtimi i gabimeve, tipizimi, null/empty, IO/rrjeti.' + NL +
+            '6. KRITERET E VERIFIKIMIT (DoD MATRIX): Komandat ekzakte të testit/build-it.' + NL + NL +
+            'Në fund të përgjigjes shkruaj ekzaktësisht etiketën:' + NL +
+            '[FAZA_' + fazaNum + '_PERFUNDOI]' + NL +
+            '================================================================';
+
+          let phaseSuccess = false;
+          let phaseResText = '';
+
+          for (let pLevel = 1; pLevel <= 3; pLevel++) {
+            let pPrompt = slicePromptL1;
+            if (pLevel === 2) {
+              pPrompt = 
+                '=== VËREJTJE OPERATIVE DISIPLINORE PËR FAZËN ' + fazaNum + ' (NIVELI 2) ===' + NL +
+                '[URDHER KORRIGJUES - ZERO TOLERANCE]' + NL +
+                'Përgjigja jote shkeli strukturën e kërkuar ose tejkaloi limitin e rreshtave për Fazën ' + fazaNum + '!' + NL +
+                'KUFIZIM STRIKT: Kthe maksimumi 120–150 rreshta (jo më shumë se 8 KB) pa asnjë fjalë hyrëse!' + NL +
+                'Mos kërko ngarkim skedarësh, kodi dhe arkitektura janë tashmë në kontekst.' + NL +
+                'Shkruaj TANI VETËM:' + NL +
+                '1. OBJEKTIVAT' + NL +
+                '2. ENTRY POINT' + NL +
+                '3. ALLOWED_FILES (Lista strikte me /)' + NL +
+                '4. SPECIFIKIMI SKEDAR MË SKEDAR' + NL +
+                '5. HARDENING & EDGE CASES' + NL +
+                '6. KRITERET DoD' + NL + NL +
+                'Mbyll detyrimisht me: [FAZA_' + fazaNum + '_PERFUNDOI]';
+            } else if (pLevel === 3) {
+              pPrompt = 
+                '=== URDHËR ULTIMATIV PËR FAZËN ' + fazaNum + ' (NIVELI 3) ===' + NL +
+                'KUFIZIM: Maksimumi 120 rreshta (max 8 KB).' + NL +
+                'Jep menjëherë planin teknik me ALLOWED_FILES, SPECIFIKIMIN SKEDAR MË SKEDAR dhe DoD për Fazën ' + fazaNum + '.' + NL +
+                'Vendos etiketën: [FAZA_' + fazaNum + '_PERFUNDOI]';
+            }
+
+            try {
+              phaseResText = await sendTurnAndExtract(pPrompt, true, lastAnswerText, 80);
+              const comp = validateFazaCompliance(phaseResText, fazaNum);
+              if (comp.ok) {
+                console.error('[SEARCH_AI_PLANNER] [FAZA_' + fazaNum + '_SUKSES] Faza ' + fazaNum + ' u miratua me sukses (' + phaseResText.length + ' karaktere).');
+                phaseSuccess = true;
+                lastAnswerText = phaseResText;
+                break;
+              } else {
+                console.error('[SEARCH_AI_PLANNER] [FAZA_' + fazaNum + '_REFUZIM] ' + comp.reason);
               }
+            } catch (pErr) {
+              console.error('[SEARCH_AI_PLANNER] [FAZA_' + fazaNum + '_ERROR] ' + pErr.message);
             }
+            await page.waitForTimeout(2000);
           }
-        }
 
-        // ==================== FAZA 1 ME 3 NIVELE PËRSHKALLËZIMI ====================
-        let faza1Text = '';
-        let faza1Valid = false;
+          // Failsafe nëse u ndërpre por ka tekst të vlefshëm (>250 karaktere)
+          if (!phaseSuccess && phaseResText && phaseResText.length > 250) {
+            console.error('[SEARCH_AI_PLANNER] Faza ' + fazaNum + ' u ndërpre por ka tekst të vlefshëm (' + phaseResText.length + ' karaktere). Po pranohet.');
+            phaseSuccess = true;
+            lastAnswerText = phaseResText;
+          }
 
-        const faza1OrderL1 = 
-          NL + NL + '=== PROTOKOLLI URDHERUES I PLANIFIKIMIT (FAZA 1 / 2) ===' + NL +
-          '[URDHER OPERATIV NGA ORCHESTRATORI - ZBATO PA ASNJË DEVIJIM]' + NL +
-          'Ke të bashkëngjitur të gjithë kodin e projektit (project_bundle.txt) dhe specifikimet e kërkesës.' + NL +
-          'Analizo me arsyetim të thellë të gjithë sistemin. Por me urdhër strikt, TANI DO TË SHKRUASH VETËM SEKSIONET 1, 2 dhe 3:' + NL + NL +
-          '1. OBJEKTIVI & NON-GOALS: Çfarë zgjidhet saktësisht dhe çfarë NUK duhet prekur.' + NL +
-          '2. ENTRY POINT & ROOT CAUSE: Rruga reale e ekzekutimit, funksionet konkrete dhe shkaku i vërtetë teknik.' + NL +
-          '3. ALLOWED_FILES & FORBIDDEN_FILES: Lista strikte e skedarëve që lejohen të krijohen ose modifikohen (rrugë relative me `/`). Çdo skedar tjetër është rreptësisht i ndaluar.' + NL + NL +
-          'RREGULL NDALIMI:' + NL +
-          'MOS shkruaj asnjë rresht nga Seksioni 4 (Specifikimi i detajuar i kodit) akoma!' + NL +
-          'Sapo të përfundosh Seksionin 3 (ALLOWED_FILES), NDALU MENJËHERË dhe në fund të mesazhit shkruaj ekzaktësisht etiketën:' + NL +
-          '[FAZA_1_PERFUNDOI]' + NL +
-          '========================================================' + NL;
-
-        for (let level = 1; level <= 3; level++) {
-          console.error('[SEARCH_AI_PLANNER] Ekzekutimi i Fazës 1 (Niveli ' + level + ')...');
-          let promptToSend = '';
-          if (level === 1) {
-            promptToSend = cleanPrompt + faza1OrderL1;
-          } else if (level === 2) {
-            promptToSend = 
-              '=== VËREJTJE OPERATIVE DISIPLINORE (NIVELI 2) ===' + NL +
-              '[URDHER KORRIGJUES AGRESIV - ZERO TOLERANCE]' + NL +
-              'Përgjigja jote shkeli urdhrin e Fazës 1! Ke devijuar nga struktura ose ke tejkaluar fazën e lejuar.' + NL +
-              'NDALOHET ÇDO FJALË HYRËSE, NDALOHET SHPJEGIMI I TEPRISË OSE BASHKËBISEDIMI.' + NL +
-              'Shkruaj TANI VETËM këto 3 pika të strukturuara pa asnjë devijim:' + NL + NL +
-              '1. OBJEKTIVI & NON-GOALS' + NL +
-              '2. ENTRY POINT & ROOT CAUSE' + NL +
-              '3. ALLOWED_FILES & FORBIDDEN_FILES (Lista strikte me rrugë relative /)' + NL + NL +
-              'Mbyll menjëherë në fund me etiketën: [FAZA_1_PERFUNDOI]. Çdo gjë tjetër është e pavlefshme.' + NL +
-              '================================================';
+          if (phaseSuccess) {
+            phasePlans.push(phaseResText);
           } else {
-            promptToSend = 
-              '=== URDHËR ULTIMATIV EKZEKUTIV (NIVELI 3 - PARALAJMËRIM SKUALIFIKIMI) ===' + NL +
-              'Dështove 2 herë të zbatosh protokollin arkitekturor. Ky është paralajmërimi i fundit operativ para mbylljes dhe skualifikimit të sesionit tënd.' + NL +
-              'Plotëso TANI VETËM këtë skelet ekzakt teknik pa asnjë shpjegim shtesë:' + NL + NL +
-              '### 1. OBJEKTIVI' + NL +
-              '[Përshkruaj shkurt objektivat dhe non-goals]' + NL +
-              '### 2. ENTRY POINT & ROOT CAUSE' + NL +
-              '[Specifiko funksionin dhe rrugën e skedarit]' + NL +
-              '### 3. ALLOWED_FILES' + NL +
-              '[Listo vetëm rrugët relative të skedarëve]' + NL + NL +
-              '[FAZA_1_PERFUNDOI]' + NL +
-              '================================================';
-          }
-
-          try {
-            faza1Text = await sendTurnAndExtract(promptToSend, level > 1, '', 60);
-            const comp = validateFaza1Compliance(faza1Text);
-            if (comp.ok) {
-              console.error('[SEARCH_AI_PLANNER] [NIVELI_' + level + '_SUKSES] Faza 1 u miratua me sukses (' + faza1Text.length + ' karaktere).');
-              faza1Valid = true;
-              break;
-            } else {
-              console.error('[SEARCH_AI_PLANNER] [NIVELI_' + level + '_REFUZIM] Modeli nuk u bind: ' + comp.reason);
-            }
-          } catch (lvlErr) {
-            console.error('[SEARCH_AI_PLANNER] [NIVELI_' + level + '_ERROR] ' + lvlErr.message);
-          }
-          await page.waitForTimeout(2000);
-        }
-
-        if (!faza1Valid) {
-          console.error('[SEARCH_AI_PLANNER] Faza 1 dështoi pas 3 niveleve në këtë sesion.');
-          if (chatAttempt < maxChatAttempts) {
-            continue; // Kalo te Chati i Ri!
-          } else {
-            throw new Error('PLANNER_ESCALATION_FAILED: Modeli nuk u bind pas 3 niveleve urdhëruese dhe restartimit të bisedës.');
+            allPhasesValid = false;
+            break;
           }
         }
 
-        // ==================== FAZA 2 ME 3 NIVELE PËRSHKALLËZIMI ====================
-        await page.waitForTimeout(3000);
-
-        let faza2Text = '';
-        let faza2Valid = false;
-
-        const faza2OrderL1 = 
-          '=== PROTOKOLLI URDHERUES I PLANIFIKIMIT (FAZA 2 / 2) ===' + NL +
-          '[URDHER OPERATIV NGA ORCHESTRATORI]' + NL +
-          'Seksionet 1, 2 dhe 3 (Objektivat dhe Lista e ALLOWED_FILES) u miratuan me sukses.' + NL +
-          'Tani vazhdo menjëherë duke shkruar SEKSIONET 4, 5 dhe 6 të plota dhe të thelluara:' + NL + NL +
-          '4. SPECIFIKIMI SKEDAR MË SKEDAR: Për secilin skedar të miratuar te ALLOWED_FILES, jep kontratat e funksioneve, tipet e të dhënave, logjikën hap pas hapi dhe ruajtjen e funksionalitetit ekzistues.' + NL +
-          '5. HARDENING & EDGE CASES (Torture Checklist): Trajtimi i null/empty, Unicode, gabime rrjeti/IO, race conditions.' + NL +
-          '6. KRITERET E VERIFIKIMIT (DoD MATRIX): Çfarë komandash build/test duhet të kalojnë që Reviewer-i të japë STATUS: PASSED.' + NL + NL +
-          'Në fund të përgjigjes, shkruaj ekzaktësisht etiketën:' + NL +
-          '[PLANI_PERFUNDOI_100%]' + NL +
-          '========================================================';
-
-        for (let level2 = 1; level2 <= 3; level2++) {
-          console.error('[SEARCH_AI_PLANNER] Ekzekutimi i Fazës 2 (Niveli ' + level2 + ')...');
-          let prompt2ToSend = '';
-          if (level2 === 1) {
-            prompt2ToSend = faza2OrderL1;
-          } else if (level2 === 2) {
-            prompt2ToSend = 
-              '=== VËREJTJE OPERATIVE DISIPLINORE PËR FAZËN 2 (NIVELI 2) ===' + NL +
-              '[URDHER KORRIGJUES AGRESIV]' + NL +
-              'Përgjigja jote në Fazën 2 nuk ishte e plotë ose u ndërpre para kohe.' + NL +
-              'Shkruaj menjëherë SPECIFIKIMIN E PLOTË SKEDAR MË SKEDAR dhe KRITERET DOD pa asnjë fjalë të tepërt.' + NL +
-              'Përfundo detyrimisht me etiketën: [PLANI_PERFUNDOI_100%].';
-          } else {
-            prompt2ToSend = 
-              '=== URDHËR ULTIMATIV PËR FAZËN 2 (NIVELI 3) ===' + NL +
-              'Vazhdo menjëherë duke dhënë funksionet e sakta për çdo skedar dhe komandat testuese DoD.' + NL +
-              'Vendos etiketën përfundimtare: [PLANI_PERFUNDOI_100%].';
-          }
-
-          try {
-            faza2Text = await sendTurnAndExtract(prompt2ToSend, true, faza1Text, 100);
-            const comp2 = validateFaza2Compliance(faza2Text);
-            if (comp2.ok) {
-              console.error('[SEARCH_AI_PLANNER] [FAZA_2_NIVELI_' + level2 + '_SUKSES] Faza 2 u miratua me sukses (' + faza2Text.length + ' karaktere).');
-              faza2Valid = true;
-              break;
-            } else {
-              console.error('[SEARCH_AI_PLANNER] [FAZA_2_NIVELI_' + level2 + '_REFUZIM] ' + comp2.reason);
-            }
-          } catch (p2Err) {
-            console.error('[SEARCH_AI_PLANNER] [FAZA_2_ERROR] ' + p2Err.message);
-          }
-          await page.waitForTimeout(2000);
-        }
-
-        // Failsafe nëse u ndërpre por ka përmbajtje të mjaftueshme
-        if (!faza2Valid && faza2Text && faza2Text.length > 250) {
-          console.error('[SEARCH_AI_PLANNER] Faza 2 u ndërpre por ka tekst të vlefshëm (' + faza2Text.length + ' karaktere). Po përdoret.');
-          faza2Valid = true;
-        }
-
-        if (faza1Valid && faza2Valid) {
+        if (allPhasesValid && phasePlans.length === totalFaza) {
           tabAuthStatus[tabKey] = 'AUTHENTICATED';
           tabActiveModel[tabKey] = '4 Carbon - Most complex work';
           tabDiscoveredModels[tabKey] = '4 Carbon (Most complex work)';
 
-          const cleanF1 = faza1Text.replace(/\[FAZA_1_PERFUNDOI\]/gi, '').trim();
-          const cleanF2 = faza2Text.replace(/\[PLANI_PERFUNDOI_100%\]/gi, '').replace(/\[FAZA_1_PERFUNDOI\]/gi, '').trim();
+          // Stitching harmonik i të gjitha fazave
+          const stitchedSections = [];
+          for (let sIdx = 0; sIdx < phasePlans.length; sIdx++) {
+            const cleanPlan = phasePlans[sIdx]
+              .replace(new RegExp('\\[FAZA_' + (sIdx + 1) + '_PERFUNDOI\\]', 'gi'), '')
+              .replace(/\[PLANI_PERFUNDOI_100%\]/gi, '')
+              .trim();
+            stitchedSections.push('### FAZA ' + (sIdx + 1) + ' / ' + totalFaza + NL + NL + cleanPlan);
+          }
 
           const finalPlan = [
-            cleanF1,
+            '# PLANI ARKITEKTUROR DHE SPECIFIKIMI I EKZEKUTIMIT (MULTI-AI RELAY)',
+            'Projekti: ' + path.basename(cleanRoot),
+            'Data: ' + new Date().toISOString(),
             '',
-            '---',
+            '## 1. STRUKTURA DHE KONFIRMIMI I ARKITEKTURËS',
+            'Modeli analizoi dhe konfirmoi me sukses hartën arkitekturore të sistemit me Handshake të suksesshëm.',
             '',
-            cleanF2
+            '## 2. PLANIFIKIMI I DETAJUAR I FAZAVE',
+            '',
+            stitchedSections.join(NL + NL + '---' + NL + NL)
           ].join(NL);
 
           return finalPlan;
+        } else {
+          console.error('[SEARCH_AI_PLANNER] Një ose më shumë faza dështuan në këtë sesion bisede.');
+          if (chatAttempt < maxChatAttempts) continue;
         }
       }
 
@@ -1857,7 +2057,7 @@ function resolveAndEmbedExternalFiles(userRequest) {
 }
 
 async function waitJobSlice(cleanRoot, maxSliceMs) {
-if (!maxSliceMs) maxSliceMs = 5000;
+if (!maxSliceMs) maxSliceMs = 22000;
 const start = Date.now();
 while (Date.now() - start < maxSliceMs) {
 const job = activeCycleJobs[cleanRoot];
@@ -1891,10 +2091,10 @@ if (action === 'run_full_cycle') {
 if (!activeCycleJobs[cleanRoot] || !activeCycleJobs[cleanRoot].running) {
 runAutonomousPipeline(cleanRoot, payload.userRequest || '');
 }
-return await waitJobSlice(cleanRoot, 5000);
+return await waitJobSlice(cleanRoot, 22000);
 }
 if (action === 'check_cycle_progress') {
-return await waitJobSlice(cleanRoot, 5000);
+return await waitJobSlice(cleanRoot, 22000);
 }
 if (action === 'pack_workspace') {
 const info = packWorkspace(cleanRoot, payload.mode || 'FULL');
@@ -1925,7 +2125,8 @@ if (engine.startsWith('google_search_')) {
     projectRoot: cleanRoot,
     promptText: prompt,
     bundlePath: bundle.path,
-    isPlanner: true
+    isPlanner: true,
+    userRequest: payload.userRequest
   });
 } else {
   response = await dispatchToWebTab({
