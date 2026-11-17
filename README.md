@@ -1,4 +1,4 @@
-# Antigravity Multi-AI Orchestrator Bridge (V3.2 Standalone)
+# Antigravity Multi-AI Orchestrator Bridge (V3.4 Standalone)
 
 **Folderi Kryesor (Source of Truth):** `C:\Vladi_project\Antigravity_MultiAI_Bridge`  
 **Izolim 100% Fizik:** Punon ekskluzivisht ne `http://127.0.0.1:4321` dhe me profilet lokale ne `.profiles/`. Nuk prek kurre portat e sistemit Hermes (`15550`, `15555`, `15556`, `18000`, `19000`, `19005`) dhe as `%LOCALAPPDATA%\HermesWebBridge`.
@@ -15,7 +15,7 @@
 | **Motori Qendror (MCP + HTTP + 0-Token)** | `mcp/server.js` | Singleton server ne `http://127.0.0.1:4321`, 5-Tab Pool me Mutex, ngarkimi i skedareve dhe **0-Token Executor (`apply_and_test`)**. |
 | **Piket e Modeleve (Thinking / Pro)** | `mcp/model_scores.json` | Peshat qe detyrojne `3.1 Pro / Thinking / GPT-5.6 Sol Think Deeper` dhe bllokojne `Auto`, `Flash`, `Deep Research` dhe opsionet `disabled`. |
 | **Nderfaqja Grafike (Web UI)** | `mcp/dashboard.html` | Paneli grafik ne `http://localhost:4321` per Login-et, statusin live te 5 fleteve dhe rolet/komandat per cdo projekt. |
-| **Sesionet Web & Regjistri** | `.profiles/` (`m365`, `gemini1..3`)<br>`projects_registry.json` | 4 profilet e izoluara Chromium me cookies e Login-it dhe regjistri i projekteve aktive. |
+| **Sesionet Web & Regjistri** | `.profiles/` (`m365`, `gemini1..3`, `google_search_1..3`)<br>`projects_registry.json` | Profilet e izoluara Chromium me cookies e Login-it dhe regjistri i projekteve aktive. |
 | **Rregullat e Aktoreve (Lexohen Live)** | `rules/AGENTS.md` & `agents/orchestrator.md`<br>`rules/planner_rules.md`<br>`rules/coder_rules.md`<br>`rules/reviewer_rules.md`<br>`agents/executor.md` | Kontratat strikte per Orchestrator (Control Plane), Planner (Architect), Coder (Worker), Reviewer (Release Gate) dhe Fallback Executor. |
 | **Procedura `/run-cycle`** | `skills/run-cycle/SKILL.md` | Rradha lineare e detyrueshme e 5 mjeteve MCP deri ne verdiktin `STATUS: PASSED`. |
 | **Nisesi Manual i Dashboard-it** | `1_HAP_DASHBOARD_4321.bat` | Hap manualisht serverin dhe Dashboard-in kur Antigravity eshte i mbyllur. |
@@ -93,4 +93,25 @@ Të gjitha rregullimet themelore janë testuar, integruar dhe verifikuar:
 4. **Universal Workspace Packing:** Mbrojtje e plotë me `try/catch` dhe përjashtim i profileve/cache-it për të eliminuar përplasjet e lejeve `EPERM` në Windows.
 5. **Autopilot Deadlock Resolution:** Ekzekutimi i hapave të brendshëm me `{ _internal: true }` për të parandaluar vetë-bllokimin ndaj `CYCLE_EXCLUSIVE_LOCK`.
 6. **External Spec Files Ingestion:** Lexim dhe injektim i plotë i skedarëve të jashtëm të specifikimeve (si `agjent marketingu shitjesh free.txt`) te Planner dhe Coder.
+
+---
+
+## 7. Protokolli Urdhërues me 3 Nivele & Google Search AI (V3.4 Milestone)
+
+Ky version sjell kontroll të plotë mbi sjelljen dhe disiplinën e AI-së:
+1. **Google Search AI Mode (4 Carbon - Most Complex Work):**
+   - Integrim i profileve `google_search_1..3` në `https://www.google.com/ai` me dritare normale të dukshme (zero bllokime nga modaliteti headless).
+   - Aktivizim automatik i modelit me arsyetim të thellë `4 Carbon`.
+2. **Ngarkim Fizik i Skedarëve me Butonin `[+]`:**
+   - Kapërcen kufirin e ngurtë `maxlength="8192"` të fushës së shkrimit duke ngarkuar `project_bundle.txt` dhe skedarët e specifikimeve fizikisht si bashkëngjitje (`setInputFiles`).
+3. **Plani me 2 Faza të Kontrolluara:**
+   - **Faza 1:** Vetëm Objektivat, Root Cause dhe `ALLOWED_FILES` me mbyllje `[FAZA_1_PERFUNDOI]`.
+   - **Faza 2:** Vetëm Specifikimi Skedar më Skedar, Hardening dhe `DoD MATRIX` me mbyllje `[PLANI_PERFUNDOI_100%]`.
+4. **Motori i Përshkallëzimit me 3 Nivele Urdhëruese:**
+   - **Niveli 1:** Urdhri Operativ Fillestar.
+   - **Niveli 2:** Vërejtje Agresive Disiplinore (bllokim i plotë i yapping/chitchat, kërkim i rreptë i strukturës).
+   - **Niveli 3:** Urdhër Ultimativ me Format të Ngurtë (skelet i kyçur).
+5. **Pastrimi i Bisedës së Helmuar (Clean Chat Reset):**
+   - Nëse modeli refuzon ose devijon pas 3 niveleve, kryhet pastrim i plotë i kontekstit (`page.goto('https://www.google.com/ai')`) dhe rinisje e bisedës nga e para me kontekst të freskët.
+
 
