@@ -1,5 +1,6 @@
 # Chrome profiles (sesione, cookies, kredenciale personale)
 .profiles/
+profiles/
 
 # Dependencies
 node_modules/
@@ -10,3 +11,4 @@ mcp/node_modules/
 .DS_Store
 Thumbs.db
 .antigravity/
+scratch/

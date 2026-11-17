@@ -29,13 +29,40 @@
   <div class="sub">100% i izoluar në 127.0.0.1:4321 • Thinking / Think Deeper Enforced • 0-Token Node.js Executor</div>
 
   <div class="card" style="margin-bottom: 20px;">
-    <h2>🔑 Profilet e Izoluara të Plugin-it (Login një herë -> pastaj Headless)</h2>
-    <div style="display:flex; gap:10px; flex-wrap:wrap;">
-      <button onclick="loginProfile('m365')">Login M365 (Web 1 & Web 2)</button>
-      <button onclick="loginProfile('gemini1')">Login Gemini 1 (Pro)</button>
-      <button onclick="loginProfile('gemini2')">Login Gemini 2 (Pro)</button>
-      <button onclick="loginProfile('gemini3')">Login Gemini 3 (Pro)</button>
-      <button class="warn" onclick="killAll()">💀 Mbyll Fletët e Plugin-it (Liro RAM)</button>
+    <h2>🔑 Profilet e Izoluara të Plugin-it (Identifikohu në Dritare të Dukshme me 1 Klikim)</h2>
+    <p style="font-size: 13px; color: #94a3b8; margin: 0 0 12px 0;">
+      Kliko mbi llogarinë që dëshiron të hapësh në dritare normale të Google Chrome. Pasi të identifikohesh dhe të kalosh verifikimet/cookies, mbylle dritaren me [X]. Të dhënat ruhen përgjithmonë në profilin përkatës për ekzekutimet automatike në sfond.
+    </p>
+
+    <div style="display: flex; flex-direction: column; gap: 12px;">
+      <!-- Grupi 1: Gemini Web App -->
+      <div>
+        <div style="font-size: 12px; font-weight: bold; color: #93c5fd; margin-bottom: 6px;">🔵 LLOGARITË GEMINI PRO (Chat App):</div>
+        <div style="display:flex; gap:10px; flex-wrap:wrap;">
+          <button style="background: #1d4ed8;" onclick="loginProfile('gemini1')">🔑 Login Gemini 1 (Pro / Argon)</button>
+          <button style="background: #1d4ed8;" onclick="loginProfile('gemini2')">🔑 Login Gemini 2 (Pro / Argon)</button>
+          <button style="background: #1d4ed8;" onclick="loginProfile('gemini3')">🔑 Login Gemini 3 (Pro / Argon)</button>
+        </div>
+      </div>
+
+      <!-- Grupi 2: Google Search AI Mode (4 Carbon) -->
+      <div>
+        <div style="font-size: 12px; font-weight: bold; color: #6ee7b7; margin-bottom: 6px;">🟢 GOOGLE SEARCH AI MODE (4 Carbon - Most Complex Work):</div>
+        <div style="display:flex; gap:10px; flex-wrap:wrap;">
+          <button style="background: #047857;" onclick="loginProfile('google_search_1')">🔍 Login Search AI 1 (Llogaria 1)</button>
+          <button style="background: #047857;" onclick="loginProfile('google_search_2')">🔍 Login Search AI 2 (Llogaria 2)</button>
+          <button style="background: #047857;" onclick="loginProfile('google_search_3')">🔍 Login Search AI 3 (Llogaria 3)</button>
+        </div>
+      </div>
+
+      <!-- Grupi 3: Copilot M365 & RAM Control -->
+      <div>
+        <div style="font-size: 12px; font-weight: bold; color: #c4b5fd; margin-bottom: 6px;">🟣 MICROSOFT 365 COPILOT & KONTROLLI I RAM-IT:</div>
+        <div style="display:flex; gap:10px; flex-wrap:wrap;">
+          <button style="background: #6d28d9;" onclick="loginProfile('m365')">🔑 Login M365 (Web 1 & Web 2)</button>
+          <button class="warn" onclick="killAll()">💀 Mbyll Të Gjitha Dritaret (Liro RAM)</button>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -75,18 +102,21 @@
       { v: 'antigravity', l: '⚡ Antigravity (Local)' }
     ];
 
-    function buildSelect(id, selected, includeOff = false, isPlanner = false) {
+    function buildSelect(id, selected, includeOff = false, isPlanner = false, onChangeCall = '') {
       let opts = includeOff ? `<option value="off" ${selected === 'off' ? 'selected' : ''}>🚫 Off (Skip)</option>` : '';
       const list = isPlanner ? PLANNER_ENGINES : ENGINES;
       for (const e of list) {
         opts += `<option value="${e.v}" ${selected === e.v ? 'selected' : ''}>${e.l}</option>`;
       }
-      return `<select id="${id}">${opts}</select>`;
+      const onch = onChangeCall ? ` onchange="${onChangeCall}"` : '';
+      return `<select id="${id}"${onch}>${opts}</select>`;
     }
 
     function escapeAttr(str) {
       return String(str || '').replace(/"/g, '&quot;');
     }
+
+    let lastProjectsJson = '';
 
     async function loadState() {
       const res = await fetch('/api/state');
@@ -104,49 +134,55 @@
             <div style="font-size:13px; margin:4px 0;">Modeli aktiv: <b>${t.model || '-'}</b></div>
             <div style="font-size:11px; color:#94a3b8; margin:4px 0; word-break:break-word;">Modelet në ueb: <i>${t.discoveredModels && t.discoveredModels !== '-' ? t.discoveredModels : 'Ende pa zbuluar'}</i></div>
             <div style="font-size:13px;">Projekti aktiv: <b>${t.activeProject}</b></div>
-            <div style="margin-top:10px;">
-              <button class="sec" onclick="resetTab('${k}')">🧹 Force New Chat</button>
+            <div style="margin-top:10px; display:flex; gap:8px;">
+              <button style="flex:1; background: #0284c7;" onclick="loginProfile('${k}')">👁️ Hap Dritaren</button>
+              <button class="sec" style="flex:1;" onclick="resetTab('${k}')">🧹 Force New Chat</button>
             </div>
           </div>
         `;
       }).join('');
 
-      document.getElementById('projectsGrid').innerHTML = data.projects.map((p, i) => {
-        const st = p.state || {};
-        const stBadge = st.lastStatus === 'PASSED' || st.lastStatus === 'BUILD_OK'
-          ? 'ok'
-          : (st.lastStatus === 'ERROR' || st.lastStatus === 'FAILED_REVIEW' ? 'err' : 'idle');
+      const curProjectsJson = JSON.stringify(data.projects);
+      if (curProjectsJson !== lastProjectsJson) {
+        lastProjectsJson = curProjectsJson;
+        document.getElementById('projectsGrid').innerHTML = data.projects.map((p, i) => {
+          const st = p.state || {};
+          const stBadge = st.lastStatus === 'PASSED' || st.lastStatus === 'BUILD_OK'
+            ? 'ok'
+            : (st.lastStatus === 'ERROR' || st.lastStatus === 'FAILED_REVIEW' ? 'err' : 'idle');
+          const saveCall = `saveRouting('${p.projectRoot.replace(/\\/g, '/')}', ${i})`;
 
-        return `
-          <div class="card">
-            <div class="row">
-              <h3 style="margin:0;">📁 ${p.projectName}</h3>
-              <span class="badge ${stBadge}">${st.phase || 'IDLE'} (Retry: ${st.retryCount || 0}/2)</span>
+          return `
+            <div class="card">
+              <div class="row">
+                <h3 style="margin:0;">📁 ${p.projectName}</h3>
+                <span class="badge ${stBadge}">${st.phase || 'IDLE'} (Retry: ${st.retryCount || 0}/2)</span>
+              </div>
+              <small style="color:#94a3b8; word-break:break-all;">${p.projectRoot}</small>
+
+              <div class="row" style="margin-top:12px;"><span>Planner:</span> ${buildSelect(`pl_${i}`, p.roles.planner, false, true, saveCall)}</div>
+              <div class="row"><span>Coder:</span> ${buildSelect(`cd_${i}`, p.roles.coder, false, false, saveCall)}</div>
+              <div class="row"><span>Reviewer (Gate):</span> ${buildSelect(`rv_${i}`, p.roles.reviewer, true, false, saveCall)}</div>
+              <div class="row"><span>Paketimi:</span>
+                <select id="fmt_${i}" onchange="${saveCall}">
+                  <option value="txt" ${p.bundleFormat !== 'zip.md' ? 'selected' : ''}>project_bundle.txt</option>
+                  <option value="zip.md" ${p.bundleFormat === 'zip.md' ? 'selected' : ''}>project_bundle.zip.md (M365)</option>
+                </select>
+              </div>
+
+              <label class="lbl">Komanda Build (0-Token Node.js):</label>
+              <input class="full" id="bld_${i}" value="${escapeAttr(p.buildCmd)}" onchange="${saveCall}" placeholder="p.sh. npm run build" />
+
+              <label class="lbl">Komanda Test (0-Token Node.js):</label>
+              <input class="full" id="tst_${i}" value="${escapeAttr(p.testCmd)}" onchange="${saveCall}" placeholder="p.sh. npm test" />
+
+              <button id="btn_save_${i}" style="width:100%; margin-top:12px;" onclick="${saveCall}">💾 Ruaj Konfigurimin</button>
+              <button style="width:100%; margin-top:6px; background:#475569; border-color:#64748b;" onclick="purgeExchange('${p.projectRoot.replace(/\\/g, '/')}')">🧹 Pastro Mbetjet e Shkëmbimit</button>
+              <button style="width:100%; margin-top:6px; background:#b91c1c; border-color:#ef4444;" onclick="deleteProject('${p.projectRoot.replace(/\\/g, '/')}', '${escapeAttr(p.projectName)}')">🗑️ Fshi Projektin</button>
             </div>
-            <small style="color:#94a3b8; word-break:break-all;">${p.projectRoot}</small>
-
-            <div class="row" style="margin-top:12px;"><span>Planner:</span> ${buildSelect(`pl_${i}`, p.roles.planner, false, true)}</div>
-            <div class="row"><span>Coder:</span> ${buildSelect(`cd_${i}`, p.roles.coder)}</div>
-            <div class="row"><span>Reviewer (Gate):</span> ${buildSelect(`rv_${i}`, p.roles.reviewer, true)}</div>
-            <div class="row"><span>Paketimi:</span>
-              <select id="fmt_${i}">
-                <option value="txt" ${p.bundleFormat !== 'zip.md' ? 'selected' : ''}>project_bundle.txt</option>
-                <option value="zip.md" ${p.bundleFormat === 'zip.md' ? 'selected' : ''}>project_bundle.zip.md (M365)</option>
-              </select>
-            </div>
-
-            <label class="lbl">Komanda Build (0-Token Node.js):</label>
-            <input class="full" id="bld_${i}" value="${escapeAttr(p.buildCmd)}" placeholder="p.sh. npm run build" />
-
-            <label class="lbl">Komanda Test (0-Token Node.js):</label>
-            <input class="full" id="tst_${i}" value="${escapeAttr(p.testCmd)}" placeholder="p.sh. npm test" />
-
-            <button style="width:100%; margin-top:12px;" onclick="saveRouting('${p.projectRoot.replace(/\\/g, '/')}', ${i})">💾 Ruaj Konfigurimin</button>
-            <button style="width:100%; margin-top:6px; background:#475569; border-color:#64748b;" onclick="purgeExchange('${p.projectRoot.replace(/\\/g, '/')}')">🧹 Pastro Mbetjet e Shkëmbimit</button>
-            <button style="width:100%; margin-top:6px; background:#b91c1c; border-color:#ef4444;" onclick="deleteProject('${p.projectRoot.replace(/\\/g, '/')}', '${escapeAttr(p.projectName)}')">🗑️ Fshi Projektin</button>
-          </div>
-        `;
-      }).join('');
+          `;
+        }).join('');
+      }
     }
 
     async function saveRouting(projectRoot, idx) {
@@ -166,7 +202,14 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
-      const b=event&&event.target;if(b&&b.tagName==="BUTTON"){const t=b.innerText;b.style.background="#16a34a";b.innerText="✅ U Ruajt!";setTimeout(()=>{b.style.background="";b.innerText=t;},2000);}
+      lastProjectsJson = '';
+      const b = document.getElementById(`btn_save_${idx}`);
+      if (b) {
+        const t = b.innerText;
+        b.style.background = "#16a34a";
+        b.innerText = "✅ U Ruajt me Sukses!";
+        setTimeout(() => { b.style.background = ""; b.innerText = t; }, 2000);
+      }
       loadState();
     }
 

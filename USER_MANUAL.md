@@ -1,4 +1,4 @@
-# MANUALI I PLOTE OPERATIV DHE I MIREMBAJTJES — ANTIGRAVITY MULTI-AI BRIDGE (V3.2)
+# MANUALI I PLOTE OPERATIV DHE I MIREMBAJTJES — ANTIGRAVITY MULTI-AI BRIDGE (V3.4)
 
 Ky manual permban cdo detaj per **perdorimin e perditshem**, **strukturen e skedareve te shkembimit**, **zgjerimin e sistemit ne te ardhmen** dhe **zgjidhjen e problemeve** pa analizuar kodin nga e para.
 
@@ -226,5 +226,38 @@ Të gjitha rregullimet themelore janë testuar dhe verifikuar fizikisht në kod:
 
 6. **Inxhinimi i Dokumenteve të Jashtme të Specifikimeve:**
    - Funksioni `resolveAndEmbedExternalFiles` zbulon dhe lexon automatikisht skedarët e mëdhenj të specifikimeve nga disku i PC dhe i injekton të plota te Planner-i dhe Coder-i.
+
+---
+
+## 11. Protokolli Urdhërues me 3 Nivele & Google Search AI (Versioni 3.4 Milestone)
+
+Ky version i jep përdoruesit dhe orkestruesit kontroll të plotë mbi sjelljen e AI-së, duke shmangur helmimin e kontekstit dhe ndërprerjet e gjata:
+
+1. **Mbështetja e Google Search AI (4 Carbon - Most Complex Work):**
+   - Profilet `google_search_1`, `google_search_2`, `google_search_3` hapen direkt në `https://www.google.com/ai`.
+   - Funksioni `ensureGoogleSearchAi4CarbonMode` kontrollon menynë dhe siguron kalimin në modelin më të fuqishëm me arsyetim `4 Carbon`.
+   - Shfletuesi ekzekutohet me dritare të dukshme normale (`headless: false`, `--start-maximized`), duke shmangur bllokimin *"AI Mode is not available on your device"*.
+
+2. **Zgjidhja e Kufirit të Shfletuesit (`maxlength="8192"`):**
+   - Fusha e shkrimit e Google AI kufizon tekstin në 8,192 karaktere.
+   - Paketa e kodit të projektit (`project_bundle.txt`) dhe skedarët e mëdhenj të specifikimeve ngarkohen fizikisht si bashkëngjitje përmes butonit `[+]` (`input[type="file"]`), duke garantuar që kodi të shkojë 100% i plotë pa asnjë shkurtim.
+
+3. **Plani me 2 Faza të Kontrolluara:**
+   - **Faza 1:** AI urdhërohet të prodhojë VETËM Seksionet 1, 2 dhe 3 (`OBJEKTIVAT`, `ENTRY POINT & ROOT CAUSE` dhe `ALLOWED_FILES`) dhe të ndalojë te etiketa `[FAZA_1_PERFUNDOI]`.
+   - **Faza 2:** Pas miratimit, urdhërohet të japë Seksionet 4, 5 dhe 6 (`SPECIFIKIMI SKEDAR MË SKEDAR`, `HARDENING` dhe `DoD MATRIX`) me etiketën `[PLANI_PERFUNDOI_100%]`.
+
+4. **Motori i Përshkallëzimit me 3 Nivele Urdhëruese:**
+   - **Niveli 1 (Operativ Normal):** Kërkesa fillestare me kufijtë e fazës.
+   - **Niveli 2 (Agresiv Disiplinor):** Nëse modeli devijon ose flet kot (yapping), i ndalohet çdo fjalë hyrëse dhe urdhërohet të japë vetëm listën teknike të kërkuar.
+   - **Niveli 3 (Ultimativ Format Lock):** Paralajmërim skualifikimi me format të ngurtë skeletor.
+
+5. **Pastrimi i Bisedës së Helmuar (Clean Chat Reset):**
+   - Nëse modeli refuzon ose nuk bindet as pas Nivelit 3, sesioni shpallet i helmuar (*Context Poisoned*).
+   - Shfletuesi kryen automatikisht navigim të pastër te `https://www.google.com/ai`, ri-bashkëngjit skedarët dhe e nis ciklin nga e para me një bisedë të re.
+
+6. **Monitorimi i Butonit dhe Ekstraktimi i Saktë:**
+   - Butoni "Dërgo" monitorohet derisa të jetë aktiv (`disabled !== true` dhe `aria-disabled !== true`), pa shtypur kurrë Enter të verbër.
+   - Përgjigja nxirret me saktësi nga `section.bzXtMb` pas shënuesit zyrtar `Përgjigjja e "Modalitetit të IA-së" për `, duke pastruar butonat ndihmës të shfletuesit (`Kalo te kërkesa e mëparshme`).
+
 
 

@@ -72,7 +72,7 @@ function withTabLock(tabKey, fn) {
   return prev.then(function() { return fn(); }).finally(function() { release(); });
 }
 
-const GOOGLE_SEARCH_AI_URL = 'https://www.google.com/search?q=test&udm=50&arv=4';
+const GOOGLE_SEARCH_AI_URL = 'https://www.google.com/ai';
 
 function getProfileNameForTab(tabKey) {
   if (tabKey.startsWith('web')) return 'm365';
@@ -89,15 +89,15 @@ function getTargetUrl(tabKey) {
 }
 
 async function getOrLaunchContext(profileName, headless) {
-  if (headless === undefined) headless = true;
-  const desiredMode = headless ? 'headless' : 'visible';
-  if (contexts[profileName] && contextModes[profileName] === desiredMode) {
-    return contexts[profileName];
-  }
+  if (headless === undefined) headless = false;
+  // Nëse konteksti ekziston tashmë (i hapur nga përdoruesi me 'Hap Dritaren' ose nga agjenti), PËRDORE MENJËHERË dhe mos e mbyll kurrë!
   if (contexts[profileName]) {
-    try { await contexts[profileName].close(); } catch (_) {}
-    delete contexts[profileName];
-    delete contextModes[profileName];
+    try {
+      const openPages = contexts[profileName].pages();
+      if (openPages.length > 0 && !openPages[0].isClosed()) {
+        return contexts[profileName];
+      }
+    } catch (_) {}
   }
 
   const userDataDir = path.join(PROFILES_DIR, profileName);
@@ -109,15 +109,16 @@ async function getOrLaunchContext(profileName, headless) {
     '--disable-dev-shm-usage',
     '--mute-audio',
     '--no-first-run',
-    '--no-default-browser-check'
+    '--no-default-browser-check',
+    '--start-maximized',
+    '--window-position=50,50'
   ];
-  if (headless) {
-    launchArgs.push('--headless=new', '--window-position=-32000,-32000');
-  }
 
   const ctx = await chromium.launchPersistentContext(userDataDir, {
     channel: 'chrome',
     headless: false,
+    viewport: null,
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
     args: launchArgs,
     ignoreDefaultArgs: ['--enable-automation', '--password-store=basic', '--use-mock-keychain']
   });
@@ -131,18 +132,15 @@ async function getOrLaunchContext(profileName, headless) {
   });
 
   contexts[profileName] = ctx;
-  contextModes[profileName] = desiredMode;
+  contextModes[profileName] = 'visible';
   return ctx;
 }
 
 async function getOrCreateTab(tabKey) {
   const profileName = getProfileNameForTab(tabKey);
-  if (contexts[profileName] && contextModes[profileName] === 'visible') {
-    await getOrLaunchContext(profileName, true);
-  }
   if (tabs[tabKey] && !tabs[tabKey].isClosed()) return tabs[tabKey];
 
-  const ctx = await getOrLaunchContext(profileName, true);
+  const ctx = await getOrLaunchContext(profileName, false);
   const isSearch = tabKey.startsWith('google_search_');
   const targetUrl = getTargetUrl(tabKey);
   const domain = targetUrl.replace('https://', '').split('/')[0];
@@ -152,7 +150,7 @@ async function getOrCreateTab(tabKey) {
   for (const p of existingPages) {
     if (p.isClosed()) continue;
     const pu = p.url() || '';
-    if (isSearch && pu.includes('google.com/search') && !Object.entries(tabs).some(([k, t]) => t === p && k !== tabKey)) {
+    if (isSearch && (pu.includes('google.com/search') || pu.includes('google.com/ai') || pu.includes('google.com/aimode')) && !Object.entries(tabs).some(([k, t]) => t === p && k !== tabKey)) {
       page = p;
       break;
     } else if (!isSearch && pu.includes(domain) && !Object.entries(tabs).some(([k, t]) => t === p && k !== tabKey)) {
@@ -162,13 +160,14 @@ async function getOrCreateTab(tabKey) {
   }
 
   if (!page) {
-    page = (existingPages.length > 0 && !isSearch && !Object.values(tabs).includes(existingPages[0]))
+    page = (existingPages.length > 0 && !Object.values(tabs).includes(existingPages[0]))
       ? existingPages[0]
       : await ctx.newPage();
   }
 
   if (isSearch) {
-    if (!page.url().includes('google.com/search') || !page.url().includes('udm=50')) {
+    const isSearchAiPage = page.url().includes('google.com/search') || page.url().includes('google.com/ai') || page.url().includes('google.com/aimode');
+    if (!isSearchAiPage) {
       await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
       await page.waitForTimeout(2000);
     }
@@ -226,7 +225,7 @@ async function checkAuthExpired(page, tabKey) {
         return Boolean(document.querySelector('rich-textarea, div[contenteditable="true"], [role="textbox"], textarea'));
       }).catch(function() { return false; });
 
-      if (ready || i >= 5) {
+      if (ready) {
         await page.waitForTimeout(800);
         tabAuthStatus[tabKey] = 'ACTIVE';
         return false;
@@ -925,6 +924,54 @@ async function dispatchToWebTab(opts) {
   });
 }
 
+async function ensureGoogleSearchAi4CarbonMode(page, tabKey) {
+  try {
+    const curUrl = page.url() || '';
+    if (curUrl.includes('google.com') && !curUrl.includes('arv=4')) {
+      const sep = curUrl.includes('?') ? '&' : '?';
+      await page.goto(curUrl + sep + 'arv=4', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(function() {});
+      await page.waitForTimeout(1500);
+    }
+
+    await page.evaluate(async function() {
+      const allButtons = Array.from(document.querySelectorAll('button, [role="button"], [role="combobox"], [aria-haspopup="menu"]'));
+      const modelBtn = allButtons.find(function(b) {
+        const txt = ((b.innerText || '') + ' ' + (b.getAttribute('aria-label') || '')).toLowerCase();
+        return (txt.includes('carbon') || txt.includes('model') || txt.includes('mode') || txt.includes('complex work')) && b.offsetParent !== null;
+      });
+
+      if (modelBtn) {
+        const btnTxt = ((modelBtn.innerText || '') + ' ' + (modelBtn.getAttribute('aria-label') || '')).toLowerCase();
+        if (btnTxt.includes('4 carbon') || btnTxt.includes('most complex work')) return;
+
+        modelBtn.click();
+        await new Promise(function(r) { setTimeout(r, 400); });
+
+        const items = Array.from(document.querySelectorAll('[role="menuitem"], [role="option"], [role="menuitemradio"], li, div[role="button"]'));
+        const carbonItem = items.find(function(it) {
+          const t = ((it.innerText || '') + ' ' + (it.getAttribute('aria-label') || '')).toLowerCase();
+          return t.includes('4 carbon') || (t.includes('carbon') && t.includes('complex'));
+        });
+
+        if (carbonItem) {
+          carbonItem.click();
+          await new Promise(function(r) { setTimeout(r, 400); });
+        } else {
+          document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }));
+        }
+      }
+    }).catch(function() {});
+
+    tabActiveModel[tabKey] = '4 Carbon - Most complex work';
+    tabDiscoveredModels[tabKey] = '4 Carbon (Most complex work)';
+    console.error('[MODEL_LOCKED_4_CARBON] tabKey=' + tabKey + ' -> 4 Carbon - Most complex work');
+    return '4 Carbon - Most complex work';
+  } catch (err) {
+    tabActiveModel[tabKey] = '4 Carbon - Most complex work';
+    return '4 Carbon - Most complex work';
+  }
+}
+
 async function dispatchToGoogleSearchAiTab(opts) {
   const { tabKey, projectRoot, promptText, bundlePath } = opts;
   const cleanRoot = path.resolve(projectRoot);
@@ -933,76 +980,222 @@ async function dispatchToGoogleSearchAiTab(opts) {
     activeProjectPerTab[tabKey] = cleanRoot;
     const page = await getOrCreateTab(tabKey);
 
-    // Siguro qe jemi ne Google Search AI Mode me arv=4 (4 Carbon - Most complex work)
-    if (!page.url().includes('google.com/search') || !page.url().includes('udm=50')) {
+    // Siguro qe jemi ne Google AI Mode
+    const onAiPage = page.url().includes('google.com/search') || page.url().includes('google.com/ai') || page.url().includes('google.com/aimode');
+    if (!onAiPage) {
       await page.goto(GOOGLE_SEARCH_AI_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
-      await page.waitForTimeout(3000);
+      await page.waitForTimeout(5000);
+    } else {
+      await page.waitForTimeout(2500);
+    }
+
+    // Selekto me force "4 Carbon - Most complex work"
+    await ensureGoogleSearchAi4CarbonMode(page, tabKey);
+
+    if (await checkAuthExpired(page, tabKey)) {
+      await captureSupportEvidence(page, cleanRoot, tabKey, 'AUTH_EXPIRED', 'Kerkon Login ne Google Search AI ne Dashboard (http://127.0.0.1:4321).');
     }
 
     const boxLoc = page.locator('textarea[placeholder="Ask anything"], textarea.ITIRGe, textarea').first();
     await boxLoc.waitFor({ state: 'visible', timeout: 25000 });
 
-    // Protokolli dinamik i Ndarjes me Faza (Pjesa 1, Pjesa 2, ... Pjesa N)
-    const chunkProtocolInstruction = 
-      NL + NL + '=== RREGULL I DETYRUESHEM I GJATESISE SE PERGJIGJES ME PJEZIM ===' + NL +
-      'Që të shmanget shkurtimi apo ndërprerja e përgjigjes, zbato rreptësisht këtë protokoll:' + NL +
-      '1. Jep përgjigje të thelluar dhe të plotë arkitekturore për projektin: ' + cleanRoot + NL +
-      '2. Nëse përgjigja kërkon më shumë se 300 rreshta, NDALU dhe në fund të mesazhit shkruaj ekzaktësisht etiketën: [VAZHDON_PJESA_TJETER].' + NL +
-      '3. Kur i gjithë plani arkitekturor të ketë përfunduar 100%, në fund të mesazhit shkruaj: [PLANI_PERFUNDOI_100%].' + NL +
-      '===============================================================' + NL;
-
-    let fullPrompt = promptText + chunkProtocolInstruction;
-    if (bundlePath && fs.existsSync(bundlePath)) {
-      try {
-        const bundleTxt = fs.readFileSync(bundlePath, 'utf8');
-        if (bundleTxt.length < 450000) {
-          fullPrompt += NL + NL + '=== PERMBAJTJA E SKEDAREVE TE PROJEKTIT (WORKSPACE BUNDLE) ===' + NL + bundleTxt;
-        }
-      } catch (_) {}
+    const exchangeDir = path.join(cleanRoot, '.antigravity', 'bridge', 'exchange');
+    const txtBundlePath = path.join(exchangeDir, 'project_bundle.txt');
+    if (!fs.existsSync(txtBundlePath)) {
+      packWorkspace(cleanRoot, 'FULL');
     }
 
-    let collectedParts = [];
-    const maxChunks = 4;
+    // BASHKANGJITJA E SKEDAREVE ME BUTONIN [+] (ATTACHMENT NATIV NE GOOGLE SEARCH AI)
+    const filesToAttach = [];
+    if (fs.existsSync(txtBundlePath)) {
+      filesToAttach.push(txtBundlePath);
+    }
 
-    for (let chunkIdx = 1; chunkIdx <= maxChunks; chunkIdx++) {
-      console.error('[SEARCH_AI_PLANNER] tabKey=' + tabKey + ' dispatching Chunk ' + chunkIdx + ' for ' + path.basename(cleanRoot));
-      await boxLoc.click({ force: true });
-      
-      const textToSend = chunkIdx === 1
-        ? fullPrompt
-        : 'Vazhdo me Pjesën ' + chunkIdx + ' të planit arkitekturor nga pika ku mbete, pa përsëritur atë që ke shkruar. Nëse ka përfunduar plotësisht, vendos etiketën [PLANI_PERFUNDOI_100%].';
+    let cleanPrompt = promptText;
+    const specRegex = /=== DOKUMENTI I PLOTE I SPECIFIKIMEVE NGA PERDORUESI:\s*([^\r\n=]+)\s*===([\s\S]*?)=== FUNDI I SPECIFIKIMEVE[^=]*===/g;
+    let match;
+    while ((match = specRegex.exec(promptText)) !== null) {
+      const specName = (match[1] || 'specifikimet').trim().replace(/[^a-zA-Z0-9._-]/g, '_');
+      const specBody = match[2];
+      if (specBody && specBody.length > 4000) {
+        const tempSpecFile = path.join(exchangeDir, 'spec_' + specName + '.txt');
+        fs.writeFileSync(tempSpecFile, specBody.trim(), 'utf8');
+        filesToAttach.push(tempSpecFile);
+        cleanPrompt = cleanPrompt.replace(match[0], NL + NL + '[UDHEZIM: Dokumenti i plote i specifikimeve (' + specName + ') eshte bashkangjitur si skedar fizik me lart. Zbato 100% te gjitha kerkesat.]' + NL);
+      }
+    }
 
-      await boxLoc.fill(textToSend);
-      await page.waitForTimeout(400);
-      await page.keyboard.press('Enter');
+    if (filesToAttach.length > 0) {
+      console.error('[SEARCH_AI] Duke bashkangjitur skedaret fizike permes butonit [+]: ' + filesToAttach.map(f => path.basename(f)).join(', '));
+      const plusBtn = page.locator('button[aria-label*="Shto skedarë" i], button[aria-label*="Add files" i]').first();
+      if (await plusBtn.count() > 0) {
+        await plusBtn.click({ force: true }).catch(function() {});
+        await page.waitForTimeout(600);
+        const fileInput = page.locator('button[aria-label*="Shto skedarë" i] input[type="file"], input[type="file"]').first();
+        if (await fileInput.count() > 0) {
+          await fileInput.setInputFiles(filesToAttach).catch(function() {});
+          await page.waitForTimeout(2500);
+        }
+      }
+    }
 
-      // Monitoro gjenerimin derisa te perfundoje
+    async function sendTurnAndExtract(textToSend, isPhase2, ignoreText, minNeeded) {
+      if (!minNeeded) minNeeded = 60;
+      console.error('[SEARCH_AI] tabKey=' + tabKey + ' -> Dërgimi i kërkesës (isPhase2=' + isPhase2 + ', length=' + textToSend.length + ')');
+
+      const currentBox = page.locator('textarea[placeholder="Ask anything"], textarea.ITIRGe, textarea').first();
+      await currentBox.waitFor({ state: 'visible', timeout: 25000 });
+      await currentBox.click({ force: true }).catch(function() {});
+      await page.keyboard.press('Control+A');
+      await page.keyboard.press('Backspace');
+      await page.waitForTimeout(100);
+
+      // Injekto me Clipboard / Ctrl+V
+      const pasteSuccess = await page.evaluate(async function(txt) {
+        try {
+          await navigator.clipboard.writeText(txt);
+          return true;
+        } catch (_) {
+          return false;
+        }
+      }, textToSend).catch(function() { return false; });
+
+      if (pasteSuccess) {
+        await page.keyboard.press('Control+V');
+      } else {
+        await page.keyboard.insertText(textToSend);
+      }
+
+      // MONITORIMI I BUTONIT TE DERGIMIT: PO ISHTE DISABLE NUK KLIKOHET ENTER!
+      console.error('[SEARCH_AI] Duke monitoruar butonin e dërgimit...');
+      let sendReady = false;
+      const sendStart = Date.now();
+      while (Date.now() - sendStart < 20000) {
+        const btnState = await page.evaluate(function() {
+          const btn = document.querySelector('button[aria-label*="Dërgo" i], button[aria-label*="Send" i], button.OEueve, button[aria-label*="Kërko" i]');
+          if (!btn) return { found: false, enabled: false };
+          const dis = btn.disabled || btn.getAttribute('aria-disabled') === 'true';
+          return { found: true, enabled: !dis };
+        }).catch(function() { return { found: false, enabled: false }; });
+
+        if (btnState.found && btnState.enabled) {
+          sendReady = true;
+          break;
+        }
+        await page.waitForTimeout(300);
+      }
+
+      if (!sendReady) {
+        console.error('[SEARCH_AI_BUTTON_DISABLED] Butoni i dërgimit mbeti disabled.');
+        await captureSupportEvidence(page, cleanRoot, tabKey, 'SUBMIT_BUTTON_DISABLED', 'Butoni i dërgimit mbeti disabled.');
+        throw new Error('SUBMIT_BUTTON_DISABLED ne [' + tabKey + ']: Butoni i dërgimit është disabled ose nuk u aktivizua.');
+      }
+
+      const clicked = await page.evaluate(function() {
+        const btn = document.querySelector('button[aria-label*="Dërgo" i], button[aria-label*="Send" i], button.OEueve, button[aria-label*="Kërko" i]');
+        if (btn && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true') {
+          btn.click();
+          return true;
+        }
+        return false;
+      }).catch(function() { return false; });
+
+      if (!clicked) {
+        await page.keyboard.press('Enter');
+      }
+
+      // Monitoro gjenerimin
       const startWait = Date.now();
       let stableCount = 0;
       let lastLen = 0;
       let partText = '';
 
-      while (Date.now() - startWait < 90000) {
+      while (Date.now() - startWait < 150000) {
         await page.waitForTimeout(2000);
 
-        const currentExtraction = await page.evaluate(function() {
-          const bubbles = Array.from(document.querySelectorAll('div, section, article')).filter(function(el) {
-            if (el.tagName === 'SCRIPT' || el.tagName === 'STYLE') return false;
-            const t = (el.innerText || '').trim();
-            return t.length > 80 && !t.includes('(this||self)') && !t.includes('Skip to main content') && !t.includes('Google apps');
-          });
+        const errorText = await page.evaluate(function() {
+          const bodyText = (document.body.innerText || '').toLowerCase();
+          const errs = [
+            'something went wrong',
+            "response wasn't generated",
+            "an ai response wasn't generated",
+            'diçka shkoi keq',
+            'nuk u krijua një përgjigje'
+          ];
+          for (const e of errs) {
+            if (bodyText.includes(e)) return e;
+          }
+          return null;
+        }).catch(function() { return null; });
 
-          bubbles.sort(function(a, b) { return (b.innerText || '').length - (a.innerText || '').length; });
-          const best = bubbles[0];
-          const busy = document.querySelectorAll('[aria-busy="true"], [class*="generating" i], [class*="searching" i]');
-          return {
-            text: best ? best.innerText.trim() : '',
-            len: best ? best.innerText.trim().length : 0,
-            isBusy: busy.length > 0
-          };
-        });
+        if (errorText) {
+          if (partText && partText.length > 250) {
+            console.error('[SEARCH_AI] Google shfaqi njoftim kufiri ne fund, por teksti u kap me sukses (' + partText.length + ' karaktere).');
+            break;
+          }
+          console.error('[SEARCH_AI_GOOGLE_ERROR] Google AI shfaqi: ' + errorText);
+          await captureSupportEvidence(page, cleanRoot, tabKey, 'GOOGLE_AI_SERVICE_ERROR', 'Google shfaqi: ' + errorText);
+          throw new Error('GOOGLE_AI_SERVICE_ERROR nga [' + tabKey + ']: ' + errorText);
+        }
 
-        if (currentExtraction.len > 100 && currentExtraction.len === lastLen) {
+        const currentExtraction = await page.evaluate(function(args) {
+          const minLen = args.minLen;
+          const isP2 = args.isP2;
+          const ign = args.ign || '';
+
+          const busy = document.querySelectorAll('[aria-busy="true"], [class*="generating" i], [class*="searching" i], [role="progressbar"]');
+          const isBusy = busy.length > 0;
+
+          // Lexo nga me e fundit (reverse) per te marre gjithmone pergjigjen me te fresket
+          const bzSections = Array.from(document.querySelectorAll('section.bzXtMb')).reverse();
+          const fallbackSections = Array.from(document.querySelectorAll('section, div[role="region"], div')).reverse();
+          const allSections = bzSections.length > 0 ? bzSections : fallbackSections;
+
+          const markers = [
+            'Përgjigjja e "Modalitetit të IA-së" për ',
+            'Përgjigjja e Modalitetit të IA-së për ',
+            'Përgjigjja e "Modalitetit të IA-së":',
+            'Përgjigjja e Modalitetit të IA-së:',
+            'AI Mode reply for ',
+            'AI Mode response for '
+          ];
+
+          for (const sec of allSections) {
+            const txt = sec.innerText || '';
+            for (const m of markers) {
+              const idx = txt.lastIndexOf(m);
+              if (idx !== -1) {
+                const after = txt.slice(idx + m.length);
+                const nl = after.indexOf('\n');
+                let ans = nl !== -1 ? after.slice(nl).trim() : after.trim();
+                ans = ans
+                  .replace(/Kalo te kërkesa e mëparshme[\s\S]*$/i, '')
+                  .replace(/Skip to previous prompt[\s\S]*$/i, '')
+                  .replace(/Something went wrong, and an AI response wasn't generated\.?[\s\S]*$/i, '')
+                  .trim();
+
+                // Nese jemi ne Fazen 2, injoro seksionet e Fazes 1
+                if (isP2) {
+                  if (ign && (ans === ign || ans.includes('[FAZA_1_PERFUNDOI]'))) {
+                    continue;
+                  }
+                }
+
+                if (ans.length > minLen) {
+                  return {
+                    text: ans,
+                    len: ans.length,
+                    isBusy: isBusy
+                  };
+                }
+              }
+            }
+          }
+
+          return { text: '', len: 0, isBusy: isBusy };
+        }, { minLen: minNeeded, isP2: isPhase2, ign: ignoreText });
+
+        if (currentExtraction.len > minNeeded && currentExtraction.len === lastLen) {
           stableCount++;
           if (stableCount >= 3 && !currentExtraction.isBusy) {
             partText = currentExtraction.text;
@@ -1011,37 +1204,248 @@ async function dispatchToGoogleSearchAiTab(opts) {
         } else {
           stableCount = 0;
           lastLen = currentExtraction.len;
-          if (currentExtraction.len > 100) partText = currentExtraction.text;
+          if (currentExtraction.len > minNeeded) partText = currentExtraction.text;
         }
       }
 
-      if (!partText || partText.length < 50) {
-        await captureSupportEvidence(page, cleanRoot, tabKey, 'SEARCH_AI_EMPTY_RESPONSE', 'Modeli nuk ktheu pergjigje.');
-        throw new Error('SEARCH_AI_EMPTY_RESPONSE nga [' + tabKey + ']: Modeli nuk ktheu pergjigje brenda kohes.');
+      if (!partText || partText.length < minNeeded) {
+        await captureSupportEvidence(page, cleanRoot, tabKey, 'SEARCH_AI_EMPTY_RESPONSE', 'Modeli nuk ktheu përgjigje brenda kohës.');
+        throw new Error('SEARCH_AI_EMPTY_RESPONSE nga [' + tabKey + ']: Modeli nuk ktheu përgjigje brenda kohës.');
       }
 
-      // Pastro etiketimin e mesazheve te Google
-      let cleanPart = partText;
-      const marker = 'AI Mode reply for ';
-      const lastMarkerIdx = cleanPart.lastIndexOf(marker);
-      if (lastMarkerIdx !== -1) {
-        const afterMarker = cleanPart.slice(lastMarkerIdx + marker.length);
-        const newlineIdx = afterMarker.indexOf('\n');
-        cleanPart = newlineIdx !== -1 ? afterMarker.slice(newlineIdx).trim() : afterMarker.trim();
-      }
-
-      collectedParts.push(cleanPart);
-
-      if (cleanPart.includes('[PLANI_PERFUNDOI_100%]') || !cleanPart.includes('[VAZHDON_PJESA_TJETER]')) {
-        break;
-      }
+      return partText;
     }
 
-    tabAuthStatus[tabKey] = 'AUTHENTICATED';
-    tabActiveModel[tabKey] = '4 Carbon - Most complex work';
-    tabDiscoveredModels[tabKey] = '4 Carbon (Most complex work)';
+    const isPlannerTask = Boolean(
+      opts.isPlanner || 
+      promptText.includes('CHIEF_ARCHITECT') || 
+      promptText.includes('PLANIFIKUESIT') ||
+      promptText.includes('plan.md')
+    );
 
-    return collectedParts.join(NL + NL + '--- VAZHDIMI I PLANIT ARKITEKTUROR ---' + NL + NL);
+    function validateFaza1Compliance(text) {
+      if (!text || text.trim().length < 60) {
+        return { ok: false, reason: 'Teksti i kthyer është bosh ose tejet i shkurtër.' };
+      }
+      const low = text.toLowerCase();
+      if (SERVICE_ERROR_PATTERNS.some(function(p) { return low.includes(p); })) {
+        return { ok: false, reason: 'Përgjigja përmban gabim ose refuzim shërbimi.' };
+      }
+      const hasMarker = text.includes('[FAZA_1_PERFUNDOI]');
+      const hasAllowed = low.includes('allowed_files') || low.includes('skedarët e lejuar') || low.includes('skedaret e lejuar');
+      const hasObjectiveOrEntry = low.includes('objektivi') || low.includes('entry point') || low.includes('root cause');
+
+      if (!hasMarker && !hasAllowed && !hasObjectiveOrEntry) {
+        return { ok: false, reason: 'Mungon struktura e kërkuar (ALLOWED_FILES, OBJEKTIVI, ose etiketa [FAZA_1_PERFUNDOI]).' };
+      }
+      return { ok: true, reason: '' };
+    }
+
+    function validateFaza2Compliance(text) {
+      if (!text || text.trim().length < 80) {
+        return { ok: false, reason: 'Teksti i Fazës 2 është bosh ose tejet i shkurtër.' };
+      }
+      const low = text.toLowerCase();
+      if (SERVICE_ERROR_PATTERNS.some(function(p) { return low.includes(p); })) {
+        return { ok: false, reason: 'Përgjigja përmban gabim ose refuzim.' };
+      }
+      const hasMarker = text.includes('[PLANI_PERFUNDOI_100%]');
+      const hasSpec = low.includes('specifikimi') || low.includes('hardening') || low.includes('dod') || low.includes('kriteret');
+      if (!hasMarker && !hasSpec) {
+        return { ok: false, reason: 'Mungon specifikimi skedar më skedar ose kriteret DoD në Fazën 2.' };
+      }
+      return { ok: true, reason: '' };
+    }
+
+    if (isPlannerTask) {
+      console.error('[SEARCH_AI_PLANNER] Duke zbatuar Protokollin Urdhërues me 3 Nivele Përshkallëzimi & Chat Reset për: ' + path.basename(cleanRoot));
+
+      const maxChatAttempts = 2; // Nëse helmohet biseda, hap Chat të Ri
+
+      for (let chatAttempt = 1; chatAttempt <= maxChatAttempts; chatAttempt++) {
+        if (chatAttempt > 1) {
+          console.error('[SEARCH_AI_PLANNER] [CHAT_RESET] Modeli nuk u bind. Duke hapur CHAT TË RI të pastër (Tentativa ' + chatAttempt + ')...');
+          await page.goto(GOOGLE_SEARCH_AI_URL, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(function() {});
+          await page.waitForTimeout(3000);
+          await ensureGoogleSearchAi4CarbonMode(page, tabKey);
+
+          if (filesToAttach.length > 0) {
+            console.error('[SEARCH_AI] Duke ri-bashkangjitur skedarët fizikë në bisedën e re...');
+            const plusBtn = page.locator('button[aria-label*="Shto skedarë" i], button[aria-label*="Add files" i]').first();
+            if (await plusBtn.count() > 0) {
+              await plusBtn.click({ force: true }).catch(function() {});
+              await page.waitForTimeout(600);
+              const fileInput = page.locator('button[aria-label*="Shto skedarë" i] input[type="file"], input[type="file"]').first();
+              if (await fileInput.count() > 0) {
+                await fileInput.setInputFiles(filesToAttach).catch(function() {});
+                await page.waitForTimeout(2500);
+              }
+            }
+          }
+        }
+
+        // ==================== FAZA 1 ME 3 NIVELE PËRSHKALLËZIMI ====================
+        let faza1Text = '';
+        let faza1Valid = false;
+
+        const faza1OrderL1 = 
+          NL + NL + '=== PROTOKOLLI URDHERUES I PLANIFIKIMIT (FAZA 1 / 2) ===' + NL +
+          '[URDHER OPERATIV NGA ORCHESTRATORI - ZBATO PA ASNJË DEVIJIM]' + NL +
+          'Ke të bashkëngjitur të gjithë kodin e projektit (project_bundle.txt) dhe specifikimet e kërkesës.' + NL +
+          'Analizo me arsyetim të thellë të gjithë sistemin. Por me urdhër strikt, TANI DO TË SHKRUASH VETËM SEKSIONET 1, 2 dhe 3:' + NL + NL +
+          '1. OBJEKTIVI & NON-GOALS: Çfarë zgjidhet saktësisht dhe çfarë NUK duhet prekur.' + NL +
+          '2. ENTRY POINT & ROOT CAUSE: Rruga reale e ekzekutimit, funksionet konkrete dhe shkaku i vërtetë teknik.' + NL +
+          '3. ALLOWED_FILES & FORBIDDEN_FILES: Lista strikte e skedarëve që lejohen të krijohen ose modifikohen (rrugë relative me `/`). Çdo skedar tjetër është rreptësisht i ndaluar.' + NL + NL +
+          'RREGULL NDALIMI:' + NL +
+          'MOS shkruaj asnjë rresht nga Seksioni 4 (Specifikimi i detajuar i kodit) akoma!' + NL +
+          'Sapo të përfundosh Seksionin 3 (ALLOWED_FILES), NDALU MENJËHERË dhe në fund të mesazhit shkruaj ekzaktësisht etiketën:' + NL +
+          '[FAZA_1_PERFUNDOI]' + NL +
+          '========================================================' + NL;
+
+        for (let level = 1; level <= 3; level++) {
+          console.error('[SEARCH_AI_PLANNER] Ekzekutimi i Fazës 1 (Niveli ' + level + ')...');
+          let promptToSend = '';
+          if (level === 1) {
+            promptToSend = cleanPrompt + faza1OrderL1;
+          } else if (level === 2) {
+            promptToSend = 
+              '=== VËREJTJE OPERATIVE DISIPLINORE (NIVELI 2) ===' + NL +
+              '[URDHER KORRIGJUES AGRESIV - ZERO TOLERANCE]' + NL +
+              'Përgjigja jote shkeli urdhrin e Fazës 1! Ke devijuar nga struktura ose ke tejkaluar fazën e lejuar.' + NL +
+              'NDALOHET ÇDO FJALË HYRËSE, NDALOHET SHPJEGIMI I TEPRISË OSE BASHKËBISEDIMI.' + NL +
+              'Shkruaj TANI VETËM këto 3 pika të strukturuara pa asnjë devijim:' + NL + NL +
+              '1. OBJEKTIVI & NON-GOALS' + NL +
+              '2. ENTRY POINT & ROOT CAUSE' + NL +
+              '3. ALLOWED_FILES & FORBIDDEN_FILES (Lista strikte me rrugë relative /)' + NL + NL +
+              'Mbyll menjëherë në fund me etiketën: [FAZA_1_PERFUNDOI]. Çdo gjë tjetër është e pavlefshme.' + NL +
+              '================================================';
+          } else {
+            promptToSend = 
+              '=== URDHËR ULTIMATIV EKZEKUTIV (NIVELI 3 - PARALAJMËRIM SKUALIFIKIMI) ===' + NL +
+              'Dështove 2 herë të zbatosh protokollin arkitekturor. Ky është paralajmërimi i fundit operativ para mbylljes dhe skualifikimit të sesionit tënd.' + NL +
+              'Plotëso TANI VETËM këtë skelet ekzakt teknik pa asnjë shpjegim shtesë:' + NL + NL +
+              '### 1. OBJEKTIVI' + NL +
+              '[Përshkruaj shkurt objektivat dhe non-goals]' + NL +
+              '### 2. ENTRY POINT & ROOT CAUSE' + NL +
+              '[Specifiko funksionin dhe rrugën e skedarit]' + NL +
+              '### 3. ALLOWED_FILES' + NL +
+              '[Listo vetëm rrugët relative të skedarëve]' + NL + NL +
+              '[FAZA_1_PERFUNDOI]' + NL +
+              '================================================';
+          }
+
+          try {
+            faza1Text = await sendTurnAndExtract(promptToSend, level > 1, '', 60);
+            const comp = validateFaza1Compliance(faza1Text);
+            if (comp.ok) {
+              console.error('[SEARCH_AI_PLANNER] [NIVELI_' + level + '_SUKSES] Faza 1 u miratua me sukses (' + faza1Text.length + ' karaktere).');
+              faza1Valid = true;
+              break;
+            } else {
+              console.error('[SEARCH_AI_PLANNER] [NIVELI_' + level + '_REFUZIM] Modeli nuk u bind: ' + comp.reason);
+            }
+          } catch (lvlErr) {
+            console.error('[SEARCH_AI_PLANNER] [NIVELI_' + level + '_ERROR] ' + lvlErr.message);
+          }
+          await page.waitForTimeout(2000);
+        }
+
+        if (!faza1Valid) {
+          console.error('[SEARCH_AI_PLANNER] Faza 1 dështoi pas 3 niveleve në këtë sesion.');
+          if (chatAttempt < maxChatAttempts) {
+            continue; // Kalo te Chati i Ri!
+          } else {
+            throw new Error('PLANNER_ESCALATION_FAILED: Modeli nuk u bind pas 3 niveleve urdhëruese dhe restartimit të bisedës.');
+          }
+        }
+
+        // ==================== FAZA 2 ME 3 NIVELE PËRSHKALLËZIMI ====================
+        await page.waitForTimeout(3000);
+
+        let faza2Text = '';
+        let faza2Valid = false;
+
+        const faza2OrderL1 = 
+          '=== PROTOKOLLI URDHERUES I PLANIFIKIMIT (FAZA 2 / 2) ===' + NL +
+          '[URDHER OPERATIV NGA ORCHESTRATORI]' + NL +
+          'Seksionet 1, 2 dhe 3 (Objektivat dhe Lista e ALLOWED_FILES) u miratuan me sukses.' + NL +
+          'Tani vazhdo menjëherë duke shkruar SEKSIONET 4, 5 dhe 6 të plota dhe të thelluara:' + NL + NL +
+          '4. SPECIFIKIMI SKEDAR MË SKEDAR: Për secilin skedar të miratuar te ALLOWED_FILES, jep kontratat e funksioneve, tipet e të dhënave, logjikën hap pas hapi dhe ruajtjen e funksionalitetit ekzistues.' + NL +
+          '5. HARDENING & EDGE CASES (Torture Checklist): Trajtimi i null/empty, Unicode, gabime rrjeti/IO, race conditions.' + NL +
+          '6. KRITERET E VERIFIKIMIT (DoD MATRIX): Çfarë komandash build/test duhet të kalojnë që Reviewer-i të japë STATUS: PASSED.' + NL + NL +
+          'Në fund të përgjigjes, shkruaj ekzaktësisht etiketën:' + NL +
+          '[PLANI_PERFUNDOI_100%]' + NL +
+          '========================================================';
+
+        for (let level2 = 1; level2 <= 3; level2++) {
+          console.error('[SEARCH_AI_PLANNER] Ekzekutimi i Fazës 2 (Niveli ' + level2 + ')...');
+          let prompt2ToSend = '';
+          if (level2 === 1) {
+            prompt2ToSend = faza2OrderL1;
+          } else if (level2 === 2) {
+            prompt2ToSend = 
+              '=== VËREJTJE OPERATIVE DISIPLINORE PËR FAZËN 2 (NIVELI 2) ===' + NL +
+              '[URDHER KORRIGJUES AGRESIV]' + NL +
+              'Përgjigja jote në Fazën 2 nuk ishte e plotë ose u ndërpre para kohe.' + NL +
+              'Shkruaj menjëherë SPECIFIKIMIN E PLOTË SKEDAR MË SKEDAR dhe KRITERET DOD pa asnjë fjalë të tepërt.' + NL +
+              'Përfundo detyrimisht me etiketën: [PLANI_PERFUNDOI_100%].';
+          } else {
+            prompt2ToSend = 
+              '=== URDHËR ULTIMATIV PËR FAZËN 2 (NIVELI 3) ===' + NL +
+              'Vazhdo menjëherë duke dhënë funksionet e sakta për çdo skedar dhe komandat testuese DoD.' + NL +
+              'Vendos etiketën përfundimtare: [PLANI_PERFUNDOI_100%].';
+          }
+
+          try {
+            faza2Text = await sendTurnAndExtract(prompt2ToSend, true, faza1Text, 100);
+            const comp2 = validateFaza2Compliance(faza2Text);
+            if (comp2.ok) {
+              console.error('[SEARCH_AI_PLANNER] [FAZA_2_NIVELI_' + level2 + '_SUKSES] Faza 2 u miratua me sukses (' + faza2Text.length + ' karaktere).');
+              faza2Valid = true;
+              break;
+            } else {
+              console.error('[SEARCH_AI_PLANNER] [FAZA_2_NIVELI_' + level2 + '_REFUZIM] ' + comp2.reason);
+            }
+          } catch (p2Err) {
+            console.error('[SEARCH_AI_PLANNER] [FAZA_2_ERROR] ' + p2Err.message);
+          }
+          await page.waitForTimeout(2000);
+        }
+
+        // Failsafe nëse u ndërpre por ka përmbajtje të mjaftueshme
+        if (!faza2Valid && faza2Text && faza2Text.length > 250) {
+          console.error('[SEARCH_AI_PLANNER] Faza 2 u ndërpre por ka tekst të vlefshëm (' + faza2Text.length + ' karaktere). Po përdoret.');
+          faza2Valid = true;
+        }
+
+        if (faza1Valid && faza2Valid) {
+          tabAuthStatus[tabKey] = 'AUTHENTICATED';
+          tabActiveModel[tabKey] = '4 Carbon - Most complex work';
+          tabDiscoveredModels[tabKey] = '4 Carbon (Most complex work)';
+
+          const cleanF1 = faza1Text.replace(/\[FAZA_1_PERFUNDOI\]/gi, '').trim();
+          const cleanF2 = faza2Text.replace(/\[PLANI_PERFUNDOI_100%\]/gi, '').replace(/\[FAZA_1_PERFUNDOI\]/gi, '').trim();
+
+          const finalPlan = [
+            cleanF1,
+            '',
+            '---',
+            '',
+            cleanF2
+          ].join(NL);
+
+          return finalPlan;
+        }
+      }
+
+      throw new Error('PLANNER_ESCALATION_FAILED: Dështoi gjenerimi i planit pas përshkallëzimit me 3 nivele dhe rinisjes së bisedës.');
+    } else {
+      const singleRes = await sendTurnAndExtract(cleanPrompt, false, '', 40);
+      tabAuthStatus[tabKey] = 'AUTHENTICATED';
+      tabActiveModel[tabKey] = '4 Carbon - Most complex work';
+      tabDiscoveredModels[tabKey] = '4 Carbon (Most complex work)';
+      return singleRes;
+    }
   });
 }
 
@@ -1207,7 +1611,10 @@ function packWorkspace(projectRoot, mode) {
 
             const relNormalized = path.relative(cleanRoot, full).replace(/\\/g, '/');
             const content = fs.readFileSync(full, 'utf8');
-            output += NL + '--- FILE: ' + relNormalized + ' ---' + NL + content + NL;
+            output += NL + NL + '=================================================================' + NL +
+                      '--- FILE: ' + relNormalized + ' ---' + NL +
+                      '=================================================================' + NL +
+                      content + NL;
             collectedFiles.push({ relNormalized: relNormalized, content: content });
           } catch (_) {
             continue;
@@ -1244,7 +1651,8 @@ function getBundleAttachmentAndNote(projectRoot, targetEngine) {
   const zipMdPath = path.join(exchangeDir, 'project_bundle.zip.md');
 
   const eng = String(targetEngine || '');
-  const useZipMd = eng.startsWith('web') || (routing.bundleFormat === 'zip.md' && !eng.startsWith('gemini'));
+  const isGoogle = eng.startsWith('google_search_') || eng.startsWith('gemini');
+  const useZipMd = !isGoogle && (eng.startsWith('web') || (routing.bundleFormat === 'zip.md'));
 
   if (useZipMd) {
     if (!fs.existsSync(zipMdPath)) packWorkspace(projectRoot, 'FULL');
@@ -1254,7 +1662,8 @@ function getBundleAttachmentAndNote(projectRoot, targetEngine) {
   }
 
   if (!fs.existsSync(txtPath)) packWorkspace(projectRoot, 'FULL');
-  return { path: txtPath, note: '' };
+  const txtNote = NL + NL + 'UDHEZIM: I gjithë kodi burimor i projektit është në formatin tekst .txt (project_bundle.txt) i përfshirë më poshtë brenda këtij mesazhi.' + NL;
+  return { path: txtPath, note: txtNote };
 }
 
 function parseCodeBlocksFromMarkdown(markdown) {
@@ -1502,7 +1911,10 @@ if (action === 'run_planner') {
 const engine = routing.roles.planner;
 if (engine === 'antigravity') return { status: 'DELEGATE_TO_ANTIGRAVITY', role: 'planner', targetFile: planPath };
 const bundle = getBundleAttachmentAndNote(cleanRoot, engine);
-const rule = fs.readFileSync(path.join(PLUGIN_ROOT, 'rules', 'planner_rules.md'), 'utf8');
+let rule = fs.readFileSync(path.join(PLUGIN_ROOT, 'rules', 'planner_rules.md'), 'utf8');
+if (engine.startsWith('google_search_') || engine.startsWith('gemini')) {
+  rule = rule.replace(/\([^)]*zip[^)]*\)/gi, '(Kodi i plotë i projektit është në formatin .txt (project_bundle.txt) i përfshirë në mesazh).');
+}
 const embeddedSpecs = resolveAndEmbedExternalFiles(payload.userRequest);
 const prompt = rule + bundle.note + embeddedSpecs + NL + NL + 'KERKESA E PERDORUESIT:' + NL + (payload.userRequest || 'Analizo dhe planifiko ndryshimet.');
 
@@ -1512,7 +1924,8 @@ if (engine.startsWith('google_search_')) {
     tabKey: engine,
     projectRoot: cleanRoot,
     promptText: prompt,
-    bundlePath: bundle.path
+    bundlePath: bundle.path,
+    isPlanner: true
   });
 } else {
   response = await dispatchToWebTab({
@@ -1539,7 +1952,10 @@ if (payload.mode === 'FIX_ERROR' && st.retryCount > (st.maxRetries || 2)) {
 return { status: 'MAX_RETRIES_EXCEEDED', errorFile: errorPath };
 }
 const bundle = getBundleAttachmentAndNote(cleanRoot, engine);
-const rule = fs.readFileSync(path.join(PLUGIN_ROOT, 'rules', 'coder_rules.md'), 'utf8');
+let rule = fs.readFileSync(path.join(PLUGIN_ROOT, 'rules', 'coder_rules.md'), 'utf8');
+if (engine.startsWith('google_search_') || engine.startsWith('gemini')) {
+  rule = rule.replace(/\([^)]*zip[^)]*\)/gi, '(Kodi i plotë i projektit është në formatin .txt (project_bundle.txt) i përfshirë në mesazh).');
+}
 const planTxt = fs.existsSync(planPath) ? fs.readFileSync(planPath, 'utf8') : '';
 const embeddedSpecs = resolveAndEmbedExternalFiles(payload.userRequest);
 let extraPrompt = bundle.note + embeddedSpecs + NL + NL + '=== PLANI ARKITEKTUROR (plan.md) ===' + NL + planTxt;
@@ -1703,18 +2119,26 @@ await resetChatIfNeeded(tabs[data.tabKey], data.tabKey, '', true);
 res.writeHead(200, { 'Content-Type': 'application/json' });
 return res.end(JSON.stringify({ ok: true }));
 }
-if (req.url === '/api/login-profile') {
-const profile = data.profileName;
-const visibleCtx = await getOrLaunchContext(profile, false);
-const loginPage = await visibleCtx.newPage();
-const targetUrl = profile === 'm365' ? M365_CHAT_URL : GEMINI_APP_URL;
-await loginPage.goto(targetUrl, { waitUntil: 'domcontentloaded' });
-res.writeHead(200, { 'Content-Type': 'application/json' });
-return res.end(JSON.stringify({
-ok: true,
-message: 'Dritarja e Login-it per [' + profile + '] u hap. Identifikohu dhe mbylle dritaren me X kur te mbarosh.'
-}));
-}
+    if (req.url === '/api/login-profile') {
+      const reqName = data.profileName;
+      const profile = getProfileNameForTab(reqName);
+      const targetUrl = getTargetUrl(reqName);
+
+      const visibleCtx = await getOrLaunchContext(profile, false);
+      const pages = visibleCtx.pages();
+      const loginPage = (pages.length > 0 && !pages[0].isClosed()) ? pages[0] : await visibleCtx.newPage();
+      await loginPage.goto(targetUrl, { waitUntil: 'domcontentloaded' }).catch(function() {});
+      if (reqName.startsWith('google_search_')) {
+        await ensureGoogleSearchAi4CarbonMode(loginPage, reqName).catch(function() {});
+      }
+      await loginPage.bringToFront().catch(function() {});
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({
+        ok: true,
+        message: 'Dritarja e dukshme per [' + reqName + ' (Profili: ' + profile + ')] u hap me sukses!\n\n1. Identifikohu me llogarine tende ne Google/Microsoft.\n2. Zgjidh modelin ose kalo verifikimet/cookies nese kerkohen.\n3. Mbylle dritaren me [X] kur te mbarosh, qe profili te ruhet per ekzekutimet automatike ne sfond.'
+      }));
+    }
 if (req.url === '/api/kill-all') {
 await closeAllContexts();
 res.writeHead(200, { 'Content-Type': 'application/json' });
