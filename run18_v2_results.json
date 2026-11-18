@@ -1,0 +1,411 @@
+{
+  "suite": "RUN18_V2_BINARY_CONTEXT_HANDSHAKE",
+  "projectRoot": "C:\\Vladi_project\\Antigravity_MultiAI_Bridge",
+  "sourcePath": "C:\\Vladi_project\\Antigravity_MultiAI_Bridge\\mcp\\server.js",
+  "total": 80,
+  "passed": 80,
+  "failed": 0,
+  "sourceSha256": "e26f93fc1a210f7b1dbbcd83ec79791f8b789baea1ec4ffe7e7cf3b648301f02",
+  "results": [
+    {
+      "id": "A01",
+      "name": "pyc excluded",
+      "status": "PASS"
+    },
+    {
+      "id": "A02",
+      "name": "uppercase pyc",
+      "status": "PASS"
+    },
+    {
+      "id": "A03",
+      "name": "pycache directory",
+      "status": "PASS"
+    },
+    {
+      "id": "A04",
+      "name": "compiled extensions",
+      "status": "PASS"
+    },
+    {
+      "id": "A05",
+      "name": "database extensions",
+      "status": "PASS"
+    },
+    {
+      "id": "A06",
+      "name": "archives",
+      "status": "PASS"
+    },
+    {
+      "id": "A07",
+      "name": "images",
+      "status": "PASS"
+    },
+    {
+      "id": "A08",
+      "name": "media",
+      "status": "PASS"
+    },
+    {
+      "id": "A09",
+      "name": "fonts",
+      "status": "PASS"
+    },
+    {
+      "id": "A10",
+      "name": "Revit CAD",
+      "status": "PASS"
+    },
+    {
+      "id": "A11",
+      "name": "extensionless NUL",
+      "status": "PASS"
+    },
+    {
+      "id": "A12",
+      "name": "txt NUL",
+      "status": "PASS"
+    },
+    {
+      "id": "A13",
+      "name": "py NUL",
+      "status": "PASS"
+    },
+    {
+      "id": "A14",
+      "name": "control 2 percent",
+      "status": "PASS"
+    },
+    {
+      "id": "A15",
+      "name": "control above 2 percent",
+      "status": "PASS"
+    },
+    {
+      "id": "A16",
+      "name": "invalid UTF8",
+      "status": "PASS"
+    },
+    {
+      "id": "A17",
+      "name": "Albanian UTF8",
+      "status": "PASS"
+    },
+    {
+      "id": "A18",
+      "name": "empty text",
+      "status": "PASS"
+    },
+    {
+      "id": "A19",
+      "name": "UTF8 BOM",
+      "status": "PASS"
+    },
+    {
+      "id": "A20",
+      "name": "UTF16 BOM",
+      "status": "PASS"
+    },
+    {
+      "id": "A21",
+      "name": "explicit binary",
+      "status": "PASS"
+    },
+    {
+      "id": "A22",
+      "name": "no binary logs",
+      "status": "PASS"
+    },
+    {
+      "id": "A23",
+      "name": "duplicate aliases",
+      "status": "PASS"
+    },
+    {
+      "id": "A24",
+      "name": "incident zero NUL",
+      "status": "PASS"
+    },
+    {
+      "id": "B01",
+      "name": "planning budget",
+      "status": "PASS"
+    },
+    {
+      "id": "B02",
+      "name": "coding budget",
+      "status": "PASS"
+    },
+    {
+      "id": "B03",
+      "name": "review budget",
+      "status": "PASS"
+    },
+    {
+      "id": "B04",
+      "name": "retry budget",
+      "status": "PASS"
+    },
+    {
+      "id": "B05",
+      "name": "absolute ceiling",
+      "status": "PASS"
+    },
+    {
+      "id": "B06",
+      "name": "workspace shrinks",
+      "status": "PASS"
+    },
+    {
+      "id": "B07",
+      "name": "fixed compaction",
+      "status": "PASS"
+    },
+    {
+      "id": "B08",
+      "name": "UTF8 bytes",
+      "status": "PASS"
+    },
+    {
+      "id": "B09",
+      "name": "unicode boundary",
+      "status": "PASS"
+    },
+    {
+      "id": "B10",
+      "name": "delimiters budget",
+      "status": "PASS"
+    },
+    {
+      "id": "B11",
+      "name": "manifest budget",
+      "status": "PASS"
+    },
+    {
+      "id": "B12",
+      "name": "reserve",
+      "status": "PASS"
+    },
+    {
+      "id": "B13",
+      "name": "no NUL unit",
+      "status": "PASS"
+    },
+    {
+      "id": "B14",
+      "name": "no encoded NUL",
+      "status": "PASS"
+    },
+    {
+      "id": "B15",
+      "name": "high surrogate",
+      "status": "PASS"
+    },
+    {
+      "id": "B16",
+      "name": "low surrogate",
+      "status": "PASS"
+    },
+    {
+      "id": "B17",
+      "name": "pair accepted",
+      "status": "PASS"
+    },
+    {
+      "id": "B18",
+      "name": "round trip",
+      "status": "PASS"
+    },
+    {
+      "id": "B19",
+      "name": "deterministic hash",
+      "status": "PASS"
+    },
+    {
+      "id": "B20",
+      "name": "repeat stable",
+      "status": "PASS"
+    },
+    {
+      "id": "B21",
+      "name": "budget log once",
+      "status": "PASS"
+    },
+    {
+      "id": "B22",
+      "name": "start complete once",
+      "status": "PASS"
+    },
+    {
+      "id": "C01",
+      "name": "incident phrase",
+      "status": "PASS"
+    },
+    {
+      "id": "C02",
+      "name": "file process",
+      "status": "PASS"
+    },
+    {
+      "id": "C03",
+      "name": "different file",
+      "status": "PASS"
+    },
+    {
+      "id": "C04",
+      "name": "unable process",
+      "status": "PASS"
+    },
+    {
+      "id": "C05",
+      "name": "too large",
+      "status": "PASS"
+    },
+    {
+      "id": "C06",
+      "name": "unsupported",
+      "status": "PASS"
+    },
+    {
+      "id": "C07",
+      "name": "context long",
+      "status": "PASS"
+    },
+    {
+      "id": "C08",
+      "name": "success",
+      "status": "PASS"
+    },
+    {
+      "id": "C09",
+      "name": "unrelated rejected",
+      "status": "PASS"
+    },
+    {
+      "id": "C10",
+      "name": "quota fast",
+      "status": "PASS"
+    },
+    {
+      "id": "C11",
+      "name": "policy fast",
+      "status": "PASS"
+    },
+    {
+      "id": "C12",
+      "name": "auth fast",
+      "status": "PASS"
+    },
+    {
+      "id": "C13",
+      "name": "transient shared",
+      "status": "PASS"
+    },
+    {
+      "id": "C14",
+      "name": "physical receipt",
+      "status": "PASS"
+    },
+    {
+      "id": "C15",
+      "name": "blocks Carbon",
+      "status": "PASS"
+    },
+    {
+      "id": "C16",
+      "name": "verified reset",
+      "status": "PASS"
+    },
+    {
+      "id": "C17",
+      "name": "compact 256",
+      "status": "PASS"
+    },
+    {
+      "id": "C18",
+      "name": "one retry file",
+      "status": "PASS"
+    },
+    {
+      "id": "C19",
+      "name": "success Carbon",
+      "status": "PASS"
+    },
+    {
+      "id": "C20",
+      "name": "retry exhausted",
+      "status": "PASS"
+    },
+    {
+      "id": "D01",
+      "name": "incident valid artifact",
+      "status": "PASS"
+    },
+    {
+      "id": "D02",
+      "name": "incident planning budget",
+      "status": "PASS"
+    },
+    {
+      "id": "D03",
+      "name": "incident NUL zero",
+      "status": "PASS"
+    },
+    {
+      "id": "D04",
+      "name": "replacement zero",
+      "status": "PASS"
+    },
+    {
+      "id": "D05",
+      "name": "rejection compact retry",
+      "status": "PASS"
+    },
+    {
+      "id": "D06",
+      "name": "Carbon blocked",
+      "status": "PASS"
+    },
+    {
+      "id": "D07",
+      "name": "fresh route receipt",
+      "status": "PASS"
+    },
+    {
+      "id": "D08",
+      "name": "clean extraction",
+      "status": "PASS"
+    },
+    {
+      "id": "D09",
+      "name": "Hydrogen Carbon switch",
+      "status": "PASS"
+    },
+    {
+      "id": "D10",
+      "name": "Gemini unchanged",
+      "status": "PASS"
+    },
+    {
+      "id": "D11",
+      "name": "Copilot unchanged",
+      "status": "PASS"
+    },
+    {
+      "id": "D12",
+      "name": "393 regression markers",
+      "status": "PASS"
+    },
+    {
+      "id": "D13",
+      "name": "node check",
+      "status": "PASS"
+    },
+    {
+      "id": "D14",
+      "name": "source allowlist",
+      "status": "PASS"
+    }
+  ]
+}

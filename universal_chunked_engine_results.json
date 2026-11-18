@@ -1,0 +1,81 @@
+{
+  "total": 15,
+  "passed": 15,
+  "results": [
+    {
+      "id": "T01",
+      "name": "small repository scan and map",
+      "status": "PASS"
+    },
+    {
+      "id": "T02",
+      "name": "synthetic 5 MiB chunks bounded",
+      "status": "PASS"
+    },
+    {
+      "id": "T03",
+      "name": "50 MiB metadata remains bounded",
+      "status": "PASS"
+    },
+    {
+      "id": "T04",
+      "name": "dependency graph resolves direct imports",
+      "status": "PASS"
+    },
+    {
+      "id": "T05",
+      "name": "chunk analysis executes analyzer",
+      "status": "PASS"
+    },
+    {
+      "id": "T06",
+      "name": "final planning context bounded",
+      "status": "PASS"
+    },
+    {
+      "id": "T07",
+      "name": "10 targets dependency batching",
+      "status": "PASS"
+    },
+    {
+      "id": "T08",
+      "name": "batch context existing and new file",
+      "status": "PASS"
+    },
+    {
+      "id": "T09",
+      "name": "coding batch mock dispatch validates targets",
+      "status": "PASS"
+    },
+    {
+      "id": "T10",
+      "name": "atomic apply and syntax quick check",
+      "status": "PASS"
+    },
+    {
+      "id": "T11",
+      "name": "repair once executes real dispatch path",
+      "status": "PASS"
+    },
+    {
+      "id": "T12",
+      "name": "adaptive halving produces bounded leaves",
+      "status": "PASS"
+    },
+    {
+      "id": "T13",
+      "name": "contract memory bounded",
+      "status": "PASS"
+    },
+    {
+      "id": "T14",
+      "name": "diff-focused review chunks",
+      "status": "PASS"
+    },
+    {
+      "id": "T15",
+      "name": "syntax scope and live integration markers",
+      "status": "PASS"
+    }
+  ]
+}

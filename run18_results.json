@@ -1,0 +1,682 @@
+{
+  "suite": "RUN18_UNIVERSAL",
+  "sourcePath": "C:\\Vladi_project\\Antigravity_MultiAI_Bridge\\mcp\\server.js",
+  "total": 112,
+  "passed": 112,
+  "failed": 0,
+  "sha256": "e26f93fc1a210f7b1dbbcd83ec79791f8b789baea1ec4ffe7e7cf3b648301f02",
+  "results": [
+    {
+      "id": "A01",
+      "name": "Gemini click reset",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "A02",
+      "name": "Copilot click reset",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "A03",
+      "name": "Search AI click reset",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "A04",
+      "name": "click no-op fallback",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "A05",
+      "name": "same route rejected",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "A06",
+      "name": "turns rejected",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "A07",
+      "name": "composer text rejected",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "A08",
+      "name": "attachment rejected",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "A09",
+      "name": "two clean polls",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "A10",
+      "name": "old fingerprint absent",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "A11",
+      "name": "model reverified",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "A12",
+      "name": "receipt fields",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "A13",
+      "name": "domain recovery",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "A14",
+      "name": "reset blocks upload",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "A15",
+      "name": "attempt isolation",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "A16",
+      "name": "canonical mapping",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "A17",
+      "name": "overlay handling",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "A18",
+      "name": "missing control",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "A19",
+      "name": "click throws",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "A20",
+      "name": "navigation timeout",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "A21",
+      "name": "auth redirect",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "A22",
+      "name": "Search clean state",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "A23",
+      "name": "M365 clean state",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "A24",
+      "name": "incident replay",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B01",
+      "name": "empty repo",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B02",
+      "name": "small repo",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B03",
+      "name": "medium repo",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B04",
+      "name": "large repo",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B05",
+      "name": "output budget",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B06",
+      "name": "absolute ceiling",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B07",
+      "name": "151-file incident",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B08",
+      "name": "duplicate data",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B09",
+      "name": "generated deprioritized",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B10",
+      "name": "source prioritized",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B11",
+      "name": "config entry priority",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B12",
+      "name": "FILE_TARGET safe",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B13",
+      "name": "imports bounded",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B14",
+      "name": "neighbor tests",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B15",
+      "name": "runtime JSON summary",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B16",
+      "name": "CSV summary",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B17",
+      "name": "NDJSON summary",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B18",
+      "name": "log tail",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B19",
+      "name": "doc headings",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B20",
+      "name": "binary excluded",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B21",
+      "name": "node_modules excluded",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B22",
+      "name": "git excluded",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B23",
+      "name": "build dist excluded",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B24",
+      "name": "symlink escape",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B25",
+      "name": "path traversal",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B26",
+      "name": "brace path",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B27",
+      "name": "UTF-8",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B28",
+      "name": "deterministic order",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B29",
+      "name": "exact boundary",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B30",
+      "name": "oversized target",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B31",
+      "name": "missing target receipt",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B32",
+      "name": "plan absent",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B33",
+      "name": "error promotion",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B34",
+      "name": "explicit promotion",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B35",
+      "name": "repeat stable",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B36",
+      "name": "runtime growth invariant",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B37",
+      "name": "four modes",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B38",
+      "name": "manifest footer",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B39",
+      "name": "no content logs",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B40",
+      "name": "canonical duplicate",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B41",
+      "name": "timestamp excluded",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "B42",
+      "name": "compat wrapper",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "C01",
+      "name": "transient encountered",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "C02",
+      "name": "transient try again",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "C03",
+      "name": "transient went wrong",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "C04",
+      "name": "transient later",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "C05",
+      "name": "transient unavailable",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "C06",
+      "name": "transient oops",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "C07",
+      "name": "transient not generated",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "C08",
+      "name": "quota exceeded",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "C09",
+      "name": "limit reached",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "C10",
+      "name": "usage limit",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "C11",
+      "name": "rate limit",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "C12",
+      "name": "policy refusal",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "C13",
+      "name": "auth session",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "C14",
+      "name": "payload large",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "C15",
+      "name": "context long",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "C16",
+      "name": "quota precedence",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "C17",
+      "name": "policy precedence",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "C18",
+      "name": "visible alerts",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "C19",
+      "name": "unknown error",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "C20",
+      "name": "normal response",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "C21",
+      "name": "one retry",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "C22",
+      "name": "quota zero retry",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "C23",
+      "name": "policy zero retry",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "C24",
+      "name": "auth zero retry",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "C25",
+      "name": "bounded backoff",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "C26",
+      "name": "fresh reset",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "C27",
+      "name": "compact retry",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "C28",
+      "name": "retry exhausted",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "D01",
+      "name": "planning mode",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "D02",
+      "name": "coder mode",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "D03",
+      "name": "reviewer mode",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "D04",
+      "name": "auto-heal compact",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "D05",
+      "name": "small compatibility",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "D06",
+      "name": "medium budget",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "D07",
+      "name": "large monorepo",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "D08",
+      "name": "multi-language",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "D09",
+      "name": "five cycles stable",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "D10",
+      "name": "transient success retry",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "D11",
+      "name": "quota fail-fast",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "D12",
+      "name": "reset fail-closed",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "D13",
+      "name": "late reset preserved",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "D14",
+      "name": "send commit preserved",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "D15",
+      "name": "model selection preserved",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "D16",
+      "name": "Search extraction preserved",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "D17",
+      "name": "node check",
+      "status": "PASS",
+      "detail": "ok"
+    },
+    {
+      "id": "D18",
+      "name": "source allowlist",
+      "status": "PASS",
+      "detail": "ok"
+    }
+  ]
+}

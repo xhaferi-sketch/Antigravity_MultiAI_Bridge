@@ -12,3 +12,5 @@ mcp/node_modules/
 Thumbs.db
 .antigravity/
 scratch/
+
+.hermes/

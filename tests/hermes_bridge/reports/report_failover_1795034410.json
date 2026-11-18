@@ -1,0 +1,10 @@
+{
+  "test_name": "test_failover_resilience",
+  "status": "SUCCESS",
+  "primary_status": "DOWN",
+  "failover_triggered": true,
+  "secondary_status": "ACTIVE",
+  "failover_recovery_ms": 45.2,
+  "timestamp": "2026-11-18 20:40:10",
+  "duration_seconds": 0.0
+}

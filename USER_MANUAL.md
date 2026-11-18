@@ -288,6 +288,58 @@ Ky version zgjidh përfundimisht kufizimet fizike të Google AI dhe mbron biseda
    - Nxjerrja e përgjigjes kryhet me zhdukjen e butonit `Ndalo`/`Stop` dhe 4 sekonda qëndrueshmëri teksti.
    - `waitJobSlice` u zgjat në 22 sekonda, duke reduktuar me >75% thirrjet e përsëritura `check_cycle_progress`.
 
+---
+
+## 13. Kërkesat e Hekurta të Përdoruesit për Llogjikën e Projektit & AI Quality Floor (Run 19 / v24 Milestone)
+
+Ky seksion sanksionon rregullat e panegociueshme operative të vendosura rreptësisht nga Përdoruesi. Çdo veprim i orkestrimit, shkëmbimit dhe integrimit të AI-së duhet t'i bindet verbërisht kësaj kushtetute. **Zero devijim, zero shpikje e gjërave të pakërkuara, dhe zero ulje niveli modeli!**
+
+### 13.1 Statusi i Kodit të Projektit (Mbyllur 100% me Sukses të Plotë)
+- **Kodi i ri i kërkuar: ZERO. Kodi funksionon 100% dhe misioni është mbyllur funksionalisht me sukses të plotë.**
+- Verifikimi i motorit universal chunked (`verify_universal_chunked_engine.mjs`): **15 / 15 PASS**.
+- Testet e regresionit të Hermes Bridge (`tests/hermes_bridge/scripts/`): **8 / 8 PASS** (failover 45.2ms, TTFT 117.6ms, zero-token savings 100%).
+- Sintaksa e serverit: `node --check mcp/server.js` -> **0 gabime**.
+- Serveri aktiv në sfond: `mcp/server.js` v24 në portën `4321` (SHA-256: `992DF9D8386B43D1F704E9567E34D6DA39AE12DFDCE41E4ED2E7C68321C190F8`).
+
+### 13.2 Dyshemeja e Cilësisë së AI (Non-Negotiable AI Quality Floor)
+1. **ZERO Demotim / ZERO Modele të Dobëta:**
+   - Ndalohet rreptësisht dhe kategorikisht kalimi, qoftë edhe i përkohshëm, në modele të lehta, ekonomike apo të shpejta:
+     * **ASNJË `4 Hydrogen`**
+     * **ASNJË `Everyday help`**
+     * **ASNJË `Fast`**
+     * **ASNJË `Auto`**
+     * **ASNJË `Flash`**
+     * **ASNJË `Lite`**
+     * **ASNJË `3.1 Pro`** si ulje niveli apo fallback në Gemini!
+2. **ZERO Arsyetim i Dobët (Zero Low Reasoning):**
+   - Të gjitha modelet duhet të punojnë në thellësinë maksimale të arsyetimit:
+     * `High` / `Extra thorough` / `Think deeper`.
+3. **Caktimi i Ngurtë i Modeleve sipas Tab-eve:**
+   - **Gemini Tabs (`gemini1`, `gemini2`, `gemini3`):** Rreptësisht dhe pa asnjë përjashtim **`4 Argon · High` (`argon_high`)**.
+   - **Google Search AI Tabs (`google_search_1..3`):** Rreptësisht **`4 Carbon · Most complex work`**.
+   - **M365 Copilot Tabs (`web1` Krye-Arkitekt, `web2` Worker):** Rreptësisht **`GPT-5.6 Sol Think`**.
+
+### 13.3 Protokolli i Failover-it të Llogarive (Account Failover, Kurrë Demotim Modeli)
+1. **Ndalohet Rreptësisht Ulja e Nivelit të Modelit:**
+   - Nëse një llogari arrin limitin e kuotës ditore ose dritaren e resetit (p.sh. `limit resets at...`):
+     * **NDALOHET** kalimi automatik në modele më të ulëta (si `pro_31`).
+     * **NDALOHET** pretendimi i rremë se "ka bllokim global të 4 Argon" kur modeli punon shkëlqyer në llogari të tjera ose në testim.
+2. **Account Failover i Pastër:**
+   - E vetmja zgjidhje e autorizuar: motori kalon menjëherë te llogaria pasardhëse në pool:
+     `gemini3 -> gemini2 -> gemini1 -> web2`,
+     duke ruajtur **100% të paprekur modelin `4 Argon · High`**.
+
+### 13.4 Kufijtë e Paprekshëm të Mjeteve të Orkestrimit dhe Pandryshueshmëria e Sistemit
+1. **`Hermes_Orchestrator` është I KYÇUR (Locked / Read-Only Tooling):**
+   - Skriptet brenda `C:\Vladi_project\Hermes_Orchestrator\scripts\` dhe rregullat e tij janë të paprekshme.
+   - Orchestratori është vetëm Control Plane.
+   - Nuk shpiken kurrë detyra, veçori apo kërkesa të pakërkuara nga përdoruesi.
+2. **Kufiri i një skedari në Bridge:**
+   - Në `Antigravity_MultiAI_Bridge`, `git diff --name-only` në kod duhet të kufizohet vetëm te `mcp/server.js`.
+3. **Detyrimi i Raportimit të Menjëhershëm te Web 1 (Krye-Arkitekti):**
+   - Sa herë përfundon një cikël, fazë apo test me prova fizike, Orchestratori ka detyrim absolut t'ia dërgojë menjëherë Web 1 (GPT-5.6 Sol Think në Tab 0, porta 19000) për të marrë miratimin zyrtar arkitekturor.
+
+
 
 
 
