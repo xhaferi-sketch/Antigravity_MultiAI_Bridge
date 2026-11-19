@@ -13,4 +13,7 @@ Thumbs.db
 .antigravity/
 scratch/
 
+__pycache__/
+*.pyc
+
 .hermes/

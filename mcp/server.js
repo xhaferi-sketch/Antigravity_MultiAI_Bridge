@@ -1,4 +1,4 @@
-const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
+﻿const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
 const { CallToolRequestSchema, ListToolsRequestSchema } = require('@modelcontextprotocol/sdk/types.js');
 const { chromium } = require('playwright');
@@ -18,7 +18,50 @@ const SCORES_PATH = path.join(__dirname, 'model_scores.json');
 const NL = String.fromCharCode(10);
 const FENCE3 = String.fromCharCode(96, 96, 96);
 
+function normalizeGeneratedSourceText(value) {
+  return String(value ?? '')
+    .replace(/\u00a0/g, ' ')
+    .replace(/\r\n?/g, '\n');
+}
+
+function findUnsafeGeneratedSourceCharacters(value) {
+  const matches = [];
+  const pattern = /[\u2007\u202f\ufeff]/g;
+  let match;
+  while ((match = pattern.exec(String(value ?? ''))) !== null) {
+    matches.push({
+      index: match.index,
+      codePoint: 'U+' + match[0].codePointAt(0).toString(16).toUpperCase().padStart(4, '0')
+    });
+  }
+  return matches;
+}
+const COPILOT_REQUIRED_MODEL = Object.freeze({ family: 'gpt-5.6-sol-think', modelLabel: 'GPT-5.6 Sol Think', reasoningLabel: 'Think deeper', reasoning: 'high' });
+const COPILOT_OUTPUT_CONTRACT = ['OUTPUT CONTRACT — MANDATORY','Return ONLY the authorized target files.','FILE: relative/path.ext',FENCE3+'language','<complete file content>',FENCE3,'Rules: Opening and closing triple backticks are mandatory. No prose. No diffs.'].join(NL);
+
 const GEMINI_APP_URL = 'https://' + 'gemini.' + 'google.com' + '/app';
+const GEMINI_REQUIRED_MODEL = Object.freeze({
+  family: 'neon',
+  menuPattern: '4\\s*neon',
+  activePattern: '(?:^|\\b)neon(?:\\b|$)',
+  menuLabel: 'Deeper analysis (4 Neon)',
+  modelLabel: '4 Neon',
+  displayLabel: 'Neon',
+  reasoning: 'high',
+  reasoningSource: 'integrated-model-mode'
+});
+
+const geminiModelReceipts = {
+  gemini1: null,
+  gemini2: null,
+  gemini3: null
+};
+
+function invalidateGeminiReceipt(tabKey) {
+  if (tabKey && geminiModelReceipts.hasOwnProperty(tabKey)) {
+    geminiModelReceipts[tabKey] = null;
+  }
+}
 const M365_CHAT_URL = 'https://' + 'm365.cloud.' + 'microsoft/chat';
 const LOGIN_GOOGLE = 'accounts.' + 'google.com';
 const LOGIN_MS = 'microsoft' + 'online.com';
@@ -243,6 +286,191 @@ async function checkAuthExpired(page, tabKey) {
 
 async function ensureMaxReasoningMode(targetFrame, tabKey, opts) {
     opts=opts||{};
+  if (tabKey.startsWith('gemini')) {
+    invalidateGeminiReceipt(tabKey);
+
+    const receipt = await targetFrame.evaluate(async function(required) {
+      const sleep = function(ms) { return new Promise(function(r) { setTimeout(r, ms); }); };
+      const normalize = function(s) { return String(s || '').toLowerCase().replace(/\s+/g, ' ').trim(); };
+      const actionable = function(el) {
+        if (!el) return false;
+        const st = window.getComputedStyle(el);
+        const r = el.getBoundingClientRect();
+        return st.display !== 'none' && st.visibility !== 'hidden' && r.width > 3 && r.height > 3;
+      };
+
+      const menuRe = new RegExp(required.menuPattern, 'i');
+      const activeRe = new RegExp(required.activePattern, 'i');
+
+      const findTrigger = function() {
+        const candidates = Array.from(document.querySelectorAll('button, [role="button"], [role="combobox"]'))
+          .filter(actionable);
+        return candidates.find(function(el) {
+          const txt = normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || ''));
+          return /currently neon|open mode picker|neon|4 neon|mode picker|deeper analysis/i.test(txt);
+        }) || null;
+      };
+
+      const readTriggerState = function(trigger) {
+        const text = String(trigger ? (trigger.innerText || '') : '').trim();
+        const aria = String(trigger ? (trigger.getAttribute('aria-label') || '') : '').trim();
+        const combined = normalize(text + ' ' + aria);
+        return {
+          text: text,
+          aria: aria,
+          active: activeRe.test(combined) || /currently neon/i.test(aria)
+        };
+      };
+
+      let trigger = findTrigger();
+      if (!trigger) return { ok: false, code: 'MODEL_TRIGGER_TIMEOUT' };
+
+      let state = readTriggerState(trigger);
+      if (!state.active) {
+        trigger.click();
+        await sleep(400);
+
+        const menus = Array.from(document.querySelectorAll('[role="menu"], [role="listbox"], mat-menu-content, .cdk-overlay-pane'));
+        const options = menus.flatMap(function(m) {
+          return Array.from(m.querySelectorAll('[role="menuitemradio"], [role="menuitem"], [role="option"]'));
+        }).filter(actionable);
+
+        const neonOption = options.find(function(el) {
+          const txt = normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || ''));
+          return menuRe.test(txt);
+        });
+
+        if (!neonOption) {
+          document.querySelectorAll('.cdk-overlay-backdrop').forEach(function(b) { b.click(); });
+          return { ok: false, code: 'MODEL_OPTION_NOT_FOUND' };
+        }
+
+        neonOption.click();
+        await sleep(600);
+        document.querySelectorAll('.cdk-overlay-backdrop').forEach(function(b) { b.click(); });
+        await sleep(300);
+
+        trigger = findTrigger();
+        if (!trigger) return { ok: false, code: 'MODEL_SELECTION_UNVERIFIED' };
+        state = readTriggerState(trigger);
+        if (!state.active) return { ok: false, code: 'MODEL_SELECTION_UNVERIFIED' };
+      }
+
+      let stablePolls = 0;
+      for (let i = 0; i < 2; i++) {
+        trigger = findTrigger();
+        if (!trigger) return { ok: false, code: 'MODEL_STABILITY_FAILED' };
+        state = readTriggerState(trigger);
+        if (!state.active) return { ok: false, code: 'MODEL_STABILITY_FAILED' };
+        stablePolls++;
+        if (i < 1) await sleep(500);
+      }
+
+      return {
+        ok: true,
+        verified: true,
+        family: required.family,
+        modelLabel: required.modelLabel,
+        displayLabel: required.displayLabel,
+        reasoning: required.reasoning,
+        reasoningSource: required.reasoningSource,
+        stablePolls: stablePolls,
+        thinkingSelectorRequired: false
+      };
+    }, {
+      family: GEMINI_REQUIRED_MODEL.family,
+      menuPattern: GEMINI_REQUIRED_MODEL.menuPattern,
+      activePattern: GEMINI_REQUIRED_MODEL.activePattern,
+      modelLabel: GEMINI_REQUIRED_MODEL.modelLabel,
+      displayLabel: GEMINI_REQUIRED_MODEL.displayLabel,
+      reasoning: GEMINI_REQUIRED_MODEL.reasoning,
+      reasoningSource: GEMINI_REQUIRED_MODEL.reasoningSource
+    });
+
+    if (!receipt || !receipt.ok) {
+      throw new Error(receipt && receipt.code ? receipt.code : 'MODEL_SELECTION_UNVERIFIED');
+    }
+
+    geminiModelReceipts[tabKey] = {
+      verified: true,
+      family: GEMINI_REQUIRED_MODEL.family,
+      modelLabel: GEMINI_REQUIRED_MODEL.modelLabel,
+      displayLabel: GEMINI_REQUIRED_MODEL.displayLabel,
+      reasoning: GEMINI_REQUIRED_MODEL.reasoning,
+      reasoningSource: GEMINI_REQUIRED_MODEL.reasoningSource,
+      stablePolls: 2,
+      thinkingSelectorRequired: false
+    };
+
+    tabActiveModel[tabKey] = GEMINI_REQUIRED_MODEL.modelLabel;
+    tabDiscoveredModels[tabKey] = GEMINI_REQUIRED_MODEL.menuLabel;
+
+    console.error('[MODEL_STATE_OBSERVED] tabKey=' + tabKey + ' model=' + GEMINI_REQUIRED_MODEL.modelLabel + ' reasoning=' + GEMINI_REQUIRED_MODEL.reasoning);
+    console.error('[MODEL_STATE_VERIFIED] tabKey=' + tabKey + ' receipt=' + JSON.stringify(geminiModelReceipts[tabKey]));
+    return GEMINI_REQUIRED_MODEL.modelLabel;
+  }
+  if (tabKey === 'web1' || tabKey === 'web2') {
+    const required = COPILOT_REQUIRED_MODEL;
+    const result = await targetFrame.evaluate(async function(contract) {
+      const visible = function(el) { if (!el) return false; const s = getComputedStyle(el), r = el.getBoundingClientRect(); return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 4 && r.height > 4; };
+      const text = function(el) { return ((el && el.innerText) || '') + ' ' + ((el && el.getAttribute('aria-label')) || ''); };
+      const selectors = 'button[aria-label*="model" i],button[aria-label*="mode" i],[data-testid*="model-switcher" i],[data-testid*="mode-selector" i],.fui-Dropdown';
+      let button = Array.from(document.querySelectorAll(selectors)).find(visible) || null;
+      if (!button) return { ok: false, reason: 'COPILOT_MODEL_SELECTOR_NOT_FOUND', active: '' };
+      const exact = function(value) { return String(value || '').toLowerCase().includes(contract.modelLabel.toLowerCase()); };
+      const requiredModelVisible = function(value) {
+        const normalized = String(value || '').toLowerCase();
+        return normalized.includes('gpt-5.6') && normalized.includes('sol think');
+      };
+      if (!requiredModelVisible(text(button))) {
+        button.click();
+        const subSelector = '[data-testid*="gptSubMenuModelTrigger-OpenAI"],[data-testid*="OpenAI"],[role="menuitem"][aria-haspopup="menu"],[role="menuitem"][aria-haspopup="true"],[role="menuitem"]';
+        let subTriggers = [];
+        for (let poll = 0; poll < 6; poll++) {
+          await new Promise(function(resolve) { setTimeout(resolve, 250); });
+          subTriggers = Array.from(document.querySelectorAll(subSelector)).filter(function(el) {
+            if (!visible(el) || el.getAttribute('role') === 'menuitemradio') return false;
+            const testId = String(el.getAttribute('data-testid') || '');
+            const t = text(el).toLowerCase(); return !/-Magic|-Chat|-Reasoning/i.test(testId) && (/OpenAI/i.test(testId) || /openai/i.test(t) || (/\bgpt\b/i.test(t) && !/gpt-5/i.test(t)) || el.getAttribute('aria-haspopup') === 'menu' || el.getAttribute('aria-haspopup') === 'true');
+          });
+          if (subTriggers.length > 0) break;
+        }
+        const openAiTrigger = subTriggers.find(function(el) { return /openai/i.test(String(el.getAttribute('data-testid') || '') + ' ' + text(el)); }) || subTriggers[0] || null;
+        if (!openAiTrigger) return { ok: false, reason: 'COPILOT_OPENAI_SUBMENU_NOT_FOUND', active: text(button).trim() };
+        openAiTrigger.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
+        openAiTrigger.dispatchEvent(new PointerEvent('pointerover', { bubbles: true }));
+        openAiTrigger.click();
+        await new Promise(function(resolve) { setTimeout(resolve, 400); });
+        const options = Array.from(document.querySelectorAll('[role="option"],[role="menuitemradio"],[role="menuitem"],button')).filter(visible);
+        const model = options.find(function(el) {
+          const value = text(el).toLowerCase();
+          return (value.includes('gpt-5.6') && (value.includes('sol think') || value.includes('think deeper'))) || value.includes(contract.modelLabel.toLowerCase()) || value.includes('5.6 sol think') || value.includes('sol think');
+        });
+        if (!model) return { ok: false, reason: 'COPILOT_REQUIRED_MODEL_UNAVAILABLE', active: text(button).trim() };
+        model.click();
+        await new Promise(function(resolve) { setTimeout(resolve, 500); });
+        button = Array.from(document.querySelectorAll(selectors)).find(visible) || button;
+      }
+      if (!requiredModelVisible(text(button))) return { ok: false, reason: 'COPILOT_REQUIRED_MODEL_NOT_ACTIVE', active: text(button).trim() };
+      const reasoningControls = Array.from(document.querySelectorAll('button,[role="option"],[role="menuitemradio"],[role="menuitem"]')).filter(visible);
+      let reasoning = reasoningControls.find(function(el) { return String(text(el)).toLowerCase().includes(contract.reasoningLabel.toLowerCase()); });
+      if (!reasoning) {
+        const opener = reasoningControls.find(function(el) { return /reason|think/i.test(text(el)); });
+        if (opener) { opener.click(); await new Promise(function(resolve) { setTimeout(resolve, 250); }); reasoning = Array.from(document.querySelectorAll('[role="option"],[role="menuitemradio"],[role="menuitem"],button')).filter(visible).find(function(el) { return String(text(el)).toLowerCase().includes(contract.reasoningLabel.toLowerCase()); }); }
+      }
+      if (!reasoning) {
+        if (requiredModelVisible(text(button))) {
+          return { ok: true, active: contract.modelLabel + ' · ' + contract.reasoningLabel };
+        }
+        return { ok: false, reason: 'COPILOT_REASONING_MODE_UNAVAILABLE', active: text(button).trim() };
+      }
+      if (reasoning.getAttribute('aria-checked') !== 'true' && !/selected|active/i.test(reasoning.className || '')) { reasoning.click(); await new Promise(function(resolve) { setTimeout(resolve, 250); }); }
+      return { ok: true, active: contract.modelLabel + ' · ' + contract.reasoningLabel };
+    }, required);
+    if (!result.ok) throw new Error(result.reason + ': active=' + result.active);
+    tabActiveModel[tabKey] = result.active;
+    return result.active;
+  }
   if (!tabKey.startsWith('gemini')) {
   const result = await targetFrame.evaluate(async function(arg) {
     const isGemini = arg.isGemini;
@@ -286,19 +514,23 @@ async function ensureMaxReasoningMode(targetFrame, tabKey, opts) {
     const curCombined = ((btn.innerText || '') + ' ' + (btn.getAttribute('aria-label') || '')).trim();
     const curDisplay = (btn.innerText || btn.getAttribute('aria-label') || 'Active').split('\n')[0].trim();
 
-    // Universal Semantic Capability Scorer (Sipas CopilotTransport.cs - Baseline: Code & analysis / 4 Argon e lart)
+    // Universal Semantic Capability Scorer (Sipas CopilotTransport.cs - Baseline: 4 Neon / Deeper analysis e lart)
     const scoreModel = function(title, fullText, isDisabled) {
       if (isDisabled) return -10000;
       const combined = ((title || '') + ' ' + (fullText || '')).toLowerCase();
       let s = 100;
 
-      // Bonus maksimal (+1000) për Argon High / Thinking / Think Deeper / In-depth reasoning
+      // Bonus maksimal (+1200) për 4 Neon High / Neon
+      if (combined.includes('neon') || combined.includes('4 neon high')) {
+        s += 1200;
+      } else
+      // Bonus maksimal (+1000) për 4 Neon / Deeper analysis
       if (combined.includes('high') || combined.includes('think deeper') || combined.includes('thinking') ||
           combined.includes('deeper') || combined.includes('in-depth') || combined.includes('deep') ||
           combined.includes('reason') || combined.includes('thellë')) {
         s += 1000;
       }
-      // Kategoria ELITE (+800): "Code & analysis", "4 Argon", "Argon"
+      // Kategoria ELITE (+800): "4 Neon", "Neon", "Deeper analysis"
       else if (combined.includes('code & analysis') || combined.includes('code and analysis') ||
           combined.includes('argon') || combined.includes('4 argon')) {
         s += 800;
@@ -325,7 +557,7 @@ async function ensureMaxReasoningMode(targetFrame, tabKey, opts) {
     if (!isGemini && scoreModel(curDisplay, curCombined, false) >= 800) {
       return { status: 'SUCCESS_ALREADY_ACTIVE', activeModel: curDisplay, summary: curDisplay + ' (Aktiv)' };
     }
-    // Për Gemini: mos prano kurrë "ALREADY_ACTIVE" nëse etiketa thjesht shkruan "Argon" pa vërtetuar "High" / "Thinking"
+    // Për Gemini: mos prano kurrë "ALREADY_ACTIVE" nëse nuk vërtetohet "Neon"
     if (isGemini) {
       const curLow = curCombined.toLowerCase();
       const isExplicitHigh = (curLow.includes('high') || curLow.includes('deeper') || curLow.includes('thinking')) && !curLow.includes('low') && !curLow.includes('fast');
@@ -461,7 +693,7 @@ async function ensureMaxReasoningMode(targetFrame, tabKey, opts) {
   });
 
   if (result.status === 'DISQUALIFIED_BELOW_BASELINE') {
-    throw new Error('CRITICAL_MODEL_LOCK_REJECTED ne [' + tabKey + ']: Modeli me i mire i gjetur [' + (result.bestCandidate || '') + '] nuk arrin nivelin baze "Code & analysis" / "4 Argon" (Score < 800). Opsionet ne ekran: [' + result.summary + ']. Ndalohet kategorikisht vazhdimi me modele te uleta!');
+    throw new Error('CRITICAL_MODEL_LOCK_REJECTED ne [' + tabKey + ']: Modeli me i mire i gjetur [' + (result.bestCandidate || '') + '] nuk arrin nivelin baze "4 Neon" (Score < 800). Opsionet ne ekran: [' + result.summary + ']. Ndalohet kategorikisht vazhdimi me modele te uleta!');
   }
 
   if (result.status === 'NO_OPTIONS_DISCOVERED' || result.status === 'NO_BUTTON_FOUND') {
@@ -524,7 +756,7 @@ async function ensureMaxReasoningMode(targetFrame, tabKey, opts) {
       };
       const mainMenuRoots = function() {
         return roots().filter(function(root) {
-          return /argon|code and analysis|quick answers|everyday help/.test(normalize(root.innerText || root.textContent || ''));
+          return /argon|4 neon high|neon|code and analysis|quick answers|everyday help|deeper analysis/.test(normalize(root.innerText || root.textContent || ''));
         });
       };
       const close = function() {
@@ -574,14 +806,14 @@ async function ensureMaxReasoningMode(targetFrame, tabKey, opts) {
         const candidates = Array.from(document.querySelectorAll('button[data-test-id*="model"], bard-mode-switcher button, button[aria-haspopup="menu"], button[aria-haspopup="true"], button[aria-label*="model" i], button[aria-label*="thinking" i], button[aria-label*="mode" i], .input-area-switch button, button:has(.model-title)')).filter(function(el) {
           if (!actionable(el) || el.closest('[role="menu"], [role="listbox"], .cdk-overlay-pane')) return false;
           const text = normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || ''));
-          return /argon|code and analysis|model|mode|thinking/.test(text);
+          return /argon|neon|4 neon high|code and analysis|model|mode|thinking|deeper analysis|everyday help/.test(text);
         });
         const ranked = candidates.map(function(el) {
           const a = el.getBoundingClientRect();
           const b = composer.getBoundingClientRect();
           const distance = Math.hypot((a.left + a.width / 2) - (b.left + b.width / 2), (a.top + a.height / 2) - (b.top + b.height / 2));
           const text = normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || ''));
-          const semantics = /argon|code and analysis/.test(text) ? 2 : 1;
+          const semantics = /4\s*neon\s*high|(^|\s)neon(\s|$)/.test(text) ? 3 : /argon|code and analysis/.test(text) ? 2 : 1;
           return { el: el, score: semantics * 100000 - distance, text: text };
         }).sort(function(a, b) { return b.score - a.score; });
         if (ranked.length > 1 && Math.abs(ranked[0].score - ranked[1].score) < 1) return { ambiguous: true };
@@ -596,7 +828,7 @@ async function ensureMaxReasoningMode(targetFrame, tabKey, opts) {
       if (!menuRoots) return fail('MODEL_MENU_TIMEOUT', 'OPEN_MENU', triggerResult.text);
       const options = function() { return menuRoots.flatMap(function(root) { return Array.from(root.querySelectorAll('[role="menuitemradio"], [role="menuitemcheckbox"], [role="option"], [role="menuitem"], .mat-mdc-menu-item')); }).filter(actionable); };
       const requestedTier=arg.modelTier||'argon_high';
-      if(requestedTier!=='argon_high'&&requestedTier!=='pro_31')return fail('GEMINI_MODEL_TIER_BELOW_FLOOR','ENSURE_MODEL',String(requestedTier));
+      if(requestedTier!=='neon'&&requestedTier!=='argon_high'&&requestedTier!=='pro_31')return fail('GEMINI_MODEL_TIER_BELOW_FLOOR','ENSURE_MODEL',String(requestedTier));
       if(requestedTier==='pro_31'){
         const tierPattern=/3\.1 pro|detailed research/i;
         let tierOption=options().find(function(el){return tierPattern.test(normalize((el.innerText||'')+' '+(el.getAttribute('aria-label')||'')));});
@@ -613,22 +845,43 @@ async function ensureMaxReasoningMode(targetFrame, tabKey, opts) {
         const summary='3.1 Pro · Detailed research';
         return {ok:true,status:'GEMINI_MODEL_TIER_VERIFIED',model:{label:summary,selected:true},reasoning:{label:'n/a',selected:true,lowSelected:false},summary:summary};
       }
-      let argon = options().find(function(el) { const t = normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || '')); return /(^|\s)(4 )?argon(\s|$)|code and analysis/.test(t); });
-      if (!argon) return { ok: false, code: 'MODEL_OPTION_NOT_FOUND', phase: 'ENSURE_MODEL', observation: menuRoots.map(function(r) { return normalize(r.innerText).slice(0, 200); }).join(' | ') };
-      if (!selected(argon)) {
-        click(argon);
+      let neonHigh = options().find(function(el) {
+        const t = normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || ''));
+        return /4\s*neon\s*high/.test(t);
+      });
+      if (!neonHigh) {
+        return {
+          ok: false,
+          code: 'MODEL_OPTION_NOT_FOUND',
+          phase: 'ENSURE_MODEL',
+          observation: 'required_model=4 Neon high ; visible=' + menuRoots.map(function(r){ return normalize(r.innerText).slice(0,200); }).join(' | ')
+        };
+      }
+      if (!selected(neonHigh)) {
+        click(neonHigh);
         await sleep(350);
         triggerResult.el = null;
         trigger = (await wait(function() { const r = findTrigger(); return r && !r.ambiguous ? r.el : null; }, 5000));
-        if (!trigger) return fail('MODEL_SELECTION_UNVERIFIED', 'ENSURE_MODEL', 'trigger_lost_after_argon');
+        if (!trigger) return fail('MODEL_SELECTION_UNVERIFIED', 'ENSURE_MODEL', 'trigger_lost_after_model_selection');
         click(trigger);
         menuRoots = await wait(function() { const r = mainMenuRoots(); return r.length ? r : null; }, 5000);
         if (!menuRoots) return fail('MODEL_MENU_TIMEOUT', 'ENSURE_MODEL', 'menu_not_reopened');
-        argon = options().find(function(el) { const t = normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || '')); return /(^|\s)(4 )?argon(\s|$)|code and analysis/.test(t); });
-        if (!argon || !selected(argon)) return fail('MODEL_SELECTION_UNVERIFIED', 'ENSURE_MODEL', argon ? normalize(argon.innerText) : 'argon_missing_after_rerender');
+        neonHigh = options().find(function(el) {
+          const t = normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || ''));
+          return /4\s*neon\s*high/.test(t);
+        });
+        if (!neonHigh || !selected(neonHigh)) {
+          return fail('MODEL_SELECTION_UNVERIFIED', 'ENSURE_MODEL', '4_neon_high_missing_after_rerender');
+        }
       }
-      let thinking = options().find(function(el) { return ['menu', 'true', 'listbox'].includes(el.getAttribute('aria-haspopup')) && /thinking level|reasoning level|thinking/.test(normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || ''))); });
-      if (!thinking) return { ok: false, code: 'GEMINI_THINKING_TRIGGER_NOT_FOUND', phase: 'ENSURE_REASONING', observation: normalize(menuRoots.map(function(r) { return r.innerText; }).join(' | ')).slice(0, 300) };
+      let thinking = options().find(function(el) {
+        return ['menu', 'true', 'listbox'].includes(el.getAttribute('aria-haspopup')) &&
+          /thinking level|reasoning level|thinking/.test(normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || '')));
+      });
+      if (!thinking) {
+        close();
+        return fail('GEMINI_THINKING_TRIGGER_NOT_FOUND', 'ENSURE_REASONING', 'reasoning_selector_missing');
+      }
       click(thinking);
       const submenu = await wait(function() {
         return roots().find(function(root) { const t = normalize(root.innerText); return /(^|\s)low(\s|$)/.test(t) && /(^|\s)high(\s|$)|extra thorough/.test(t); }) || null;
@@ -643,10 +896,13 @@ async function ensureMaxReasoningMode(targetFrame, tabKey, opts) {
       click(trigger);
       menuRoots = await wait(function() { const r = mainMenuRoots(); return r.length ? r : null; }, 5000);
       if (!menuRoots) return fail('MODEL_MENU_TIMEOUT', 'VERIFY', 'verification_menu_missing');
-      argon = options().find(function(el) { const t = normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || '')); return /(^|\s)(4 )?argon(\s|$)|code and analysis/.test(t); });
+      neonHigh = options().find(function(el) {
+        const t = normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || ''));
+        return /4\s*neon\s*high/.test(t);
+      });
       thinking = options().find(function(el) { return ['menu', 'true', 'listbox'].includes(el.getAttribute('aria-haspopup')) && /thinking level|reasoning level|thinking/.test(normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || ''))); });
-      if (!argon) return fail('MODEL_SELECTION_UNVERIFIED', 'VERIFY', 'argon_missing_in:' + normalize(menuRoots.map(function(root) { return root.innerText || root.textContent || ''; }).join(' | ')).slice(0, 400));
-      if (!selected(argon)) return fail('MODEL_SELECTION_UNVERIFIED', 'VERIFY', 'argon_not_selected');
+      if (!neonHigh) return fail('MODEL_SELECTION_UNVERIFIED', 'VERIFY', '4_neon_high_missing');
+      if (!selected(neonHigh)) return fail('MODEL_SELECTION_UNVERIFIED', 'VERIFY', '4_neon_high_not_selected');
       if (!thinking) return fail('GEMINI_THINKING_TRIGGER_NOT_FOUND', 'VERIFY', 'thinking_missing');
       click(thinking);
       const verifySubmenu = await wait(function() { return roots().find(function(root) { return /(^|\s)low(\s|$)/.test(normalize(root.innerText)) && /(^|\s)high(\s|$)|extra thorough/.test(normalize(root.innerText)); }) || null; }, 5000);
@@ -658,14 +914,53 @@ async function ensureMaxReasoningMode(targetFrame, tabKey, opts) {
       const lowSelected = Boolean(low && selected(low));
       close();
       if (!highSelected||lowSelected) return fail('GEMINI_HIGH_UNVERIFIED', 'VERIFY', 'high=' + highSelected + ',low=' + lowSelected);
-      return { ok: true, status: 'GEMINI_MAX_REASONING_VERIFIED', model: { label: (argon.innerText || '4 Argon').split('\n')[0].trim(), selected: true }, reasoning: { label: (high.innerText || 'High').split('\n')[0].trim(), selected: true, lowSelected: false }, summary: '4 Argon · High (Extra thorough)' };
-    },{reasoningLevel:'high',modelTier:opts.modelTier||'argon_high'}).catch(function(err) { return {ok:false,code:'MODEL_SELECTION_UNVERIFIED',phase:'EVALUATE',observation:err.message}; });
+      const observedModel = (neonHigh.innerText || GEMINI_REQUIRED_MODEL.label).split('\n')[0].trim();
+      if (normalize(observedModel) !== normalize(GEMINI_REQUIRED_MODEL.label)) {
+        return fail('MODEL_SELECTION_UNVERIFIED', 'VERIFY', observedModel);
+      }
+      return {
+        ok: true,
+        status: 'GEMINI_MAX_REASONING_VERIFIED',
+        model: {
+          label: GEMINI_REQUIRED_MODEL.label,
+          selected: true
+        },
+        reasoning: {
+          label: GEMINI_REQUIRED_MODEL.reasoning,
+          selected: true,
+          lowSelected: false
+        },
+        summary: '4 Neon high'
+      };
+    },{reasoningLevel:'high',modelTier:opts.modelTier||'neon'}).catch(function(err) { return {ok:false,code:'MODEL_SELECTION_UNVERIFIED',phase:'EVALUATE',observation:err.message}; });
     if (result.ok) {
-      tabActiveModel[tabKey] = result.summary;
-      tabDiscoveredModels[tabKey] = result.model.label + ', ' + result.reasoning.label;
+      let stablePolls = 0;
+      while (stablePolls < 2) {
+        const poll = await targetFrame.evaluate(function() {
+          const text = String(document.body.innerText || '');
+          return /4\s*neon\s*high/i.test(text);
+        }).catch(function(){ return false; });
+        if (!poll) {
+          throw new Error('GEMINI_MODEL_STABILITY_FAILED');
+        }
+        stablePolls++;
+        if (stablePolls < 2) {
+          await new Promise(function(resolve){ setTimeout(resolve, 500); });
+        }
+      }
+      geminiModelReceipts[tabKey] = {
+        verified: true,
+        family: GEMINI_REQUIRED_MODEL.family,
+        modelLabel: GEMINI_REQUIRED_MODEL.label,
+        displayLabel: GEMINI_REQUIRED_MODEL.display,
+        reasoning: GEMINI_REQUIRED_MODEL.reasoning,
+        stablePolls: 2
+      };
+      tabActiveModel[tabKey] = GEMINI_REQUIRED_MODEL.label;
+      tabDiscoveredModels[tabKey] = GEMINI_REQUIRED_MODEL.label;
       console.error('[MODEL_STATE_OBSERVED] model=' + result.model.label + ' reasoning=' + result.reasoning.label + ' evidence=selected:true,lowSelected:false');
-      console.error('[MODEL_STATE_VERIFIED] tabKey=' + tabKey + ' attempts=' + attempt + ' summary=' + result.summary);
-      return result.summary;
+      console.error('[MODEL_STATE_VERIFIED] tabKey=' + tabKey + ' receipt=' + JSON.stringify(geminiModelReceipts[tabKey]));
+      return GEMINI_REQUIRED_MODEL.label;
     }
     lastObservation = result;
     console.error('[MODEL_STATE_FAILED] tabKey=' + tabKey + ' code=' + result.code + ' attempt=' + attempt + ' lastObservation=' + JSON.stringify({ phase: result.phase, observation: result.observation }));
@@ -718,6 +1013,9 @@ async function probeChatCleanState(targetFrame,tabKey,oldConversationId){
   state.url=url;state.route=normalizeChatRoute(url);state.conversationId=conversationIdFromUrl(url);const adapter=getEngineAdapter(tabKey);state.clean=Boolean(adapter.routeIsClean(state)&&state.composer.ready&&state.composer.empty&&state.attachmentChips===0&&!state.generating&&!state.oldPresent);return state;
 }
 async function resetChatVerified(args){
+  if (args && args.tabKey && String(args.tabKey).startsWith('gemini')) {
+    invalidateGeminiReceipt(args.tabKey);
+  }
   let page=args.page,targetFrame=args.targetFrame||findChatFrameOrPage(page);const tabKey=args.tabKey,projectRoot=args.projectRoot,timeoutMs=args.timeoutMs||30000,started=Date.now(),adapter=getEngineAdapter(tabKey),oldRoute=normalizeChatRoute(page.url()),oldConversationId=conversationIdFromUrl(page.url());
   if(args.forceReload===true){let state=null,stable=0;try{await page.goto(adapter.canonicalUrl,{waitUntil:'domcontentloaded',timeout:Math.min(timeoutMs,45000)});targetFrame=findChatFrameOrPage(page);if(await checkAuthExpired(page,tabKey))throw new Error('AUTH_EXPIRED');const deadline=Date.now()+Math.min(timeoutMs,30000);while(Date.now()<deadline&&stable<2){state=await probeChatCleanState(targetFrame,tabKey,oldConversationId);stable=state.clean?stable+1:0;if(stable<2)await page.waitForTimeout(250);}if(stable<2)throw new Error('clean_state_unverified');activeProjectPerTab[tabKey]=projectRoot;return {status:'CHAT_RESET_VERIFIED',method:'FORCED_NAV',oldRoute:oldRoute,newRoute:state.route,oldConversationId:oldConversationId,newConversationId:state.conversationId,users:0,assistants:0,composerEmpty:true,attachmentChips:0,stablePolls:2,documentChanged:true,elapsedMs:Date.now()-started};}catch(err){throw new Error('FORCED_CHAT_RESET_VERIFICATION_FAILED: '+err.message);}}
   console.error('[CHAT_RESET_STARTED] tabKey='+tabKey+' reason='+(args.reason||'requested'));
@@ -996,11 +1294,118 @@ async function attachFilesSafely(page, targetFrame, tabKey, projectRoot, validFi
   return receipt;
 }
 async function extractWebAssistantContent(targetFrame,isGemini){
-  return targetFrame.evaluate(function(arg){
-    const uniqueTurnNodes=function(selector){const nodes=Array.from(document.querySelectorAll(selector));return nodes.filter(function(node){return !nodes.some(function(other){return other!==node&&other.contains(node);});});};let containers=arg.gem?Array.from(document.querySelectorAll('response-container')):uniqueTurnNodes('[data-testid="chat-turn-assistant"],[data-testid="ai-message"],[data-message-author-role="assistant"],[data-content="ai-message"],.assistant-message,[data-testid="chatOutput"],[data-testid="copilot-message-div"],.fai-CopilotMessage,[data-testid="chat-response-message"]');if(arg.gem&&containers.length===0)containers=Array.from(document.querySelectorAll('model-response,message-content,[data-message-author-role="model"]'));const liveNode=containers[containers.length-1];if(!liveNode)return {text:'',metadata:{liveNodeTag:'',contentNodeTag:'',contentCharsBeforeClean:0,thoughtNodesRemoved:0,contentCharsAfterClean:0,codeBlockCount:0,hasMessageContent:false}};
-    const nested=arg.gem?liveNode.querySelector('message-content,.markdown-main-panel,.md-content'):null,contentNode=arg.gem?(nested||liveNode):liveNode,hasMessageContent=Boolean(nested),before=(contentNode.textContent||'').length,clone=contentNode.cloneNode(true),thoughtNodes=Array.from(clone.querySelectorAll('model-thoughts,.thoughts-container,.thought-container,[data-test-id*="thought" i],[data-testid*="thought" i],ms-thought-chunk'));thoughtNodes.forEach(function(el){el.remove();});let codeBlockCount=0;
-    clone.querySelectorAll('pre').forEach(function(pre){codeBlockCount++;const code=pre.querySelector('code'),cls=((code&&code.className)||'')+' '+(pre.className||''),m=cls.match(/language-([a-zA-Z0-9_+-]+)/);let lang=m?m[1]:'';if(!lang){const w=pre.closest('code-block,.code-block,.code-container'),h=w&&w.querySelector('.code-header span,.code-block-decoration span,.code-block-internal-header span'),c=h&&h.textContent?h.textContent.trim().toLowerCase():'';if(/^[a-z0-9_+-]{1,20}$/.test(c))lang=c;}const raw=(code?code.textContent:pre.textContent)||'';pre.replaceWith(document.createTextNode('\n\n'+arg.fence+lang+'\n'+raw.replace(/\n+$/,'')+'\n'+arg.fence+'\n\n'));});
-    clone.querySelectorAll('button,svg,mat-icon,.code-header,.code-block-decoration,.code-block-internal-header').forEach(function(el){el.remove();});clone.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function(h){h.prepend(document.createTextNode('\n\n'+'#'.repeat(Number(h.tagName.slice(1)))+' '));h.append(document.createTextNode('\n\n'));});clone.querySelectorAll('p,div,li,tr').forEach(function(el){el.append(document.createTextNode('\n'));});clone.querySelectorAll('br').forEach(function(el){el.replaceWith(document.createTextNode('\n'));});let text=(clone.textContent||'').replace(/\r\n/g,'\n').replace(/\n{3,}/g,'\n\n').replace(/^\s*Gemini said\s*\n+/i,'').trim();const meta={liveNodeTag:liveNode.tagName.toLowerCase(),contentNodeTag:contentNode.tagName.toLowerCase(),contentCharsBeforeClean:before,thoughtNodesRemoved:thoughtNodes.length,contentCharsAfterClean:text.length,codeBlockCount:codeBlockCount,hasMessageContent:hasMessageContent};if(before>0&&text.length===0&&(hasMessageContent||thoughtNodes.length===0))return {error:'GEMINI_EXTRACTION_OVERPRUNED',text:'',metadata:meta};return {text:text,metadata:meta};
+  return targetFrame.evaluate(async function(arg){
+    function selectSafeMarkdownFence(code, minLen) {
+      const src = String(code || '');
+      let len = Math.max(3, Number(minLen || 3));
+      while (src.includes('`'.repeat(len))) {
+        len++;
+      }
+      return '`'.repeat(len);
+    }
+    function collectCanonicalEditorRoots(container) {
+      const editorSelector = '[data-virtualized-code-find-root], [aria-label="Code editor"], .monaco-editor';
+      const candidates = Array.from(container.querySelectorAll(editorSelector));
+      const strongRoots = candidates.filter(function(node) {
+        return node.hasAttribute('data-virtualized-code-find-root');
+      });
+      const source = strongRoots.length > 0 ? strongRoots : candidates;
+      return source.filter(function(candidate) {
+        return !source.some(function(other) {
+          return other !== candidate && other.contains(candidate);
+        });
+      });
+    }
+    let containers=arg.gem?Array.from(document.querySelectorAll('response-container')):Array.from(document.querySelectorAll('[data-testid="copilot-message-div"],[data-message-author-role="assistant"],[data-testid="chat-turn-assistant"],[data-testid="ai-message"],[data-content="ai-message"],.assistant-message,.fai-CopilotMessage'));if(arg.gem&&containers.length===0)containers=Array.from(document.querySelectorAll('model-response,message-content,[data-message-author-role="model"]'));const liveNode=containers[containers.length-1];if(!liveNode)return {text:'',metadata:{liveNodeTag:'',contentNodeTag:'',contentCharsBeforeClean:0,thoughtNodesRemoved:0,contentCharsAfterClean:0,codeBlockCount:0,hasMessageContent:false}};
+    const nested=arg.gem?liveNode.querySelector('message-content,.markdown-main-panel,.md-content'):(Array.from(liveNode.querySelectorAll('[data-testid="markdown-reply"]')).find(function(el){return (el.textContent||'').trim().length>0;})||null),contentNode=nested||liveNode,hasMessageContent=Boolean(nested),before=(contentNode.textContent||'').length,clone=contentNode.cloneNode(true),codeExtractionReceipts=[],virtualizedErrors=[],thoughtNodes=Array.from(clone.querySelectorAll('model-thoughts,.thoughts-container,.thought-container,[data-test-id*="thought" i],[data-testid*="thought" i],ms-thought-chunk'));thoughtNodes.forEach(function(el){el.remove();});let codeBlockCount=0,virtualizedEditorsFound=0,virtualizedBlocksExtracted=0;
+    clone.querySelectorAll('pre').forEach(function(pre){codeBlockCount++;const code=pre.querySelector('code'),cls=((code&&code.className)||'')+' '+(pre.className||''),m=cls.match(/language-([a-zA-Z0-9_+-]+)/);let lang=(m&&m[1])?m[1]:'';if(!lang){const w=pre.closest('code-block,.code-block,.code-container'),h=w&&w.querySelector('.code-header span,.code-block-decoration span,.code-block-internal-header span'),c=h&&h.textContent?h.textContent.trim().toLowerCase():'';if(/^[a-z0-9_+-]{1,20}$/.test(c))lang=c;}const raw=(code?code.textContent:pre.textContent)||'';const fence=selectSafeMarkdownFence(raw,3);pre.replaceWith(document.createTextNode('\n\n'+fence+lang+'\n'+raw.replace(/\n+$/,'')+'\n'+fence+'\n\n'));codeExtractionReceipts.push({sourceKind:'PRE_CODE',language:lang,lineCount:raw.split('\n').length,completenessVerified:true});});
+    const liveEditorRoots=collectCanonicalEditorRoots(contentNode);
+    const editorRoots=collectCanonicalEditorRoots(clone);
+    virtualizedEditorsFound=editorRoots.length;
+    for(let i=0;i<editorRoots.length;i++){
+      const root=editorRoots[i];
+      const liveRoot=liveEditorRoots[i];
+      let rawCode='',sourceKind='',complete=false;
+
+      // Tier 1: Copilot React Fiber dataModel (100% full, authoritative, unvirtualized code)
+      if(liveRoot){
+        try{
+          const key=Object.keys(liveRoot).find(function(k){return k.startsWith('__reactFiber')||k.startsWith('__reactInternalInstance');});
+          let fiber=key?liveRoot[key]:null;
+          let dm=null;
+          for(let f=0;f<20&&fiber;f++){
+            const candidate=(fiber.memoizedProps&&fiber.memoizedProps.value&&fiber.memoizedProps.value.dataModel)||(fiber.memoizedProps&&fiber.memoizedProps.dataModel);
+            if(candidate&&typeof candidate.getCode==='function'){dm=candidate;break;}
+            fiber=fiber.return;
+          }
+          if(dm){
+            const resolved=await dm.getCode();
+            if(typeof resolved==='string'&&resolved.length>0){
+              rawCode=resolved;
+              sourceKind='COPILOT_DATAMODEL_CODE';
+              complete=true;
+            }
+          }
+        }catch(_){}
+      }
+
+      // Tier 2: Textarea value (Monaco full value)
+      if(!complete){
+        const textarea=root.querySelector('textarea[aria-label], textarea.inputarea');
+        if(textarea&&typeof textarea.value==='string'&&textarea.value.length>0){
+          rawCode=textarea.value;
+          sourceKind='MONACO_FULL_VALUE';
+          complete=true;
+        }
+      }
+
+      // Tier 3: Indexed rows with contiguity check
+      if(!complete){
+        const indexedLines=Array.from(root.querySelectorAll('[data-line-index]')).map(function(el){
+          return {el:el,index:parseInt(el.getAttribute('data-line-index'),10)};
+        });
+        const rowCountAttr=root.getAttribute('aria-rowcount')||(root.querySelector('[aria-rowcount]')&&root.querySelector('[aria-rowcount]').getAttribute('aria-rowcount'));
+        const totalRows=Number(rowCountAttr);
+        const hasExplicitRowCount=Number.isInteger(totalRows)&&totalRows>0;
+        if(indexedLines.length>0&&!indexedLines.some(function(item){return !Number.isInteger(item.index)||item.index<0;})){
+          indexedLines.sort(function(a,b){return a.index-b.index;});
+          const expectedCount=hasExplicitRowCount?totalRows:indexedLines.length;
+          if(indexedLines.length===expectedCount&&indexedLines[0].index===0&&indexedLines[indexedLines.length-1].index===expectedCount-1){
+            complete=true;
+            const seen=new Set();
+            for(let j=0;complete&&j<indexedLines.length;j++){
+              if(seen.has(indexedLines[j].index)||indexedLines[j].index!==j){complete=false;break;}
+              seen.add(indexedLines[j].index);
+            }
+            if(complete){
+              rawCode=indexedLines.map(function(item){return item.el.textContent||'';}).join('\n');
+              sourceKind='MONACO_INDEXED_ROWS';
+            }
+          }
+        }
+      }
+
+      if(complete&&rawCode.trim()){
+        let lang='';
+        const wrapper=root.closest('code-block,.code-block,.code-container,[data-testid*="code" i]');
+        const header=(wrapper&&wrapper.querySelector('.code-header span,.code-block-decoration span,.code-block-internal-header span,[data-language]'))||root.previousElementSibling;
+        const headerLanguage=header&&header.getAttribute&&header.getAttribute('data-language');
+        const headerText=String(headerLanguage||(header&&header.textContent)||'').trim().toLowerCase();
+        const languageMatch=headerText.match(/\b(python|javascript|typescript|jsx|tsx|csharp|java|json|html|css|bash|shell|sql|xml|yaml|yml|markdown|powershell)\b/i);
+        if(languageMatch)lang=languageMatch[1].toLowerCase();
+        const fence=selectSafeMarkdownFence(rawCode,3);
+        root.replaceWith(document.createTextNode('\n\n'+fence+lang+'\n'+rawCode.replace(/\n+$/,'')+'\n'+fence+'\n\n'));
+        codeBlockCount++;
+        virtualizedBlocksExtracted++;
+        codeExtractionReceipts.push({sourceKind:sourceKind,language:lang,lineCount:rawCode.split('\n').length,completenessVerified:true});
+      }else{
+        virtualizedErrors.push({code:'VIRTUALIZED_CODE_INCOMPLETE',sourceKind:sourceKind||'MONACO_INDEXED_ROWS'});
+        root.replaceWith(document.createTextNode(''));
+      }
+    }
+    clone.querySelectorAll('button,svg,mat-icon,.code-header,.code-block-decoration,.code-block-internal-header').forEach(function(el){el.remove();});clone.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function(h){h.prepend(document.createTextNode('\n\n'+'#'.repeat(Number(h.tagName.slice(1)))+' '));h.append(document.createTextNode('\n\n'));});clone.querySelectorAll('p,div,li,tr').forEach(function(el){el.append(document.createTextNode('\n'));});clone.querySelectorAll('br').forEach(function(el){el.replaceWith(document.createTextNode('\n'));});let text=String(clone.textContent||'').replace(/\u00a0/g,' ').replace(/\r\n/g,'\n').replace(/\n{3,}/g,'\n\n').replace(/^\s*Gemini said\s*\n+/i,'').trim();const meta={liveNodeTag:liveNode.tagName.toLowerCase(),contentNodeTag:contentNode.tagName.toLowerCase(),contentCharsBeforeClean:before,thoughtNodesRemoved:thoughtNodes.length,contentCharsAfterClean:text.length,codeBlockCount:codeBlockCount,hasMessageContent:hasMessageContent,codeExtractionReceipts:codeExtractionReceipts};
+    if(virtualizedEditorsFound>0&&virtualizedBlocksExtracted===0&&virtualizedErrors.length>0)return {error:virtualizedErrors[0].code,text:'',metadata:meta};
+    if(before>0&&text.length===0&&(hasMessageContent||thoughtNodes.length===0))return {error:'GEMINI_EXTRACTION_OVERPRUNED',text:'',metadata:meta};return {text:text,metadata:meta};
   },{gem:isGemini,fence:FENCE3});
 }
 async function collectGeminiTerminalDiagnostics(args){
@@ -1059,7 +1464,7 @@ async function runWebDispatchWithRetryPolicy(opts){const dispatchId=opts.dispatc
       if(attempt===2){const backoff=Number.isFinite(opts.backoffMs)?opts.backoffMs:8000+(parseInt(crypto.createHash('sha256').update(diagId).digest('hex').slice(0,8),16)%4001);await (typeof opts.sleepFn==='function'?opts.sleepFn(backoff):new Promise(function(resolve){setTimeout(resolve,backoff);}));await resetChatVerified({page:page,targetFrame:targetFrame,tabKey:tabKey,projectRoot:projectRoot,forceReload:true,reason:'COMPACT_RECOVERY'});targetFrame=findChatFrameOrPage(page);}
       else if(attempt===1&&opts.forceFreshChat===true){await resetChatVerified({page:page,targetFrame:targetFrame,tabKey:tabKey,projectRoot:projectRoot,forceReload:true,reason:'CODING_BATCH_FRESH_CHAT'});targetFrame=findChatFrameOrPage(page);}
       else if(routing.autoNewChatOnProjectSwitch){await resetChatIfNeeded(page,tabKey,projectRoot,false);}
-      const verifiedModel = await ensureMaxReasoningMode(targetFrame,tabKey,{reasoningLevel:'high',modelTier:opts.modelTier||'argon_high'});
+      const verifiedModel = await ensureMaxReasoningMode(targetFrame,tabKey,{reasoningLevel:'high',modelTier:opts.modelTier||'neon'});
       tabActiveModel[tabKey]=verifiedModel;appendDispatchDiag(projectRoot,diagId,'MODEL_VERIFIED',{model:verifiedModel});
       await page.keyboard.press('Escape').catch(function() {});
       await targetFrame.evaluate(function() {
@@ -1068,7 +1473,7 @@ async function runWebDispatchWithRetryPolicy(opts){const dispatchId=opts.dispatc
       await page.waitForTimeout(200);
 
       // 1. Numërimi i saktë i përgjigjeve ekzistuese (1:1 me waitAndExtractCleanResponse)
-      const previousAssistant=await targetFrame.evaluate(function(isGem){const root=document.querySelector('main')||document.body,norm=function(v){return String(v||'').replace(/\s+/g,' ').trim();};let c=isGem?Array.from(root.querySelectorAll('response-container')):Array.from(root.querySelectorAll('[data-testid="chat-turn-assistant"],[data-testid="ai-message"],[data-message-author-role="assistant"],[data-content="ai-message"],.assistant-message,[data-testid="chatOutput"],[data-testid="copilot-message-div"],.fai-CopilotMessage,[data-testid="chat-response-message"]'));if(isGem&&c.length===0)c=Array.from(root.querySelectorAll('model-response,[data-message-author-role="model"]'));const n=c[c.length-1]||null;if(n&&!n.dataset.antigravityTurnId)n.dataset.antigravityTurnId='ag-turn-'+Array.from(root.querySelectorAll('*')).indexOf(n);const t=n?norm(n.textContent||''):'';return {count:c.length,fingerprint:t.slice(0,160)+'|'+t.length,nodeSignature:n?(n.tagName.toLowerCase()+'|'+n.dataset.antigravityTurnId):''};},isGemini);const previousCount=previousAssistant.count;
+      const previousAssistant=await targetFrame.evaluate(function(isGem){const root=document.querySelector('main')||document.body,norm=function(v){return String(v||'').replace(/\s+/g,' ').trim();};let c=isGem?Array.from(root.querySelectorAll('response-container')):Array.from(root.querySelectorAll('[data-testid="copilot-message-div"],[data-message-author-role="assistant"],[data-testid="chat-turn-assistant"],[data-testid="ai-message"],[data-content="ai-message"],.assistant-message,.fai-CopilotMessage'));if(isGem&&c.length===0)c=Array.from(root.querySelectorAll('model-response,[data-message-author-role="model"]'));const n=c[c.length-1]||null;if(n&&!n.dataset.antigravityTurnId)n.dataset.antigravityTurnId='ag-turn-'+Array.from(root.querySelectorAll('*')).indexOf(n);const t=n?norm(n.textContent||''):'';return {count:c.length,fingerprint:t.slice(0,160)+'|'+t.length,nodeSignature:n?(n.tagName.toLowerCase()+'|'+n.dataset.antigravityTurnId):''};},isGemini);const previousCount=previousAssistant.count;
       console.error('[DISPATCH_STEP] tabKey=' + tabKey + ' previousCount=' + previousCount);
 
       let combinedText = promptText;
@@ -1097,7 +1502,11 @@ async function runWebDispatchWithRetryPolicy(opts){const dispatchId=opts.dispatc
         filesToUpload.push(fp);
       }
       const maxChars = 29500;
-      const safePrompt = combinedText.length > maxChars ? (combinedText.slice(0, Math.floor(maxChars / 2)) + NL + '...[COMPACTED]...' + NL + combinedText.slice(-Math.floor(maxChars / 2))) : combinedText;
+      let promptWithContract = combinedText;
+      if (!isGemini && !combinedText.includes('OUTPUT CONTRACT')) {
+        promptWithContract = COPILOT_OUTPUT_CONTRACT + NL + NL + combinedText;
+      }
+      const safePrompt = promptWithContract.length > maxChars ? (promptWithContract.slice(0, Math.floor(maxChars / 2)) + NL + '...[COMPACTED]...' + NL + promptWithContract.slice(-Math.floor(maxChars / 2))) : promptWithContract;
       if(filesToUpload.length>0){const ar=await attachFilesSafely(page,targetFrame,tabKey,projectRoot,filesToUpload);appendDispatchDiag(projectRoot,diagId,'ATTACHMENTS_READY',{files:ar.files.length,elapsedMs:ar.elapsedMs});}
 
         const composer=await resolveActiveComposer(targetFrame,isGemini);
@@ -1652,15 +2061,71 @@ function getBundleAttachmentAndNote(projectRoot, targetEngine) {
   return { path: txtPath, note: txtNote };
 }
 
-function parseCodeBlocksFromMarkdown(markdown,expectedTargets){
-  const source=String(markdown||''),results=[];
-  const normalizePath=function(value){return String(value||'').trim().replace(/^[\x22\x27]|[\x22\x27]$/g,'').replace(/\\/g,'/').replace(/^\/+/, '');};
-  const push=function(rawPath,rawCode){const relPath=normalizePath(rawPath),code=String(rawCode||'').replace(/^```[a-zA-Z0-9_+-]*\s*\r?\n/,'').replace(/\r?\n```\s*$/,'');if(relPath&&code.trim())results.push({relPath:relPath,code:code});};
-  const parseStandard=function(text){const pattern='(?:###\\s*)?FILE:\\s*([^\\r\\n'+String.fromCharCode(96)+']+)\\r?\\n+'+FENCE3+'[a-zA-Z0-9_+-]*\\r?\\n([\\s\\S]*?)'+FENCE3,regex=new RegExp(pattern,'g');let match;while((match=regex.exec(text))!==null)push(match[1],match[2]);};
-  parseStandard(source);
-  if(results.length===0){const outerPattern=/```(?:markdown|text|python)?\s*\r?\n([\s\S]*?)\r?\n```/gi;let outer;while((outer=outerPattern.exec(source))!==null){const inner=outer[1];if(!/(?:^|\n)(?:###\s*)?FILE:\s*[^\r\n]+/i.test(inner))continue;const before=results.length;parseStandard(inner);if(results.length>before)continue;const header=/(?:^|\n)(?:###\s*)?FILE:\s*([^\r\n]+)\r?\n/gmi,matches=[];let fileMatch;while((fileMatch=header.exec(inner))!==null)matches.push({path:fileMatch[1],start:fileMatch.index+fileMatch[0].length,end:header.lastIndex});for(let i=0;i<matches.length;i++){const code=inner.slice(matches[i].end,i+1<matches.length?matches[i+1].start:inner.length);push(matches[i].path,code);}}}
-  if(results.length===0&&Array.isArray(expectedTargets)&&expectedTargets.length===1){const fences=[];const fencePattern=/```[a-zA-Z0-9_+-]*\s*\r?\n([\s\S]*?)\r?\n```/g;let fence;while((fence=fencePattern.exec(source))!==null)if(fence[1].trim().length>=40)fences.push(fence[1]);fences.sort(function(a,b){return b.length-a.length;});if(fences.length){let code=fences[0].replace(/^\s*(?:###\s*|#\s*)?FILE:\s*[^\r\n]+\r?\n/i,'');push(expectedTargets[0],code);}}
-  const unique=new Map();for(const item of results)if(!unique.has(item.relPath))unique.set(item.relPath,item);return Array.from(unique.values());
+function parseCodeBlocksFromMarkdown(markdown, expectedTargets) {
+  const source=String(markdown||''),results=[],expected=new Set((expectedTargets||[]).map(function(x){return String(x).replace(/\\/g,'/').replace(/^\.\//,'');}));
+  const safePath=function(value){const normalized=String(value||'').trim().replace(/^[\x22\x27]|[\x22\x27]$/g,'').replace(/\\/g,'/');if(!normalized||normalized.startsWith('/')||/^[A-Za-z]:\//.test(normalized)||normalized.split('/').includes('..'))return '';return normalized;};
+  const accept=function(relPath,code){
+    const clean=safePath(relPath);
+    if(!clean||!String(code||'').trim()||(expected.size&& !expected.has(clean)))return;
+    const normalizedCode=normalizeGeneratedSourceText(code);
+    const unsafeChars=findUnsafeGeneratedSourceCharacters(normalizedCode);
+    if(unsafeChars.length>0){
+      throw new Error('GENERATED_SOURCE_UNSAFE_UNICODE: '+clean+' '+JSON.stringify(unsafeChars));
+    }
+    results.push({relPath:clean,code:normalizedCode});
+  };
+  const dynamicFencePattern = new RegExp("(?:(?:###\\s*)?FILE:\\s*([^\\r\\n`]+)\\r?\\n\\s*)?(`{3,})([a-zA-Z0-9_+-]*)\\r?\\n([\\s\\S]*?)\\r?\\n\\2(?:\\r?\\n|$)", "g");
+  let match;
+  let fenceIndex = 0;
+  while ((match = dynamicFencePattern.exec(source)) !== null) {
+    const declaredTarget = match[1];
+    const code = match[4];
+    if (declaredTarget) {
+      accept(declaredTarget, code);
+    } else {
+      const target = Array.from(expected)[fenceIndex++];
+      if (target) accept(target, code);
+    }
+  }
+  if (results.length) return results;
+  const markers=[];const marker=/^\s*FILE\s*:\s*([^\r\n]+)$/gmi;while((match=marker.exec(source))!==null)markers.push({index:match.index,end:marker.lastIndex,line:match[1]});
+  const PYTHON_STARTERS=[/^import\s+/,/^from\s+\S+\s+import\s+/,/^def\s+[A-Za-z_]\w*\s*\(/,/^async\s+def\s+[A-Za-z_]\w*\s*\(/,/^class\s+[A-Za-z_]\w*/,/^#/,/^@/,/^#!/,/^if\s+__name__\s*==/,/^try\s*:/,/^with\s+.+:/,/^pass(?:\s|$)/,/^[A-Za-z_]\w*(?:\s*:\s*[^=]+)?\s*=/,/^(?:(?:r|u|f|fr|rf)?(?:"""|'''))/i];
+  const JS_STARTERS=[/^(?:import|export)\b/,/^(?:const|let|var)\s+[A-Za-z_$]/,/^function\b/,/^async\s+function\b/,/^class\b/,/^\/\//,/^\/\*/,/^module\.exports\b/,/^require\s*\(/,/^['"]use strict['"];?/,/^(?:describe|test|it)\s*\(/];
+  function matchesAnyStarter(text,patterns){return patterns.some(function(p){return p.test(text);});}
+  const starters={cs:/^(?:using|namespace|public|internal|private|protected|class|record|interface|enum|\/\/|#)/,json:/^[{[]/,html:/^(?:<!doctype|<html|<div|<template|<!--)/i,css:/^(?:@|:root|\.|#|[a-z-]+\s*{)/i,sh:/^(?:#!|set\s+-|[a-zA-Z_][a-zA-Z0-9_]*=|function\s+)/};
+  markers.forEach(function(item,i){
+    const tail=source.slice(item.end,i+1<markers.length?markers[i+1].index:source.length);
+    let target='';
+    const candidates=Array.from(expected).map(normalizeCheckpointTarget).sort(function(a,b){return b.length-a.length;});
+    const lowerLine=item.line.toLowerCase();
+    target=candidates.find(function(c){
+      const lowerC=c.toLowerCase();
+      if(!lowerLine.startsWith(lowerC))return false;
+      const next=item.line.slice(c.length,c.length+1);
+      return next===''||/\s/.test(next);
+    })||'';
+    if(!target){const token=item.line.trim().split(/\s+/)[0];target=safePath(token);}
+    if(!target||(expected.size&&!expected.has(target)))return;
+    let code=(item.line.slice(target.length)+tail).trim();
+    code=code.replace(/^(?:python|javascript|typescript|csharp|json|html|css|bash|shell)\s*/i,'');
+    const ext=path.extname(target).slice(1).toLowerCase();
+    let kind='';
+    if(ext==='py')kind='py';
+    else if(['js','jsx','ts','tsx'].includes(ext))kind='js';
+    else if(ext==='cs')kind='cs';
+    else if(ext==='json')kind='json';
+    else if(['html','htm'].includes(ext))kind='html';
+    else if(ext==='css')kind='css';
+    else if(['sh','bash'].includes(ext))kind='sh';
+    let lexical=false;
+    if(kind==='py')lexical=matchesAnyStarter(code,PYTHON_STARTERS);
+    else if(kind==='js')lexical=matchesAnyStarter(code,JS_STARTERS);
+    else if(starters[kind])lexical=starters[kind].test(code);
+    if(!lexical)return;
+    accept(target,code);
+    if(results.some(function(x){return x.relPath===target;}))console.error('[UNFENCED_OUTPUT_RECOVERED] target='+target+' parserMode=UNFENCED_FILE_FALLBACK');
+  });
+  return results;
 }
 function validateGeneratedCodeMarkdown(markdown) {
   const fileBlocks = parseCodeBlocksFromMarkdown(markdown);
@@ -1683,7 +2148,15 @@ function validateGeneratedCodeMarkdown(markdown) {
   return { valid: true, fileBlocks: fileBlocks };
 }
 
+function atomicWriteValidated(targetPath, content) {
+  const dir=path.dirname(targetPath),temp=path.join(dir,'.'+path.basename(targetPath)+'.antigravity-'+process.pid+'-'+crypto.randomBytes(6).toString('hex')+'.tmp');
+  fs.mkdirSync(dir,{recursive:true});fs.writeFileSync(temp,content,'utf8');
+  if(!fs.statSync(temp).size){fs.unlinkSync(temp);throw new Error('ATOMIC_WRITE_EMPTY: '+targetPath);}
+  try{fs.renameSync(temp,targetPath);}catch(error){if(fs.existsSync(temp))fs.unlinkSync(temp);throw error;}
+}
+
 function applyAndTestDeterministically(projectRoot) {
+  const resumeBatchId='BATCH-001';console.error('[CHECKPOINT_RESUME] resumeBatchId='+resumeBatchId+' destructiveReset=false');
   const routing = ensureProjectSetup(projectRoot);
   const cleanRoot = path.resolve(projectRoot);
   const exchangeDir = path.join(cleanRoot, '.antigravity', 'bridge', 'exchange');
@@ -1709,7 +2182,7 @@ function applyAndTestDeterministically(projectRoot) {
     }
     const parentDir = path.dirname(targetAbs);
     if (!fs.existsSync(parentDir)) fs.mkdirSync(parentDir, { recursive: true });
-    fs.writeFileSync(targetAbs, item.code, 'utf8');
+    atomicWriteValidated(targetAbs, item.code);
     writtenFiles.push(item.relPath);
   }
 
@@ -1744,7 +2217,7 @@ writeProjectState(cleanRoot, { phase: 'APPLIED_AND_VERIFIED', lastStatus: 'BUILD
 return { status: 'APPLIED_AND_GREEN', writtenFiles: writtenFiles, commandsExecuted: commands, logFile: logPath };
 }
 
-const CHUNK_ENGINE_LIMITS=Object.freeze({repoMapSoft:48*1024,repoMapHard:64*1024,planningSafe:240*1024,chunkSoft:160*1024,chunkHard:240*1024,summaryHard:24*1024,batchSoft:160*1024,batchHard:192*1024,recoveryHard:160*1024,contractPerBatch:16*1024,contractCumulative:64*1024,reviewSoft:160*1024,reviewHard:240*1024,maxBatchFiles:4,maxBatchTargetSourceBytes:18*1024,maxHalvingLevel:1,maxWebAnalysisChunks:4,maxInlineChars:12*1024,maxInlineBytes:12*1024,batchMiniMapSoft:8*1024});
+const CHUNK_ENGINE_LIMITS=Object.freeze({repoMapSoft:48*1024,repoMapHard:64*1024,planningSafe:240*1024,chunkSoft:160*1024,chunkHard:240*1024,summaryHard:24*1024,batchSoft:160*1024,batchHard:192*1024,recoveryHard:160*1024,contractPerBatch:16*1024,contractCumulative:64*1024,reviewSoft:160*1024,reviewHard:240*1024,maxBatchFiles:2,testMaxFiles:1,maxBatchTargetSourceBytes:18*1024,maxHalvingLevel:4,maxWebAnalysisChunks:4,maxInlineChars:12*1024,maxInlineBytes:12*1024,batchMiniMapSoft:8*1024});
 function normalizeBatchTarget(value){return String(value||'').replace(/\\/g,'/').replace(/^\.\//,'').trim();}
 function inferRepositoryLanguage(rel){const e=path.extname(rel).toLowerCase();return ({'.js':'JavaScript','.mjs':'JavaScript','.cjs':'JavaScript','.ts':'TypeScript','.tsx':'TypeScript','.jsx':'JavaScript','.py':'Python','.java':'Java','.kt':'Kotlin','.cs':'CSharp','.go':'Go','.rs':'Rust','.php':'PHP','.rb':'Ruby','.c':'C','.h':'C','.cpp':'Cpp','.hpp':'Cpp','.sh':'Shell','.ps1':'PowerShell','.sql':'SQL','.vue':'Vue','.svelte':'Svelte','.json':'JSON','.yaml':'YAML','.yml':'YAML','.toml':'TOML','.xml':'XML'})[e]||'Text';}
 function extractRepositorySignals(rel,text){const imports=[],symbols=[],exports=[];const patterns=[/(?:import[^'\"]*from\s*|require\s*\(|import\s*\()['\"]([^'\"]+)['\"]/g,/^\s*(?:from|import)\s+([A-Za-z0-9_.]+)/gm,/^\s*(?:using|package|import)\s+([A-Za-z0-9_.]+)/gm,/^\s*(?:mod|use)\s+([A-Za-z0-9_:]+)/gm];for(const r of patterns){let m;while((m=r.exec(text))&&imports.length<100)imports.push(m[1]);}const sr=/^\s*(?:export\s+)?(?:async\s+)?(?:function|class|interface|record|struct|enum|def|fn|type|const|let|var)\s+([A-Za-z_$][\w$]*)/gm;let sm;while((sm=sr.exec(text))&&symbols.length<120)symbols.push(sm[1]);const er=/^\s*export\s+(?:default\s+)?(?:async\s+)?(?:function|class|const|let|var)?\s*([A-Za-z_$][\w$]*)?/gm;let em;while((em=er.exec(text))&&exports.length<80)if(em[1])exports.push(em[1]);return {imports:Array.from(new Set(imports)).sort(),symbols:Array.from(new Set(symbols)).sort(),exports:Array.from(new Set(exports)).sort(),entryPointSignals:/(^|\/)(main|index|server|app|program)\.[^.]+$/i.test(rel)||/\b(?:main\s*\(|if __name__|createServer\s*\()/.test(text),testSignals:/(^|\/|\.)(test|tests|spec|specs)(\/|\.|$)/i.test(rel),configSignals:/(package\.json|pyproject\.toml|cargo\.toml|go\.mod|\.ya?ml$|\.toml$|\.xml$)/i.test(rel)};}
@@ -1765,18 +2238,18 @@ function scoreAnalysisChunkRelevance(chunk,scan,graph,userRequest){const terms=S
 function buildLocalStructuralChunkSummary(chunk,scan){const files=new Map(scan.files.map(function(f){return [f.path,f];})),symbols=[];for(const rel of chunk.files){const f=files.get(rel);if(f)symbols.push(...(f.symbols||[]).slice(0,12));}return ['CHUNK_ID: '+chunk.chunkId,'MODULES: '+chunk.module,'KEY_SYMBOLS: '+Array.from(new Set(symbols)).slice(0,80).join(', '),'RELEVANT_FILES:',...chunk.files.map(function(rel){return '- '+rel;}),'SUMMARY_MODE: LOCAL_STRUCTURAL'].join(NL);}
 function buildFinalPlanningContext(args){const sections=['USER REQUEST\n'+String(args.userRequest||''),'REPO MAP\n'+args.repoMap.text,'CHUNK SUMMARIES',...(args.summaries||[]).map(x=>x.text),'CRITICAL WINDOWS\n'+String(args.criticalWindows||'')];const text=truncateUtf8(sections.join(NL+NL),CHUNK_ENGINE_LIMITS.planningSafe);return {text:text,bytes:Buffer.byteLength(text),path:(args.totalRelevantBytes||0)<=CHUNK_ENGINE_LIMITS.planningSafe?'SINGLE_PASS':'CHUNKED'};}
 function parseAndValidatePlanBatches(plan,graph,scan){const targets=Array.from(String(plan||'').matchAll(/^\s*(?:[-*]\s*)?FILE_TARGET:\s*([^\r\n]+)/gmi)).map(m=>normalizeBatchTarget(m[1].replace(/["'`*]/g,'')));if(!targets.length)throw new Error('PLANNING_FINAL_INVALID');const options=scan?{fileBytesByPath:Object.fromEntries(scan.files.map(function(file){return [file.path,file.bytes];}))}:{};return partitionCodingBatches(Array.from(new Set(targets)),graph,options);}
-function partitionCodingBatches(targets,graph,limits){limits=Object.assign({},CHUNK_ENGINE_LIMITS,limits||{});const order=[],seen=new Set(),deps=new Map();for(const e of graph.edges||[]){if(!deps.has(e.from))deps.set(e.from,[]);deps.get(e.from).push(e.to);}function visit(x){if(seen.has(x))return;seen.add(x);for(const d of (deps.get(x)||[]))if(targets.includes(d))visit(d);order.push(x);}targets.slice().sort().forEach(visit);const batches=[],fileBytes=limits.fileBytesByPath||null;let current=[],currentSourceBytes=0;function flush(){if(!current.length)return;batches.push({batchId:'BATCH-'+String(batches.length+1).padStart(3,'0'),order:batches.length+1,targets:current,dependenciesOnBatches:[],purpose:'Implement planned targets',expectedContracts:[],quickChecks:[],riskLevel:'NORMAL'});current=[];currentSourceBytes=0;}for(const target of order){const targetBytes=fileBytes?Math.max(0,Number(fileBytes[target]||0)):0;if(current.length&&(current.length>=limits.maxBatchFiles||(fileBytes&&currentSourceBytes+targetBytes>limits.maxBatchTargetSourceBytes)))flush();current.push(target);currentSourceBytes+=targetBytes;}flush();return batches;}
+function partitionCodingBatches(targets,graph,limits){limits=Object.assign({},CHUNK_ENGINE_LIMITS,limits||{});const order=[],seen=new Set(),deps=new Map();for(const e of graph.edges||[]){if(!deps.has(e.from))deps.set(e.from,[]);deps.get(e.from).push(e.to);}function visit(x){if(seen.has(x))return;seen.add(x);for(const d of (deps.get(x)||[]))if(targets.includes(d))visit(d);order.push(x);}targets.slice().sort().forEach(visit);const batches=[],fileBytes=limits.fileBytesByPath||null;let current=[],currentSourceBytes=0;function flush(){if(!current.length)return;batches.push({batchId:'BATCH-'+String(batches.length+1).padStart(3,'0'),order:batches.length+1,targets:current,dependenciesOnBatches:[],purpose:'Implement planned targets',expectedContracts:[],quickChecks:[],riskLevel:'NORMAL'});current=[];currentSourceBytes=0;}for(const target of order){const targetBytes=fileBytes?Math.max(0,Number(fileBytes[target]||0)):0;const isTestTarget=Boolean(/(^|\/|\.)(test|tests|spec|specs)(\/|\.|$)/i.test(target));if(isTestTarget&&Number(limits.testMaxFiles||1)===1){flush();current=[target];currentSourceBytes=targetBytes;flush();continue;}if(current.length&&(current.length>=limits.maxBatchFiles||(fileBytes&&currentSourceBytes+targetBytes>limits.maxBatchTargetSourceBytes)))flush();current.push(target);currentSourceBytes+=targetBytes;}flush();return batches;}
 function buildBatchMiniMap(batch,state,limits){limits=Object.assign({},CHUNK_ENGINE_LIMITS,limits||{});const targets=new Set(batch.targets.map(normalizeBatchTarget)),files=new Map(state.scan.files.map(function(f){return [f.path,f];})),imports=new Set(),dependents=new Set();for(const edge of state.graph.edges||[]){if(targets.has(edge.from))imports.add(edge.to);if(targets.has(edge.to))dependents.add(edge.from);}const lines=['BATCH MINI MAP','TARGET PATHS',...Array.from(targets).sort(),'TARGET SYMBOLS',...Array.from(targets).sort().map(function(rel){const f=files.get(rel)||{};return rel+': '+(f.symbols||[]).slice(0,30).join(', '); }),'DIRECT IMPORTS',...Array.from(imports).sort(),'DIRECT DEPENDENTS',...Array.from(dependents).sort(),'ENTRY POINT RELATIONSHIP',...Array.from(targets).filter(function(rel){return (files.get(rel)||{}).entryPointSignals;}).map(function(rel){return rel+'=ENTRY_POINT';}),'RELEVANT BUILD/TEST COMMAND',String((state.routing&&state.routing.buildCmd)||''),String((state.routing&&state.routing.testCmd)||''),'PRIOR PUBLIC CONTRACTS',String(state.contractMemory||'')];const text=truncateUtf8(lines.join(NL),limits.batchMiniMapSoft||8*1024);return {text:text,bytes:Buffer.byteLength(text)};}
 function extractBatchPlanSlice(planText,batch){const targets=batch.targets.map(normalizeBatchTarget),lines=String(planText||'').split(/\r?\n/),selected=[];let active=false;for(const line of lines){const hit=targets.some(function(target){return line.toLowerCase().includes(target.toLowerCase());});const global=/OBJECTIVE|OBJEKTIV|CONSTRAINT|KUFIZIM|DEFINITION OF DONE|ACCEPTANCE|VERIFIK|TEST|DEPENDENC/i.test(line);if(hit){active=true;selected.push(line);continue;}if(active&&/^\s*(?:#{1,6}|\d+\.|FILE_TARGET:)/i.test(line)&&!global){active=false;}if(active||global)selected.push(line);}return truncateUtf8(selected.join(NL),24*1024);}
 function buildMinimalBatchContext(batch,state,limits){limits=Object.assign({},CHUNK_ENGINE_LIMITS,limits||{});const mini=buildBatchMiniMap(batch,state,limits),slice=extractBatchPlanSlice(state.planSlice,batch),targets=[],contracts=[];for(const rel of batch.targets){const full=path.join(state.scan.projectRoot,rel);targets.push('### FILE: '+rel+NL+(fs.existsSync(full)?fs.readFileSync(full,'utf8'):'NEW FILE'));}const direct=new Set();for(const edge of state.graph.edges||[])if(batch.targets.includes(edge.from))direct.add(edge.to);for(const rel of Array.from(direct).sort()){const full=path.join(state.scan.projectRoot,rel);if(fs.existsSync(full)){const f=state.scan.files.find(function(x){return x.path===rel;});contracts.push('### DIRECT CONTRACT: '+rel+NL+truncateUtf8(fs.readFileSync(full,'utf8'),Math.min(8*1024,(f&&f.bytes)||8*1024)));}}const text=['BATCH INSTRUCTION',batch.batchId+' targets='+batch.targets.join(', '),'BATCH PLAN SLICE',slice,'TARGET SOURCE',targets.join(NL+NL),'DIRECT IMPORT CONTRACTS/WINDOWS',contracts.join(NL+NL),'PRIOR PUBLIC CONTRACTS',state.contractMemory||'','BATCH MINI MAP',mini.text,'LAST ERROR RECEIPT',state.lastErrorReceipt||''].join(NL+NL);return {text:text,bytes:Buffer.byteLength(text),miniMapBytes:mini.bytes,planSliceBytes:Buffer.byteLength(slice),targets:batch.targets};}
 function selectCodingTransport(context,limits){limits=Object.assign({},CHUNK_ENGINE_LIMITS,limits||{});const text=String(context&&context.text||''),chars=text.length,bytes=Buffer.byteLength(text,'utf8'),thresholdChars=limits.maxInlineChars,thresholdBytes=limits.maxInlineBytes,inline=chars<=thresholdChars&&bytes<=thresholdBytes,transport=inline?'INLINE':'ATTACHMENT';console.error('[CODING_TRANSPORT_DECISION] chars='+chars+' bytes='+bytes+' maxInlineChars='+thresholdChars+' maxInlineBytes='+thresholdBytes+' transport='+transport);return inline?{transport:transport,attachmentCount:0,twoStepIngest:false,chars:chars,bytes:bytes,thresholdChars:thresholdChars,thresholdBytes:thresholdBytes}:{transport:transport,attachmentCount:1,twoStepIngest:true,chars:chars,bytes:bytes,thresholdChars:thresholdChars,thresholdBytes:thresholdBytes};}
 function selectAdaptiveReasoningLevel(ctx){return 'high';}
 function classifyAttachmentHandshakeStrict(text){const normalized=String(text||'').trim();if(!normalized)return {ok:false,code:'BLANK'};if(/Lexo skedarin e bashkëngjitur|Mos shkruaj kod ende/i.test(normalized))return {ok:false,code:'PROMPT_ECHO'};const classified=classifyAttachmentHandshake(normalized,{attachmentVerified:true,alerts:[]});return {ok:classified.class==='HANDSHAKE_ACCEPTED',code:classified.code};}
-async function runGeminiAttachmentIngestHandshake(args){const prompt='Lexo skedarin e bashkëngjitur plotësisht. Mos shkruaj kod ende. Përgjigju vetëm me konfirmim të shkurtër se skedari u lexua dhe je gati.';const text=await dispatchToWebTab({tabKey:args.tabKey,projectRoot:args.projectRoot,promptText:prompt,attachmentPaths:[args.attachmentPath],forceFreshChat:args.forceFreshChat!==false,disableInternalRetry:true,reasoningLevel:'high',modelTier:args.modelTier||'argon_high',hardCapMs:args.modelTier==='pro_31'?240000:65000});const check=classifyAttachmentHandshakeStrict(text);if(!check.ok)throw new Error('GEMINI_ATTACHMENT_INGEST_UNVERIFIED: '+check.code);console.error('[GEMINI_ATTACHMENT_INGEST_VERIFIED] batchId='+(args.batchId||'')+' chars='+text.length);return {status:'VERIFIED',text:text};}
+async function runGeminiAttachmentIngestHandshake(args){const prompt='Lexo skedarin e bashkëngjitur plotësisht. Mos shkruaj kod ende. Përgjigju vetëm me konfirmim të shkurtër se skedari u lexua dhe je gati.';const text=await dispatchToWebTab({tabKey:args.tabKey,projectRoot:args.projectRoot,promptText:prompt,attachmentPaths:[args.attachmentPath],forceFreshChat:args.forceFreshChat!==false,disableInternalRetry:true,reasoningLevel:'high',modelTier:args.modelTier||'neon',hardCapMs:args.modelTier==='pro_31'?240000:65000});const check=classifyAttachmentHandshakeStrict(text);if(!check.ok)throw new Error('GEMINI_ATTACHMENT_INGEST_UNVERIFIED: '+check.code);console.error('[GEMINI_ATTACHMENT_INGEST_VERIFIED] batchId='+(args.batchId||'')+' chars='+text.length);return {status:'VERIFIED',text:text};}
 function buildBatchContext(batch,state,limits){limits=Object.assign({},CHUNK_ENGINE_LIMITS,limits||{});const scan=state.scan;batch.targets=batch.targets.map(normalizeBatchTarget);const needed=new Set(batch.targets);for(const e of state.graph.edges||[])if(needed.has(e.from))needed.add(e.to);const targetBlocks=[],dependencyBlocks=[];for(const rel of Array.from(needed).sort()){const full=path.join(scan.projectRoot,rel);let block;if(!fs.existsSync(full)){block='### FILE: '+rel+' (NEW FILE - DOES NOT EXIST YET ON DISK, CREATE FROM PLAN)'+NL+'PLAN REQUIREMENT: '+String(state.planSlice||'');}else{const inspected=inspectTextBuffer(fs.readFileSync(full));if(!inspected.isText)continue;block='### FILE: '+rel+NL+inspected.text;}if(batch.targets.includes(rel))targetBlocks.push(block);else dependencyBlocks.push(block);}const mandatory=['BATCH '+batch.batchId,'TARGETS '+batch.targets.join(', '),'SOURCE TARGETS',targetBlocks.join(NL+NL),'PLAN SLICE',state.planSlice||'','LAST ERROR RECEIPT',state.lastErrorReceipt||''].join(NL+NL);if(Buffer.byteLength(mandatory)>limits.batchHard)throw new Error('BATCH_CONTEXT_INCOMPLETE: TARGETS_EXCEED_HARD_LIMIT');const optional=['DEPENDENCIES',dependencyBlocks.join(NL+NL),'PRIOR CONTRACTS',state.contractMemory||'','REPO MAP',state.repoMap.text,'CHANGED FILES',JSON.stringify(state.changedFiles||[])].join(NL+NL);const room=limits.batchHard-Buffer.byteLength(mandatory)-Buffer.byteLength(NL+NL);const text=mandatory+NL+NL+truncateUtf8(optional,Math.max(0,room));for(const t of batch.targets)if(!text.includes('### FILE: '+t))throw new Error('BATCH_CONTEXT_INCOMPLETE: '+t);return {text:text,bytes:Buffer.byteLength(text),sha256:crypto.createHash('sha256').update(text).digest('hex'),targets:batch.targets};}
 
 async function runCodingBatch(batch,context,engine,opts){opts=opts||{};if(context.bytes>CHUNK_ENGINE_LIMITS.batchHard)throw new Error('BATCH_CONTEXT_INCOMPLETE');let resetReceipt=null;if(opts.page)resetReceipt=await resetChatVerified({page:opts.page,targetFrame:opts.targetFrame,tabKey:engine,projectRoot:opts.projectRoot,forceReload:true,reason:'CODING_BATCH'});if(resetReceipt&&resetReceipt.method!=='FORCED_NAV')throw new Error('FORCED_CHAT_RESET_VERIFICATION_FAILED');if(typeof opts.reverifyModel==='function')await opts.reverifyModel();if(typeof opts.dispatch!=='function')return {status:'BATCH_READY',batchId:batch.batchId,contextBytes:context.bytes,resetReceipt:resetReceipt,attachmentCount:1};const output=await opts.dispatch({batch:batch,context:context,attachmentCount:1});const parsed=parseCodeBlocksFromMarkdown(output);const paths=new Set(parsed.map(x=>x.relPath));if(batch.targets.some(x=>!paths.has(x)))throw new Error('BATCH_OUTPUT_INCOMPLETE');if(parsed.some(x=>!batch.targets.includes(x.relPath)))throw new Error('BATCH_OUTPUT_UNAUTHORIZED_FILE');return {status:'BATCH_CODED',batchId:batch.batchId,parsedFiles:parsed,resetReceipt:resetReceipt,attachmentCount:1};}
-function applyBatch(args){const root=fs.realpathSync(path.resolve(args.projectRoot));args.batch.targets=args.batch.targets.map(normalizeBatchTarget);args.parsedFiles=args.parsedFiles.map(x=>Object.assign({},x,{relPath:normalizeBatchTarget(x.relPath)}));const expected=new Set(args.batch.targets),seen=new Set(),backups=[];for(const f of args.parsedFiles){if(seen.has(f.relPath)||!expected.has(f.relPath))throw new Error('BATCH_OUTPUT_INCOMPLETE');seen.add(f.relPath);const abs=path.resolve(root,f.relPath);if(!abs.startsWith(root+path.sep))throw new Error('SECURITY_BLOCK');if(detectUnpairedSurrogates(f.code)||Buffer.from(f.code).includes(0))throw new Error('BUNDLE_INVALID_UNICODE');backups.push({path:f.relPath,exists:fs.existsSync(abs),content:fs.existsSync(abs)?fs.readFileSync(abs):null});fs.mkdirSync(path.dirname(abs),{recursive:true});const tmp=abs+'.antigravity-tmp';fs.writeFileSync(tmp,f.code,'utf8');fs.renameSync(tmp,abs);}if(seen.size!==expected.size)throw new Error('BATCH_OUTPUT_INCOMPLETE');return {status:'BATCH_APPLIED',filesWritten:Array.from(seen),backups:backups};}
+function applyBatch(args){const root=fs.realpathSync(path.resolve(args.projectRoot));args.batch.targets=args.batch.targets.map(normalizeBatchTarget);args.parsedFiles=args.parsedFiles.map(x=>Object.assign({},x,{relPath:normalizeBatchTarget(x.relPath)}));const expected=new Set(args.batch.targets),seen=new Set(),backups=[];for(const f of args.parsedFiles){if(seen.has(f.relPath)||!expected.has(f.relPath))throw new Error('BATCH_OUTPUT_INCOMPLETE');seen.add(f.relPath);const abs=path.resolve(root,f.relPath);if(!abs.startsWith(root+path.sep))throw new Error('SECURITY_BLOCK');if(detectUnpairedSurrogates(f.code)||Buffer.from(f.code).includes(0))throw new Error('BUNDLE_INVALID_UNICODE');if(fs.existsSync(abs)){const existingStat=fs.statSync(abs);if(existingStat.size>5000&&Buffer.byteLength(f.code,'utf8')<existingStat.size*0.25&&f.code.split('\n').length<30){throw new Error('BATCH_OUTPUT_COLLAPSED_STUB: '+f.relPath+' shrunk from '+existingStat.size+' bytes to '+Buffer.byteLength(f.code,'utf8')+' bytes');}}backups.push({path:f.relPath,exists:fs.existsSync(abs),content:fs.existsSync(abs)?fs.readFileSync(abs):null});fs.mkdirSync(path.dirname(abs),{recursive:true});const tmp=abs+'.antigravity-tmp';fs.writeFileSync(tmp,f.code,'utf8');fs.renameSync(tmp,abs);}if(seen.size!==expected.size)throw new Error('BATCH_OUTPUT_INCOMPLETE');return {status:'BATCH_APPLIED',filesWritten:Array.from(seen),backups:backups};}
 function runBatchQuickChecks(args){const receipts=[];for(const rel of args.writtenFiles||[]){const full=path.join(args.projectRoot,rel),ext=path.extname(rel).toLowerCase();let run={status:0,stdout:'',stderr:''};if(['.js','.mjs','.cjs'].includes(ext))run=spawnSync(process.execPath,['--check',full],{encoding:'utf8'});else if(ext==='.py')run=spawnSync(process.env.PYTHON||'python',['-m','py_compile',full],{encoding:'utf8'});else if(ext==='.json'){try{JSON.parse(fs.readFileSync(full,'utf8'));}catch(err){run={status:1,stdout:'',stderr:err.message};}}receipts.push({command:'syntax '+rel,status:run.status,output:truncateUtf8((run.stdout||'')+(run.stderr||''),12000)});if(run.status!==0)return {status:'CHECK_FAILED',receipts:receipts};}return {status:'CHECK_PASSED',receipts:receipts};}
 function redactDiagnosticSecrets(value){return String(value||'').replace(/(authorization\s*[:=]\s*(?:bearer\s+)?)[^\s,;]+/ig,'$1[REDACTED]').replace(/((?:api[_-]?key|token|cookie|password|secret)\s*[:=]\s*)[^\s,;]+/ig,'$1[REDACTED]');}
 function boundedDiagnosticExcerpt(value,maxBytes){const clean=redactDiagnosticSecrets(value),limit=maxBytes||24000;if(Buffer.byteLength(clean,'utf8')<=limit)return {text:clean,truncated:false};const blocks=(clean.match(/(?:Traceback[\s\S]*?(?=\n\S|$)|(?:error|exception|failed)[^\n]*(?:\n[ \t]+[^\n]*){0,12})/ig)||[]).join(NL);return {text:truncateUtf8(clean,7200)+NL+'...[DIAGNOSTIC_TRUNCATED]...'+NL+truncateUtf8(blocks,3600)+NL+truncateUtf8(clean.slice(-14000),13200),truncated:true};}
@@ -1785,35 +2258,240 @@ function runFinalBuildAndTests(projectRoot,timeoutMs){const routing=ensureProjec
 
 async function repairBatchOnce(args){if(args.repairsUsed>=1)throw new Error('BATCH_REPAIR_EXHAUSTED');const result=await runCodingBatch(args.batch,args.context,args.engine,Object.assign({},args,{repair:true}));return Object.assign(result,{repairsUsed:1});}
 function halveBatchAdaptively(batch,costs,level){if((level||0)>=CHUNK_ENGINE_LIMITS.maxHalvingLevel||batch.targets.length<=1)return [batch];const weighted=batch.targets.map(t=>({target:t,cost:Number(costs&&costs[t]||1)})),maxLeft=Math.ceil(weighted.length/2),total=weighted.reduce((n,x)=>n+x.cost,0);let left=[],right=[],sum=0;for(const x of weighted){const remaining=weighted.length-left.length-right.length;if(left.length<maxLeft&&(sum<total/2||!left.length||remaining<=maxLeft-left.length)){left.push(x.target);sum+=x.cost;}else right.push(x.target);}while(left.length>maxLeft)right.unshift(left.pop());if(!right.length)right.push(left.pop());return [{...batch,batchId:batch.batchId+'.a',targets:left,halvingLevel:(level||0)+1},{...batch,batchId:batch.batchId+'.b',targets:right,halvingLevel:(level||0)+1}];}
+function normalizeFailureCode(err){if(!err)return '';if(typeof err==='object'&&err.code)return String(err.code).trim();if(typeof err==='object'&&err.failureCode)return String(err.failureCode).trim();const msg=String(err&&err.message||err).trim();const prefixMatch=msg.match(/^([A-Z0-9_]{4,40}):/);if(prefixMatch)return prefixMatch[1];return msg.split(/[\s,]+/)[0]||'';}
+const ADAPTIVE_HALVING_CODES=new Set(['BATCH_OUTPUT_INCOMPLETE','BATCH_TARGET_MISSING','BATCH_OUTPUT_TRUNCATED','BATCH_RESPONSE_BUDGET_EXCEEDED','BATCH_PARSE_INCOMPLETE']);
+function isAdaptiveHalvingFailure(err){return ADAPTIVE_HALVING_CODES.has(normalizeFailureCode(err));}
 function buildCrossBatchContractSummary(receipt,previous){let text=[previous||'','BATCH '+receipt.batchId,'FILES '+(receipt.filesWritten||[]).join(','),'HASHES '+JSON.stringify(receipt.fileHashes||{}),'PUBLIC_CONTRACTS '+JSON.stringify(receipt.publicContracts||[]),'EXPORTS '+JSON.stringify(receipt.exports||[]),'QUICK_CHECK '+JSON.stringify(receipt.quickCheckResult||{})].join(NL);text=truncateUtf8(text,CHUNK_ENGINE_LIMITS.contractCumulative);return {text:text,bytes:Buffer.byteLength(text)};}
 function buildDiffFocusedReviewContext(args){let text=['FINAL PLAN',String(args.plan||''),'CHANGED FILES',JSON.stringify(args.changedFiles||[]),'DIFF',String(args.diff||''),'BATCH RECEIPTS',JSON.stringify(args.batchReceipts||[]),'FINAL TESTS',String(args.finalTests||''),'KNOWN RISKS',JSON.stringify(args.knownRisks||[])].join(NL+NL);const chunks=[];while(Buffer.byteLength(text)>CHUNK_ENGINE_LIMITS.reviewHard){chunks.push(truncateUtf8(text,CHUNK_ENGINE_LIMITS.reviewSoft));text=text.slice(chunks[chunks.length-1].length);}if(text)chunks.push(text);return {text:chunks.length===1?chunks[0]:'',chunks:chunks,bytes:chunks.reduce((n,x)=>n+Buffer.byteLength(x),0),fullRepositoryIncluded:false};}
 
 
 function writeChunkContextFile(exchangeDir,chunk,scan,maxBytes){const blocks=['CHUNK_ID: '+chunk.chunkId,'MODULE: '+chunk.module];for(const rel of chunk.files){const full=path.join(scan.projectRoot,rel);if(!fs.existsSync(full))continue;const inspected=inspectTextBuffer(fs.readFileSync(full));if(inspected.isText)blocks.push('### FILE: '+rel+NL+inspected.text);}const text=truncateUtf8(blocks.join(NL+NL),maxBytes);const file=path.join(exchangeDir,'chunk_'+chunk.chunkId+'.txt');fs.writeFileSync(file,text,'utf8');return {path:file,text:text,bytes:Buffer.byteLength(text)};}
 function extractTargetsFromError(text,known){const normalizedText=String(text||'').replace(/\\+/g,'/'),lowerText=normalizedText.toLowerCase(),found=[],basenameCounts=new Map();for(const rel of known){const basename=path.posix.basename(normalizeBatchTarget(rel)).toLowerCase();if(basename.length>=8)basenameCounts.set(basename,(basenameCounts.get(basename)||0)+1);}for(const rel of known){const normalizedRel=normalizeBatchTarget(rel),index=lowerText.lastIndexOf(normalizedRel.toLowerCase()),basename=path.posix.basename(normalizedRel).toLowerCase(),basenameIndex=basename.length>=8&&basenameCounts.get(basename)===1?lowerText.lastIndexOf(basename):-1;if(index>=0)found.push({rel:normalizedRel,index:index,rank:1});else if(basenameIndex>=0)found.push({rel:normalizedRel,index:basenameIndex,rank:0});}return found.sort(function(a,b){return b.index-a.index||b.rank-a.rank||a.rel.localeCompare(b.rel);}).map(function(item){return item.rel;});}
-function appendBatchAudit(codePath,receipt,parsed){const header=NL+NL+'<!-- '+receipt.batchId+' -->'+NL;fs.appendFileSync(codePath,header+parsed.map(x=>'### FILE: '+x.relPath+NL+FENCE3+path.extname(x.relPath).slice(1)+NL+x.code+NL+FENCE3).join(NL+NL),'utf8');}
-async function dispatchChunkedEngineTurn(engine,cleanRoot,prompt,attachment,opts){opts=opts||{};const common={tabKey:engine,projectRoot:cleanRoot,promptText:prompt,attachmentPaths:[attachment],bundlePath:attachment,isPlanner:Boolean(opts.isPlanner),userRequest:opts.userRequest||'',forceFreshChat:opts.forceFreshChat!==false,useProvidedBundle:opts.useProvidedBundle===true,backoffMs:opts.backoffMs,sleepFn:opts.sleepFn,disableInternalRetry:opts.disableInternalRetry===true,reasoningLevel:'high',modelTier:opts.modelTier||'argon_high',hardCapMs:opts.hardCapMs};return engine.startsWith('google_search_')?dispatchToGoogleSearchAiTab(common):dispatchToWebTab(common);}
-function getFailoverEngines(primaryEngine,excludedSet){const e=excludedSet instanceof Set?excludedSet:new Set(excludedSet||[]),orders={gemini2:['gemini3','gemini1','web2'],gemini3:['gemini2','gemini1','web2'],gemini1:['gemini3','gemini2','web2'],web2:['web1','gemini3','gemini2'],web1:['web2','gemini3','gemini2'],google_search_1:['google_search_2','google_search_3','web1'],google_search_2:['google_search_3','google_search_1','web1'],google_search_3:['google_search_1','google_search_2','web1']};return (orders[primaryEngine]||[]).filter(function(engine){if(e.has(engine)||engine===primaryEngine)return false;const profile=getProfileNameForTab(engine),profileExists=fs.existsSync(path.join(PROFILES_DIR,profile));return Object.prototype.hasOwnProperty.call(tabs,engine)&&(profileExists||tabs[engine]!==null||tabAuthStatus[engine]==='ACTIVE');});}
+function normalizeCheckpointTarget(target){return String(target||'').replace(/\\/g,'/').replace(/^\.\/+/,'');}
+function computeRepositoryFingerprint(cleanRoot){
+  const canonicalRoot=path.resolve(cleanRoot).toLowerCase();
+  let gitHead=null,branch=null;
+  try{gitHead=execSync('git -C "'+cleanRoot+'" rev-parse HEAD',{encoding:'utf8'}).trim();}catch(_){}
+  try{branch=execSync('git -C "'+cleanRoot+'" rev-parse --abbrev-ref HEAD',{encoding:'utf8'}).trim();}catch(_){}
+  return crypto.createHash('sha256').update(JSON.stringify({canonicalRoot:canonicalRoot,gitHead:gitHead,branch:branch})).digest('hex');
+}
+function computeCheckpointIdentity(cleanRoot,planText){
+  const repoFp=computeRepositoryFingerprint(cleanRoot);
+  const planFp=crypto.createHash('sha256').update(String(planText||'').trim()).digest('hex');
+  return {repositoryFingerprint:repoFp,planFingerprint:planFp};
+}
+function checkpointTargetAbsolute(cleanRoot,target){
+  if(!cleanRoot)return null;
+  const normalized=normalizeCheckpointTarget(target),rootAbs=path.resolve(cleanRoot),targetAbs=path.resolve(rootAbs,normalized);
+  if(!normalized||path.isAbsolute(normalized)||(targetAbs!==rootAbs&&!targetAbs.startsWith(rootAbs+path.sep)))return null;
+  return targetAbs;
+}
+function fileReceiptFingerprint(r){
+  return crypto.createHash('sha256').update(JSON.stringify({
+    target:r.target,inputSha256:r.inputSha256,outputSha256:r.outputSha256,
+    repositoryFingerprint:r.repositoryFingerprint,planFingerprint:r.planFingerprint,
+    parserMode:r.parserMode||null,verificationBasis:r.verificationBasis||null,
+    migrationSource:r.migrationSource||null,historicalOutputProvenance:r.historicalOutputProvenance||null,
+    syntax:r.syntax,quickCheck:r.quickCheck,status:r.status
+  })).digest('hex');
+}
+function parseCheckpointAudit(auditText){
+  const fileReceipts=new Map(),conflicts=new Set();
+  const pattern=/<!--\s*CHECKPOINT_FILE_VERIFIED\s+([\s\S]*?)-->/g;
+  let match;
+  while((match=pattern.exec(String(auditText||'')))!==null){
+    const attr={},re=/([A-Za-z][A-Za-z0-9_]*)=([^\s>]+)/g;
+    let m;
+    while((m=re.exec(match[1]))!==null)attr[m[1]]=m[2];
+    const target=normalizeCheckpointTarget(attr.target);
+    if(!target)continue;
+    const r={
+      target:target,
+      inputSha256:String(attr.inputSha256||'').toLowerCase(),
+      outputSha256:String(attr.outputSha256||'').toLowerCase(),
+      repositoryFingerprint:String(attr.repositoryFingerprint||'').toLowerCase(),
+      planFingerprint:String(attr.planFingerprint||'').toLowerCase(),
+      parserMode:String(attr.parserMode||''),
+      verificationBasis:String(attr.verificationBasis||''),
+      migrationSource:String(attr.migrationSource||''),
+      historicalOutputProvenance:String(attr.historicalOutputProvenance||''),
+      syntax:String(attr.syntax||''),
+      quickCheck:String(attr.quickCheck||''),
+      status:String(attr.status||'')
+    };
+    fileReceipts.set(target,r);
+  }
+  return {fileReceipts:fileReceipts,conflicts:conflicts};
+}
+function isTargetVerifiedForCheckpoint(auditIndex,target,cleanRoot,checkpointIdentity){
+  const normalized=normalizeCheckpointTarget(target),receipt=auditIndex&&auditIndex.fileReceipts?auditIndex.fileReceipts.get(normalized):null;
+  if(!receipt||!checkpointIdentity||receipt.status!=='VERIFIED'||receipt.syntax!=='PASS'||receipt.quickCheck!=='PASS'||!/^[a-f0-9]{64}$/.test(receipt.inputSha256)||!/^[a-f0-9]{64}$/.test(receipt.outputSha256))return false;
+  if(receipt.repositoryFingerprint!==checkpointIdentity.repositoryFingerprint||receipt.planFingerprint!==checkpointIdentity.planFingerprint)return false;
+  if(auditIndex&&auditIndex.conflicts&&auditIndex.conflicts.has(normalized))return false;
+  const targetAbs=checkpointTargetAbsolute(cleanRoot,normalized);
+  if(!targetAbs||!fs.existsSync(targetAbs)||!fs.statSync(targetAbs).isFile())return false;
+  const actualSha256=crypto.createHash('sha256').update(fs.readFileSync(targetAbs)).digest('hex');
+  return actualSha256===receipt.outputSha256;
+}
+function checkpointSyntaxQuickCheck(targetAbs){
+  const extension=path.extname(targetAbs).toLowerCase();
+  if(extension==='.js'||extension==='.cjs'||extension==='.mjs'){
+    const syntaxResult=spawnSync(process.execPath,['--check',targetAbs],{encoding:'utf8'});
+    return !syntaxResult.error&&syntaxResult.status===0;
+  }
+  if(extension==='.py'){
+    const pyResult=spawnSync('python',['-m','py_compile',targetAbs],{encoding:'utf8'});
+    return !pyResult.error&&pyResult.status===0;
+  }
+  return fs.statSync(targetAbs).size>0;
+}
+function migrateLegacyCheckpointReceipts(codePath,cleanRoot,checkpointIdentity){
+  if(!fs.existsSync(codePath))return;
+  const auditText=fs.readFileSync(codePath,'utf8'),auditIndex=parseCheckpointAudit(auditText),legacyPattern=/^### FILE:\s*(.+?)\s*$/gm;
+  const migrated=[],seen=new Set();
+  let match;
+  while((match=legacyPattern.exec(auditText))!==null){
+    const target=normalizeCheckpointTarget(match[1]);
+    if(!target||seen.has(target)||(auditIndex.fileReceipts&&auditIndex.fileReceipts.has(target)))continue;
+    seen.add(target);
+    const targetAbs=checkpointTargetAbsolute(cleanRoot,target);
+    if(!targetAbs||!fs.existsSync(targetAbs)||!fs.statSync(targetAbs).isFile()||!checkpointSyntaxQuickCheck(targetAbs))continue;
+    const outputSha256=crypto.createHash('sha256').update(fs.readFileSync(targetAbs)).digest('hex');
+    migrated.push('<!-- CHECKPOINT_FILE_VERIFIED target='+target+' inputSha256='+outputSha256+' outputSha256='+outputSha256+' repositoryFingerprint='+checkpointIdentity.repositoryFingerprint+' planFingerprint='+checkpointIdentity.planFingerprint+' parserMode=LEGACY_VERIFIED_MIGRATION verificationBasis=CURRENT_STATE_MIGRATION migrationSource=LEGACY_FILE_HEADER historicalOutputProvenance=UNPROVEN syntax=PASS quickCheck=PASS status=VERIFIED -->');
+  }
+  if(migrated.length>0)fs.appendFileSync(codePath,NL+NL+migrated.join(NL)+NL,'utf8');
+}
+function appendBatchAudit(codePath,receipt,parsed,cleanRoot,checkpointIdentity){
+  if(!cleanRoot)cleanRoot=path.resolve(path.dirname(codePath),'..','..');
+  if(!checkpointIdentity)checkpointIdentity=computeCheckpointIdentity(cleanRoot,'');
+  const targetSetSha256=crypto.createHash('sha256').update(JSON.stringify(parsed.map(x=>normalizeCheckpointTarget(x.relPath)).sort())).digest('hex');
+  const header=NL+NL+'<!-- CHECKPOINT_BATCH_VERIFIED batchId='+receipt.batchId+' targetSetSha256='+targetSetSha256+' repositoryFingerprint='+(checkpointIdentity?checkpointIdentity.repositoryFingerprint:'')+' planFingerprint='+(checkpointIdentity?checkpointIdentity.planFingerprint:'')+' status=VERIFIED -->'+NL+'<!-- '+receipt.batchId+' -->'+NL;
+  const entries=parsed.map(function(x){
+    const target=normalizeCheckpointTarget(x.relPath),targetAbs=checkpointTargetAbsolute(cleanRoot,target);
+    if(!targetAbs||!fs.existsSync(targetAbs)||!fs.statSync(targetAbs).isFile())throw new Error('CHECKPOINT_TARGET_NOT_FOUND: '+target);
+    const outputSha256=crypto.createHash('sha256').update(fs.readFileSync(targetAbs)).digest('hex');
+    const inputSha256=/^[a-f0-9]{64}$/i.test(String(x.inputSha256||''))?String(x.inputSha256).toLowerCase():outputSha256;
+    return '<!-- CHECKPOINT_FILE_VERIFIED target='+target+' inputSha256='+inputSha256+' outputSha256='+outputSha256+' repositoryFingerprint='+(checkpointIdentity?checkpointIdentity.repositoryFingerprint:'')+' planFingerprint='+(checkpointIdentity?checkpointIdentity.planFingerprint:'')+' parserMode=FENCED verificationBasis=BATCH_APPLY migrationSource=NEW_APPLY historicalOutputProvenance=VERIFIED syntax=PASS quickCheck=PASS status=VERIFIED -->'+NL+'### FILE: '+target+NL+FENCE3+path.extname(target).slice(1)+NL+x.code+NL+FENCE3;
+  });
+  fs.appendFileSync(codePath,header+entries.join(NL+NL),'utf8');
+}
+function persistCheckpointReceiptOnce(codePath,receipt,parsedFiles,cleanRoot,checkpointIdentity){
+  const auditText=fs.existsSync(codePath)?fs.readFileSync(codePath,'utf8'):'';
+  const auditIndex=parseCheckpointAudit(auditText);
+  const unpersisted=parsedFiles.filter(function(item){
+    const target=normalizeCheckpointTarget(item.relPath);
+    return !isTargetVerifiedForCheckpoint(auditIndex,target,cleanRoot,checkpointIdentity);
+  });
+  if(unpersisted.length>0){
+    appendBatchAudit(codePath,receipt,unpersisted,cleanRoot,checkpointIdentity);
+  }
+}
+async function dispatchChunkedEngineTurn(engine,cleanRoot,prompt,attachment,opts){opts=opts||{};const common={tabKey:engine,projectRoot:cleanRoot,promptText:prompt,attachmentPaths:[attachment],bundlePath:attachment,isPlanner:Boolean(opts.isPlanner),userRequest:opts.userRequest||'',forceFreshChat:opts.forceFreshChat!==false,useProvidedBundle:opts.useProvidedBundle===true,backoffMs:opts.backoffMs,sleepFn:opts.sleepFn,disableInternalRetry:opts.disableInternalRetry===true,reasoningLevel:'high',modelTier:opts.modelTier||'neon',hardCapMs:opts.hardCapMs};return engine.startsWith('google_search_')?dispatchToGoogleSearchAiTab(common):dispatchToWebTab(common);}
+function getFailoverEngines(primaryEngine,excludedSet){const e=excludedSet instanceof Set?excludedSet:new Set(excludedSet||[]),orders={gemini2:['gemini3','gemini1','web2'],gemini3:['gemini2','gemini1','web2'],gemini1:['gemini3','gemini2','web2'],web2:['web1'],web1:['web2'],google_search_1:['google_search_2','google_search_3','web1'],google_search_2:['google_search_3','google_search_1','web1'],google_search_3:['google_search_1','google_search_2','web1']};return (orders[primaryEngine]||[]).filter(function(engine){if(e.has(engine)||engine===primaryEngine)return false;const profile=getProfileNameForTab(engine),profileExists=fs.existsSync(path.join(PROFILES_DIR,profile));return Object.prototype.hasOwnProperty.call(tabs,engine)&&(profileExists||tabs[engine]!==null||tabAuthStatus[engine]==='ACTIVE');});}
 function isEngineFailoverEligible(code){return /BATCH_RECOVERY_EXHAUSTED|GEMINI_CONVERSATION_RESET_AFTER_SEND|GEMINI_TURN_ROLLED_BACK_AFTER_SEND|GEMINI_SILENT_PREFLIGHT_TIMEOUT|GEMINI_THINKING_STALL|GEMINI_HARD_CAP_TIMEOUT|WEB_SERVICE_REFUSAL|SERVICE_REFUSAL|WEB_TRANSIENT_SERVICE_ERROR|WEB_PAYLOAD_REJECTED_OR_OVERSIZED|WEB_QUOTA_OR_LIMIT_ERROR|SEARCH_AI_RESPONSE_TIMEOUT|SEARCH_AI_CAPTCHA_REQUIRED|PLANNER_ESCALATION_FAILED|FORCED_CHAT_RESET_VERIFICATION_FAILED|CHAT_RESET_VERIFICATION_FAILED|MODEL_OPTION_NOT_FOUND|MODEL_TIER_NOT_FOUND|MODEL_MENU_TIMEOUT|MODEL_TRIGGER_TIMEOUT|MODEL_SELECTION_UNVERIFIED|FIRST_TOKEN_TIMEOUT|GEMINI_FIRST_TOKEN_TIMEOUT/.test(String(code||''));}
-async function dispatchPlannerWithFailover(state,routing,cleanRoot,prompt,attachment,opts){opts=opts||{};state.failedEngines=state.failedEngines||new Set();state.engineFailoverCount=0;state.totalEngineFailoverCount=state.totalEngineFailoverCount||0;state.activeGeminiModelTier='argon_high';const batchLocalFailedEngines=new Set();let engine=state.activePlannerEngine||routing.roles.planner;while(true){try{const result=await dispatchChunkedEngineTurn(engine,cleanRoot,prompt,attachment,Object.assign({},opts,{modelTier:engine.startsWith('gemini')?state.activeGeminiModelTier:'argon_high',disableInternalRetry:engine.startsWith('gemini')?true:Boolean(opts.disableInternalRetry)}));state.activePlannerEngine=engine;return result;}catch(err){const code=String(err&&err.message||err),backend=/GEMINI_CONVERSATION_RESET_AFTER_SEND|GEMINI_TURN_ROLLED_BACK_AFTER_SEND|GEMINI_SILENT_PREFLIGHT_TIMEOUT|GEMINI_THINKING_STALL|GEMINI_HARD_CAP_TIMEOUT|WEB_SERVICE_REFUSAL|SERVICE_REFUSAL|WEB_TRANSIENT_SERVICE_ERROR|WEB_PAYLOAD_REJECTED_OR_OVERSIZED|MODEL_OPTION_NOT_FOUND/.test(code);if(!isEngineFailoverEligible(code)||state.engineFailoverCount>=3)throw err;batchLocalFailedEngines.add(engine);const next=getFailoverEngines(engine,batchLocalFailedEngines)[0];if(!next)throw err;console.error('[PLANNER_ENGINE_FAILOVER] from='+engine+' to='+next+' reason='+code.split(' ')[0]);state.engineFailoverCount++;state.totalEngineFailoverCount++;console.error('[ACCOUNT_FAILOVER_SELECTED] requestedTier=argon_high verifiedTier=unavailable account='+engine+' reason='+code.split(' ')[0]+' nextEngine='+next);engine=next;state.activePlannerEngine=next;}}}
+async function dispatchPlannerWithFailover(state,routing,cleanRoot,prompt,attachment,opts){opts=opts||{};state.failedEngines=state.failedEngines||new Set();state.engineFailoverCount=0;state.totalEngineFailoverCount=state.totalEngineFailoverCount||0;state.activeGeminiModelTier='neon';const batchLocalFailedEngines=new Set();let engine=state.activePlannerEngine||routing.roles.planner;while(true){try{const result=await dispatchChunkedEngineTurn(engine,cleanRoot,prompt,attachment,Object.assign({},opts,{modelTier:engine.startsWith('gemini')?state.activeGeminiModelTier: 'neon',disableInternalRetry:engine.startsWith('gemini')?true:Boolean(opts.disableInternalRetry)}));state.activePlannerEngine=engine;return result;}catch(err){const code=String(err&&err.message||err),backend=/GEMINI_CONVERSATION_RESET_AFTER_SEND|GEMINI_TURN_ROLLED_BACK_AFTER_SEND|GEMINI_SILENT_PREFLIGHT_TIMEOUT|GEMINI_THINKING_STALL|GEMINI_HARD_CAP_TIMEOUT|WEB_SERVICE_REFUSAL|SERVICE_REFUSAL|WEB_TRANSIENT_SERVICE_ERROR|WEB_PAYLOAD_REJECTED_OR_OVERSIZED|MODEL_OPTION_NOT_FOUND/.test(code);if(!isEngineFailoverEligible(code)||state.engineFailoverCount>=3)throw err;batchLocalFailedEngines.add(engine);const next=getFailoverEngines(engine,batchLocalFailedEngines)[0];if(!next)throw err;console.error('[PLANNER_ENGINE_FAILOVER] from='+engine+' to='+next+' reason='+code.split(' ')[0]);state.engineFailoverCount++;state.totalEngineFailoverCount++;console.error('[ACCOUNT_FAILOVER_SELECTED] requestedTier=argon_high verifiedTier=unavailable account='+engine+' reason='+code.split(' ')[0]+' nextEngine='+next);engine=next;state.activePlannerEngine=next;}}}
 async function executeCodingLeaf(batch,state,routing,job,opts){
-  opts=opts||{};batch.targets=batch.targets.map(normalizeBatchTarget);state.routing=routing;const coderEngine=opts.coderEngine||state.activeCoderEngine||routing.roles.coder;state.activeCoderEngine=coderEngine;job.activeCoderEngine=coderEngine;state.activeGeminiModelTier='argon_high';const modelTier=opts.modelTier||state.activeGeminiModelTier;job.activeModelTier=modelTier;
-  const context=buildMinimalBatchContext(batch,state,CHUNK_ENGINE_LIMITS),transport=selectCodingTransport(context,CHUNK_ENGINE_LIMITS),exchangeDir=path.join(state.scan.projectRoot,'.antigravity','bridge','exchange'),contextPath=path.join(exchangeDir,'b_'+batch.batchId.replace(/^BATCH-?/i,'').replace(/^INTEGRATION-REPAIR-?/i,'r').replace(/[^A-Za-z0-9]/g,'').slice(0,6)+'.txt'),rules=fs.readFileSync(path.join(PLUGIN_ROOT,'rules','coder_rules.md'),'utf8'),instruction=rules+NL+NL+'Implemento VETEM target-et ('+batch.targets.join(', ')+'). Kthe VETEM blloqe ### FILE: path me permbajtje te plote.';
+  opts=opts||{};batch.targets=batch.targets.map(normalizeBatchTarget);state.routing=routing;const coderEngine=opts.coderEngine||state.activeCoderEngine||routing.roles.coder;state.activeCoderEngine=coderEngine;job.activeCoderEngine=coderEngine;state.activeGeminiModelTier='neon';const modelTier=opts.modelTier||state.activeGeminiModelTier;job.activeModelTier=modelTier;
+  const context=buildMinimalBatchContext(batch,state,CHUNK_ENGINE_LIMITS),transport=selectCodingTransport(context,CHUNK_ENGINE_LIMITS),exchangeDir=path.join(state.scan.projectRoot,'.antigravity','bridge','exchange'),codePath=path.join(exchangeDir,'code.md'),checkpointIdentity=computeCheckpointIdentity(state.scan.projectRoot,state.planSlice),contextPath=path.join(exchangeDir,'b_'+batch.batchId.replace(/^BATCH-?/i,'').replace(/^INTEGRATION-REPAIR-?/i,'r').replace(/[^A-Za-z0-9]/g,'').slice(0,6)+'.txt'),rules=fs.readFileSync(path.join(PLUGIN_ROOT,'rules','coder_rules.md'),'utf8'),instruction=rules+NL+NL+'Implemento VETEM target-et ('+batch.targets.join(', ')+'). Kthe VETEM blloqe ### FILE: path me permbajtje te plote.';
   job.currentBatchId=batch.batchId;job.currentTargets=batch.targets;job.bytesInContext=context.bytes;job.transport=transport.transport;job.reasoningLevel=opts.reasoningLevel||'high';job.attempt=(opts.recoveryAttempt||0)+1;job.handshakeStatus=transport.twoStepIngest?'PENDING':'NOT_REQUIRED';console.error('[BATCH_CONTEXT_MINIMIZED] batchId='+batch.batchId+' bytes='+context.bytes+' miniMapBytes='+context.miniMapBytes+' planSliceBytes='+context.planSliceBytes);console.error('[CODING_TRANSPORT_SELECTED] batchId='+batch.batchId+' transport='+transport.transport+' attachmentCount='+transport.attachmentCount);
   const dispatch=function(prompt,attachment,forceFreshChat){return dispatchChunkedEngineTurn(coderEngine,state.scan.projectRoot,prompt,attachment,{forceFreshChat:forceFreshChat,disableInternalRetry:true,reasoningLevel:'high',modelTier:modelTier,backoffMs:opts.backoffMs,sleepFn:opts.sleepFn,useProvidedBundle:Boolean(attachment)});};
   let output;if(transport.transport==='INLINE'){job.handshakeStatus='NOT_REQUIRED';output=await dispatch(instruction+NL+NL+context.text,null,true);}else{fs.writeFileSync(contextPath,context.text,'utf8');if(coderEngine.startsWith('gemini')){await runGeminiAttachmentIngestHandshake({tabKey:coderEngine,projectRoot:state.scan.projectRoot,attachmentPath:contextPath,batchId:batch.batchId,reasoningLevel:'high',modelTier:modelTier,forceFreshChat:true});job.handshakeStatus='VERIFIED';output=await dispatch(instruction,null,false);}else{job.handshakeStatus='DIRECT_ATTACHMENT';output=await dispatch(instruction,contextPath,true);}}
   const expected=new Set(batch.targets);
   const parseExpected=function(text){const all=parseCodeBlocksFromMarkdown(text,batch.targets).map(function(x){return Object.assign({},x,{relPath:normalizeBatchTarget(x.relPath)});}),received=new Set(all.map(function(x){return x.relPath;})),missing=batch.targets.filter(function(x){return !received.has(x);});return {all:all,parsed:missing.length===0?all.filter(function(x){return expected.has(x.relPath);}):all,missing:missing,extra:all.map(function(x){return x.relPath;}).filter(function(x){return !expected.has(x);})};};
   let formatRepairUsed=Boolean(opts.formatRepairUsed);const repairFormat=async function(failure){if(formatRepairUsed)throw new Error(failure);formatRepairUsed=true;console.error('[BATCH_FORMAT_REPAIR] batchId='+batch.batchId+' reason='+failure.slice(0,160));const repairPrompt='KORRIGJIM I VETEM FORMATI/SINTAKSE. '+failure+NL+'Kthe VETEM target-et e autorizuara: '+batch.targets.join(', ')+NL+'Per secilin perdor saktesisht ### FILE: path, pastaj nje code fence me permbajtjen e plote. Mos jep snippets ose skedare ekstra.';return dispatch(repairPrompt,null,false);};
-  let parsedResult=parseExpected(output);if(parsedResult.missing.length){const detail='BATCH_OUTPUT_INCOMPLETE: missing=['+parsedResult.missing.join(',')+'] extra=['+parsedResult.extra.join(',')+']';state.lastErrorReceipt=detail;output=await repairFormat(detail);parsedResult=parseExpected(output);if(parsedResult.missing.length)throw new Error('BATCH_OUTPUT_INCOMPLETE: missing=['+parsedResult.missing.join(',')+'] extra=['+parsedResult.extra.join(',')+']');}
+  let parsedResult=parseExpected(output);if(parsedResult.missing.length){
+    const validParsed=parsedResult.parsed.filter(function(x){return expected.has(x.relPath)&&!parsedResult.missing.includes(x.relPath);});
+    if(validParsed.length>0){
+      try{
+        const appliedPartial=applyBatch({projectRoot:state.scan.projectRoot,batch:{targets:validParsed.map(function(x){return x.relPath;})},parsedFiles:validParsed});
+        const quickPartial=runBatchQuickChecks({projectRoot:state.scan.projectRoot,writtenFiles:appliedPartial.filesWritten});
+        if(quickPartial.status==='CHECK_PASSED'){
+          const partialReceipt={batchId:batch.batchId+'.partial',filesWritten:appliedPartial.filesWritten,fileHashes:Object.fromEntries(appliedPartial.filesWritten.map(function(x){return [x,crypto.createHash('sha256').update(fs.readFileSync(path.join(state.scan.projectRoot,x))).digest('hex')];})),quickCheckResult:quickPartial,parsedFiles:validParsed};
+          persistCheckpointReceiptOnce(codePath,partialReceipt,validParsed,state.scan.projectRoot,checkpointIdentity);
+        }
+      }catch(_) {}
+    }
+    const detail='BATCH_OUTPUT_INCOMPLETE: missing=['+parsedResult.missing.join(',')+'] extra=['+parsedResult.extra.join(',')+']';
+    state.lastErrorReceipt=detail;output=await repairFormat(detail);parsedResult=parseExpected(output);
+    if(parsedResult.missing.length){
+      const repairedValidParsed=parsedResult.parsed.filter(function(x){return expected.has(x.relPath)&&!parsedResult.missing.includes(x.relPath);});
+      if(repairedValidParsed.length>0){
+        try{
+          const appliedRepairedPartial=applyBatch({projectRoot:state.scan.projectRoot,batch:{targets:repairedValidParsed.map(function(x){return x.relPath;})},parsedFiles:repairedValidParsed});
+          const quickRepairedPartial=runBatchQuickChecks({projectRoot:state.scan.projectRoot,writtenFiles:appliedRepairedPartial.filesWritten});
+          if(quickRepairedPartial.status==='CHECK_PASSED'){
+            const repairedPartialReceipt={batchId:batch.batchId+'.partial',filesWritten:appliedRepairedPartial.filesWritten,fileHashes:Object.fromEntries(appliedRepairedPartial.filesWritten.map(function(x){return [x,crypto.createHash('sha256').update(fs.readFileSync(path.join(state.scan.projectRoot,x))).digest('hex')];})),quickCheckResult:quickRepairedPartial,parsedFiles:repairedValidParsed};
+            persistCheckpointReceiptOnce(codePath,repairedPartialReceipt,repairedValidParsed,state.scan.projectRoot,checkpointIdentity);
+          }
+        }catch(_) {}
+      }
+      throw new Error('BATCH_OUTPUT_INCOMPLETE: missing=['+parsedResult.missing.join(',')+'] extra=['+parsedResult.extra.join(',')+']');
+    }
+  }
   let applied=applyBatch({projectRoot:state.scan.projectRoot,batch:batch,parsedFiles:parsedResult.parsed}),quick=runBatchQuickChecks({projectRoot:state.scan.projectRoot,writtenFiles:applied.filesWritten});
   if(quick.status!=='CHECK_PASSED'){for(const backup of applied.backups){const abs=path.join(state.scan.projectRoot,backup.path);if(backup.exists)fs.writeFileSync(abs,backup.content);else if(fs.existsSync(abs))fs.unlinkSync(abs);}const detail='BATCH_SYNTAX_OR_QUICK_CHECK_FAILED: '+JSON.stringify(quick.receipts);state.lastErrorReceipt=detail;output=await repairFormat(detail);parsedResult=parseExpected(output);if(parsedResult.missing.length)throw new Error('BATCH_OUTPUT_INCOMPLETE: missing=['+parsedResult.missing.join(',')+'] extra=['+parsedResult.extra.join(',')+']');applied=applyBatch({projectRoot:state.scan.projectRoot,batch:batch,parsedFiles:parsedResult.parsed});quick=runBatchQuickChecks({projectRoot:state.scan.projectRoot,writtenFiles:applied.filesWritten});if(quick.status!=='CHECK_PASSED')throw new Error('BATCH_SYNTAX_OR_QUICK_CHECK_FAILED: '+JSON.stringify(quick.receipts));}
   return {batchId:batch.batchId,filesWritten:applied.filesWritten,fileHashes:Object.fromEntries(applied.filesWritten.map(function(x){return [x,crypto.createHash('sha256').update(fs.readFileSync(path.join(state.scan.projectRoot,x))).digest('hex')];})),quickCheckResult:quick,parsedFiles:parsedResult.parsed,contextBytes:context.bytes,transport:transport.transport,reasoningLevel:'high',attempt:(opts.recoveryAttempt||0)+1,handshakeStatus:job.handshakeStatus};
 }
-async function executeBatchWithRecovery(batch,state,routing,job,opts){opts=opts||{};state.failedEngines=state.failedEngines||new Set();state.engineFailoverCount=state.engineFailoverCount||0;state.totalEngineFailoverCount=state.totalEngineFailoverCount||0;state.activeGeminiModelTier='argon_high';const failoverScope=opts.failoverScope||{localFailoverCount:0,batchLocalFailedEngines:new Set()};opts.failoverScope=failoverScope;const initialEngine=opts.coderEngine||state.activeCoderEngine||routing.roles.coder;try{return [await executeCodingLeaf(batch,state,routing,job,Object.assign({},opts,{coderEngine:initialEngine,reasoningLevel:selectAdaptiveReasoningLevel(opts)}))];}catch(err){const code=String(err&&err.message||err),geminiBackendReset=/GEMINI_CONVERSATION_RESET_AFTER_SEND|GEMINI_TURN_ROLLED_BACK_AFTER_SEND|GEMINI_SILENT_PREFLIGHT_TIMEOUT|GEMINI_THINKING_STALL|GEMINI_HARD_CAP_TIMEOUT|WEB_SERVICE_REFUSAL|SERVICE_REFUSAL|WEB_TRANSIENT_SERVICE_ERROR|WEB_PAYLOAD_REJECTED_OR_OVERSIZED|MODEL_OPTION_NOT_FOUND/.test(code);const exhausted='BATCH_RECOVERY_EXHAUSTED: '+batch.batchId+' '+String(err&&err.message||err);if(!isEngineFailoverEligible(exhausted)||failoverScope.localFailoverCount>=3)throw new Error(exhausted);failoverScope.batchLocalFailedEngines.add(initialEngine);state.failedEngines.add(initialEngine);const nextEngine=getFailoverEngines(initialEngine,failoverScope.batchLocalFailedEngines)[0];if(!nextEngine)throw new Error(exhausted);failoverScope.localFailoverCount++;state.engineFailoverCount=failoverScope.localFailoverCount;state.totalEngineFailoverCount++;state.activeCoderEngine=nextEngine;job.activeCoderEngine=nextEngine;console.error('[CODER_ENGINE_FAILOVER] from='+initialEngine+' to='+nextEngine+' batchId='+batch.batchId+' reason='+String(err&&err.message||err).split(' ')[0]);return executeBatchWithRecovery(batch,state,routing,job,{coderEngine:nextEngine,modelTier:state.activeGeminiModelTier,recoveryAttempt:0,reasoningLevel:'high',backoffMs:opts.backoffMs,sleepFn:opts.sleepFn,failoverScope:failoverScope});}}
+async function executeBatchWithRecovery(batch,state,routing,job,opts){
+  opts=opts||{};state.failedEngines=state.failedEngines||new Set();state.engineFailoverCount=state.engineFailoverCount||0;state.totalEngineFailoverCount=state.totalEngineFailoverCount||0;
+  const failoverScope=opts.failoverScope||{localFailoverCount:0,batchLocalFailedEngines:new Set()};opts.failoverScope=failoverScope;
+  const codePath=path.join(state.scan.projectRoot,'.antigravity','bridge','exchange','code.md');
+  const auditIndex=parseCheckpointAudit(fs.existsSync(codePath)?fs.readFileSync(codePath,'utf8'):'');
+  const checkpointIdentity=computeCheckpointIdentity(state.scan.projectRoot,state.planSlice);
+  const unresolvedTargets=batch.targets.map(normalizeCheckpointTarget).filter(function(target){return !isTargetVerifiedForCheckpoint(auditIndex,target,state.scan.projectRoot,checkpointIdentity);});
+  if(!unresolvedTargets.length){
+    return [{batchId:batch.batchId,filesWritten:batch.targets.map(normalizeCheckpointTarget),fileHashes:{},quickCheckResult:{status:'CHECK_PASSED'},parsedFiles:[],skippedFromCheckpoint:true}];
+  }
+  const activeBatch=Object.assign({},batch,{targets:unresolvedTargets});
+  const initialEngine=opts.coderEngine||state.activeCoderEngine||routing.roles.coder;
+  const level=Number(opts.halvingLevel||0);
+  try{
+    return [await executeCodingLeaf(activeBatch,state,routing,job,Object.assign({},opts,{coderEngine:initialEngine,reasoningLevel:selectAdaptiveReasoningLevel(opts)}))];
+  }catch(err){
+    const freshAuditText=fs.existsSync(codePath)?fs.readFileSync(codePath,'utf8'):'';
+    const freshAuditIndex=parseCheckpointAudit(freshAuditText);
+    const unresolvedTargetsAfterCatch=activeBatch.targets.filter(function(target){return !isTargetVerifiedForCheckpoint(freshAuditIndex,target,state.scan.projectRoot,checkpointIdentity);});
+    if(!unresolvedTargetsAfterCatch.length){
+      return [{batchId:activeBatch.batchId,filesWritten:activeBatch.targets,fileHashes:{},quickCheckResult:{status:'CHECK_PASSED'},parsedFiles:[],skippedFromCheckpoint:true}];
+    }
+    const batchToHalve=Object.assign({},activeBatch,{targets:unresolvedTargetsAfterCatch});
+    if(batchToHalve.targets.length>1&&level<CHUNK_ENGINE_LIMITS.maxHalvingLevel&&isAdaptiveHalvingFailure(err)){
+      const batchCosts=opts.batchCosts||(state.scan&&state.scan.files?Object.fromEntries(state.scan.files.map(function(f){return [normalizeCheckpointTarget(f.path),Number(f.bytes||0)];})):null);
+      const subBatches=halveBatchAdaptively(batchToHalve,batchCosts,level);
+      if(subBatches.length>1){
+        console.error('[ADAPTIVE_BATCH_HALVING] batchId='+batchToHalve.batchId+' targets='+batchToHalve.targets.length+' subBatches='+subBatches.map(function(subBatch){return subBatch.batchId+':'+subBatch.targets.length;}).join(',')+' reason='+normalizeFailureCode(err));
+        const results=[];
+        for(const subBatch of subBatches){
+          const subReceipts=await executeBatchWithRecovery(subBatch,state,routing,job,Object.assign({},opts,{coderEngine:initialEngine,halvingLevel:level+1,batchCosts:batchCosts,failoverScope:{localFailoverCount:0,batchLocalFailedEngines:new Set()}}));
+          for(const r of subReceipts){
+            results.push(r);
+            if(r.parsedFiles&&r.parsedFiles.length&&!r.skippedFromCheckpoint){
+              persistCheckpointReceiptOnce(codePath,r,r.parsedFiles,state.scan.projectRoot,checkpointIdentity);
+              r.checkpointPersisted=true;
+            }
+          }
+        }
+        return results;
+      }
+    }
+    const exhausted='BATCH_RECOVERY_EXHAUSTED: '+batchToHalve.batchId+' '+String(err&&err.message||err);
+    if(batchToHalve.targets.length>1||!isEngineFailoverEligible(exhausted)||failoverScope.localFailoverCount>=2)throw new Error(exhausted);
+    failoverScope.batchLocalFailedEngines.add(initialEngine);
+    state.failedEngines.add(initialEngine);
+    const nextEngine=getFailoverEngines(initialEngine,failoverScope.batchLocalFailedEngines)[0];
+    if(!nextEngine)throw new Error(exhausted);
+    failoverScope.localFailoverCount++;
+    state.engineFailoverCount=failoverScope.localFailoverCount;
+    state.totalEngineFailoverCount++;
+    state.activeCoderEngine=nextEngine;
+    job.activeCoderEngine=nextEngine;
+    console.error('[CODER_ENGINE_FAILOVER] from='+initialEngine+' to='+nextEngine+' batchId='+batchToHalve.batchId+' reason='+normalizeFailureCode(err));
+    return executeBatchWithRecovery(batchToHalve,state,routing,job,{coderEngine:nextEngine,recoveryAttempt:0,reasoningLevel:'high',backoffMs:opts.backoffMs,sleepFn:opts.sleepFn,failoverScope:failoverScope,halvingLevel:level,batchCosts:opts.batchCosts});
+  }
+}
 // ---------------- 25-SECOND NON-BLOCKING AUTOPILOT ENGINE ----------------
 const activeCycleJobs = {};
-async function runAutonomousPipeline(cleanRoot,userRequest){const job=activeCycleJobs[cleanRoot]={running:true,phase:'DISCOVERY',startedAt:Date.now(),result:null,error:null,completed:0,total:0,currentBatchId:null,currentTargets:[],bytesInContext:0,retriesUsed:0,halvingUsed:0,lastCheckStatus:'PENDING'};try{const routing=ensureProjectSetup(cleanRoot),exchangeDir=path.join(cleanRoot,'.antigravity','bridge','exchange'),planPath=path.join(exchangeDir,'plan.md'),codePath=path.join(exchangeDir,'code.md'),reviewPath=path.join(exchangeDir,'review.md'),logPath=path.join(exchangeDir,'build_test.log'),scan=scanRepositoryUniversal(cleanRoot),graph=buildDependencyGraph(scan),repoMap=buildCompactRepoMap(scan,CHUNK_ENGINE_LIMITS),embeddedSpecs=resolveAndEmbedExternalFiles(userRequest),totalRelevantSourceBytes=scan.files.filter(f=>f.generatedScore===0).reduce((n,f)=>n+f.bytes,0)+Buffer.byteLength(embeddedSpecs);job.repoMapReceipt={bytes:repoMap.bytes,sha256:repoMap.sha256,repoFingerprint:scan.repoFingerprint};const planningState={activePlannerEngine:routing.roles.planner,failedEngines:new Set(),engineFailoverCount:0,activeGeminiModelTier:'argon_high'};let planText='';if(totalRelevantSourceBytes<=CHUNK_ENGINE_LIMITS.planningSafe){job.phase='PLANNING_SINGLE_PASS';const relevant=[];for(const f of scan.files.filter(x=>x.generatedScore===0)){const inspected=inspectTextBuffer(fs.readFileSync(path.join(cleanRoot,f.path)));if(inspected.isText)relevant.push('### FILE: '+f.path+NL+inspected.text);}const planning=buildFinalPlanningContext({userRequest:userRequest,repoMap:repoMap,summaries:[],criticalWindows:relevant.join(NL+NL)+NL+embeddedSpecs,totalRelevantBytes:totalRelevantSourceBytes}),physical=path.join(exchangeDir,'planning_context.txt');fs.writeFileSync(physical,planning.text,'utf8');planText=await dispatchPlannerWithFailover(planningState,routing,cleanRoot,buildSearchAiCleanPrompt('plan'),physical,{isPlanner:true,useProvidedBundle:true,userRequest:userRequest,forceFreshChat:true});}else{const chunks=partitionAnalysisChunks(scan,graph,CHUNK_ENGINE_LIMITS),ranked=chunks.map(function(chunk,index){return {chunk:chunk,index:index,score:scoreAnalysisChunkRelevance(chunk,scan,graph,userRequest)};}).sort(function(a,b){return b.score-a.score||a.index-b.index;}),webIds=new Set(ranked.slice(0,CHUNK_ENGINE_LIMITS.maxWebAnalysisChunks).map(function(x){return x.chunk.chunkId;})),webChunks=chunks.filter(function(chunk){return webIds.has(chunk.chunkId);}),summaries=chunks.filter(function(chunk){return !webIds.has(chunk.chunkId);}).map(function(chunk){const text=buildLocalStructuralChunkSummary(chunk,scan);return {chunkId:chunk.chunkId,text:text,bytes:Buffer.byteLength(text)};});job.total=webChunks.length;for(let i=0;i<webChunks.length;i++){job.phase='PLANNING_CHUNK '+(i+1)+'/'+webChunks.length;job.completed=i;const chunk=webChunks[i],physical=writeChunkContextFile(exchangeDir,chunk,scan,CHUNK_ENGINE_LIMITS.chunkHard),prompt='Analizo vetem kete chunk. Kthe structured summary me CHUNK_ID: '+chunk.chunkId+' dhe seksionet MODULES, RESPONSIBILITIES, ENTRY_POINTS, PUBLIC_CONTRACTS, KEY_SYMBOLS, DEPENDENCIES_IN, DEPENDENCIES_OUT, DATA/SCHEMAS, SIDE_EFFECTS, RISKS, TESTS, RELEVANT_FILES, POSSIBLE_CHANGE_TARGETS, UNRESOLVED_QUESTIONS.';let text;try{text=await dispatchPlannerWithFailover(planningState,routing,cleanRoot,prompt,physical.path,{isPlanner:false,useProvidedBundle:true,forceFreshChat:true});}catch(err){text=await dispatchPlannerWithFailover(planningState,routing,cleanRoot,prompt,physical.path,{isPlanner:false,useProvidedBundle:true,forceFreshChat:true});}text=truncateUtf8(text,CHUNK_ENGINE_LIMITS.summaryHard);if(!text.includes('CHUNK_ID: '+chunk.chunkId))text='CHUNK_ID: '+chunk.chunkId+NL+text;summaries.push({chunkId:chunk.chunkId,text:text,bytes:Buffer.byteLength(text)});}summaries.sort(function(a,b){return a.chunkId.localeCompare(b.chunkId);});job.phase='PLANNING_FINAL';const finalContext=buildFinalPlanningContext({userRequest:userRequest,repoMap:repoMap,summaries:summaries,criticalWindows:embeddedSpecs,totalRelevantBytes:totalRelevantSourceBytes}),planningPath=path.join(exchangeDir,'planning_context.txt');fs.writeFileSync(planningPath,finalContext.text,'utf8');planText=await dispatchPlannerWithFailover(planningState,routing,cleanRoot,buildSearchAiCleanPrompt('plan'),planningPath,{isPlanner:true,useProvidedBundle:true,userRequest:userRequest,forceFreshChat:true});}const validated=validatePlanOutput(planText,{requiresFiles:false});if(!validated.ok)throw new Error('PLANNING_FINAL_INVALID');fs.writeFileSync(planPath,planText,'utf8');let batches;try{batches=parseAndValidatePlanBatches(planText,graph,scan);}catch(_){const fallback=scan.files.filter(f=>f.sourceScore>0&&f.generatedScore===0).slice(0,1).map(f=>f.path);if(!fallback.length)throw new Error('PLANNING_FINAL_INVALID');batches=partitionCodingBatches(fallback,graph,{});}job.total=batches.length;job.completed=0;fs.writeFileSync(codePath,'# CHUNKED ENGINE BATCH AUDIT'+NL,'utf8');const state={scan:scan,graph:graph,repoMap:repoMap,planSlice:planText,contractMemory:'',changedFiles:[],activeCoderEngine:routing.roles.coder,activePlannerEngine:routing.roles.planner,failedEngines:new Set(),engineFailoverCount:0,activeGeminiModelTier:planningState.activeGeminiModelTier||'argon_high'},batchReceipts=[],allWrittenFiles=[];for(let i=0;i<batches.length;i++){job.phase='CODING_BATCH '+(i+1)+'/'+batches.length;const receipts=await executeBatchWithRecovery(batches[i],state,routing,job,{});for(const receipt of receipts){batchReceipts.push(receipt);allWrittenFiles.push(...receipt.filesWritten);appendBatchAudit(codePath,receipt,receipt.parsedFiles);state.contractMemory=buildCrossBatchContractSummary(receipt,state.contractMemory).text;state.changedFiles.push(...receipt.filesWritten);}job.completed=i+1;}job.phase='FINAL_APPLY_AND_TEST';let finalChecks=runFinalBuildAndTests(cleanRoot,180000);fs.writeFileSync(logPath,JSON.stringify(finalChecks,null,2),'utf8');for(let repairRound=1;repairRound<=2&&finalChecks.status!=='CHECK_PASSED';repairRound++){const errorText=JSON.stringify(finalChecks),knownTargets=Array.from(new Set([...allWrittenFiles,...scan.files.map(function(f){return f.path;})])),mentioned=extractTargetsFromError(errorText,knownTargets);if(!mentioned.length)break;job.phase='INTEGRATION_REPAIR';state.lastErrorReceipt='FINAL_APPLY_AND_TEST_FAILED (round '+repairRound+'):'+NL+truncateUtf8(errorText,12000);const repairBatch={batchId:'INTEGRATION-REPAIR-'+repairRound,targets:mentioned.slice(0,2),halvingLevel:1};const receipts=await executeBatchWithRecovery(repairBatch,state,routing,job,{compact:true,singleRetry:true});for(const receipt of receipts){batchReceipts.push(receipt);allWrittenFiles.push(...receipt.filesWritten);appendBatchAudit(codePath,receipt,receipt.parsedFiles);}finalChecks=runFinalBuildAndTests(cleanRoot,180000);fs.writeFileSync(logPath,JSON.stringify(finalChecks,null,2),'utf8');if(finalChecks.status==='CHECK_PASSED')state.lastErrorReceipt='';}if(finalChecks.status!=='CHECK_PASSED')throw new Error('FINAL_APPLY_AND_TEST_FAILED');job.phase='REVIEWING';const diff=spawnSync('git',['diff','--',...Array.from(new Set(allWrittenFiles))],{cwd:cleanRoot,encoding:'utf8'}),review=buildDiffFocusedReviewContext({plan:planText,changedFiles:Array.from(new Set(allWrittenFiles)),diff:(diff.stdout||''),batchReceipts:batchReceipts,finalTests:fs.readFileSync(logPath,'utf8'),knownRisks:[]}),reviewPathContext=path.join(exchangeDir,'rev_ctx.txt');fs.writeFileSync(reviewPathContext,review.chunks.join(NL+NL+'--- REVIEW CHUNK ---'+NL+NL),'utf8');let reviewText='STATUS: PASSED\nSKIPPED: reviewer off',reviewerEngine=routing.roles.reviewer||'off';if(reviewerEngine!=='off'){const reviewerRules=fs.readFileSync(path.join(PLUGIN_ROOT,'rules','reviewer_rules.md'),'utf8'),reviewInline=review.text.length<=CHUNK_ENGINE_LIMITS.maxInlineChars&&review.bytes<=CHUNK_ENGINE_LIMITS.maxInlineBytes,reviewSubject=reviewInline?'kontekstin e meposhtem':path.basename(reviewPathContext)+' te bashkengjitur',baseReviewPrompt=reviewerRules+NL+NL+'Rishiko vetem '+reviewSubject+'. Kthe STATUS: PASSED ose STATUS: CHANGES_REQUIRED.',reviewAttachment=reviewInline?null:reviewPathContext,reviewPrompt=reviewInline?baseReviewPrompt+NL+NL+(review.text||review.chunks[0]||''):baseReviewPrompt,failedReviewEngines=new Set();let reviewAttempt=0;while(reviewAttempt<6){reviewAttempt++;try{if(!reviewInline&&reviewerEngine.startsWith('gemini')){const reviewModelTier=state.activeGeminiModelTier||'argon_high';await runGeminiAttachmentIngestHandshake({tabKey:reviewerEngine,projectRoot:cleanRoot,attachmentPath:reviewPathContext,batchId:'REVIEW',reasoningLevel:'high',modelTier:reviewModelTier,forceFreshChat:true});reviewText=await dispatchChunkedEngineTurn(reviewerEngine,cleanRoot,reviewPrompt,null,{forceFreshChat:false,useProvidedBundle:false,disableInternalRetry:true,reasoningLevel:'high',modelTier:reviewModelTier});}else{reviewText=await dispatchChunkedEngineTurn(reviewerEngine,cleanRoot,reviewPrompt,reviewAttachment,{forceFreshChat:true,useProvidedBundle:!reviewInline,disableInternalRetry:reviewerEngine.startsWith('gemini'),reasoningLevel:'high',modelTier:reviewerEngine.startsWith('gemini')?(state.activeGeminiModelTier||'argon_high'):'argon_high'});}break;}catch(reviewError){const reviewCode=String(reviewError&&reviewError.message||reviewError),reviewBackend=/GEMINI_CONVERSATION_RESET_AFTER_SEND|GEMINI_TURN_ROLLED_BACK_AFTER_SEND|GEMINI_SILENT_PREFLIGHT_TIMEOUT|GEMINI_THINKING_STALL|GEMINI_HARD_CAP_TIMEOUT|WEB_SERVICE_REFUSAL|SERVICE_REFUSAL|WEB_TRANSIENT_SERVICE_ERROR|WEB_PAYLOAD_REJECTED_OR_OVERSIZED|MODEL_OPTION_NOT_FOUND/.test(reviewCode);if(isEngineFailoverEligible(reviewCode)&&failedReviewEngines.size<3){failedReviewEngines.add(reviewerEngine);const nextReviewer=getFailoverEngines(reviewerEngine,failedReviewEngines)[0];if(nextReviewer){console.error('[REVIEWER_ENGINE_FAILOVER] from='+reviewerEngine+' to='+nextReviewer+' reason='+reviewCode.split(' ')[0]);reviewerEngine=nextReviewer;continue;}}throw reviewError;}}}fs.writeFileSync(reviewPath,reviewText,'utf8');const reviewVerdicts=String(reviewText||'').split(/\r?\n/).map(function(line){return line.replace(/[*#]/g,'').trim();}).map(function(line){return line.match(/^STATUS:\s*(APPROVED|PASSED|CHANGES_REQUIRED|FAILED|REJECTED)\b/i);}).filter(Boolean).map(function(match){return match[1].toUpperCase();}),approved=reviewVerdicts.some(function(verdict){return verdict==='APPROVED'||verdict==='PASSED';})&&!reviewVerdicts.some(function(verdict){return verdict==='CHANGES_REQUIRED'||verdict==='FAILED'||verdict==='REJECTED';});job.running=false;job.phase=approved?'COMPLETED':'FAILED_REVIEW';job.result={status:approved?'CYCLE_COMPLETED':'REVIEW_FAILED',verdict:approved?'APPROVED':'CHANGES_REQUIRED',plannerModel:tabActiveModel[routing.roles.planner]||routing.roles.planner,coderModel:tabActiveModel[routing.roles.coder]||routing.roles.coder,reviewerEngine:reviewerEngine,writtenFiles:Array.from(new Set(allWrittenFiles)),commandsExecuted:finalChecks.receipts.map(x=>x.command),batchReceipts:batchReceipts,finalChecks:finalChecks};}catch(err){job.running=false;job.phase='FAILED';job.error=err.message;job.result=null;}}
+async function runAutonomousPipeline(cleanRoot,userRequest){const job=activeCycleJobs[cleanRoot]={running:true,phase:'DISCOVERY',startedAt:Date.now(),result:null,error:null,completed:0,total:0,currentBatchId:null,currentTargets:[],bytesInContext:0,retriesUsed:0,halvingUsed:0,lastCheckStatus:'PENDING'};try{const routing=ensureProjectSetup(cleanRoot),exchangeDir=path.join(cleanRoot,'.antigravity','bridge','exchange'),planPath=path.join(exchangeDir,'plan.md'),codePath=path.join(exchangeDir,'code.md'),reviewPath=path.join(exchangeDir,'review.md'),logPath=path.join(exchangeDir,'build_test.log'),scan=scanRepositoryUniversal(cleanRoot),graph=buildDependencyGraph(scan),repoMap=buildCompactRepoMap(scan,CHUNK_ENGINE_LIMITS),embeddedSpecs=resolveAndEmbedExternalFiles(userRequest),totalRelevantSourceBytes=scan.files.filter(f=>f.generatedScore===0).reduce((n,f)=>n+f.bytes,0)+Buffer.byteLength(embeddedSpecs);job.repoMapReceipt={bytes:repoMap.bytes,sha256:repoMap.sha256,repoFingerprint:scan.repoFingerprint};const planningState={activePlannerEngine:routing.roles.planner,failedEngines:new Set(),engineFailoverCount:0,activeGeminiModelTier: 'neon'};let planText='';if(fs.existsSync(planPath)&&fs.statSync(planPath).size>200){planText=fs.readFileSync(planPath,'utf8');console.error('[CHECKPOINT_PLAN_LOADED] size='+planText.length);}else if(totalRelevantSourceBytes<=CHUNK_ENGINE_LIMITS.planningSafe){job.phase='PLANNING_SINGLE_PASS';const relevant=[];for(const f of scan.files.filter(x=>x.generatedScore===0)){const inspected=inspectTextBuffer(fs.readFileSync(path.join(cleanRoot,f.path)));if(inspected.isText)relevant.push('### FILE: '+f.path+NL+inspected.text);}const planning=buildFinalPlanningContext({userRequest:userRequest,repoMap:repoMap,summaries:[],criticalWindows:relevant.join(NL+NL)+NL+embeddedSpecs,totalRelevantBytes:totalRelevantSourceBytes}),physical=path.join(exchangeDir,'planning_context.txt');fs.writeFileSync(physical,planning.text,'utf8');planText=await dispatchPlannerWithFailover(planningState,routing,cleanRoot,buildSearchAiCleanPrompt('plan'),physical,{isPlanner:true,useProvidedBundle:true,userRequest:userRequest,forceFreshChat:true});}else{const chunks=partitionAnalysisChunks(scan,graph,CHUNK_ENGINE_LIMITS),ranked=chunks.map(function(chunk,index){return {chunk:chunk,index:index,score:scoreAnalysisChunkRelevance(chunk,scan,graph,userRequest)};}).sort(function(a,b){return b.score-a.score||a.index-b.index;}),webIds=new Set(ranked.slice(0,CHUNK_ENGINE_LIMITS.maxWebAnalysisChunks).map(function(x){return x.chunk.chunkId;})),webChunks=chunks.filter(function(chunk){return webIds.has(chunk.chunkId);}),summaries=chunks.filter(function(chunk){return !webIds.has(chunk.chunkId);}).map(function(chunk){const text=buildLocalStructuralChunkSummary(chunk,scan);return {chunkId:chunk.chunkId,text:text,bytes:Buffer.byteLength(text)};});job.total=webChunks.length;for(let i=0;i<webChunks.length;i++){job.phase='PLANNING_CHUNK '+(i+1)+'/'+webChunks.length;job.completed=i;const chunk=webChunks[i],physical=writeChunkContextFile(exchangeDir,chunk,scan,CHUNK_ENGINE_LIMITS.chunkHard),prompt='Analizo vetem kete chunk. Kthe structured summary me CHUNK_ID: '+chunk.chunkId+' dhe seksionet MODULES, RESPONSIBILITIES, ENTRY_POINTS, PUBLIC_CONTRACTS, KEY_SYMBOLS, DEPENDENCIES_IN, DEPENDENCIES_OUT, DATA/SCHEMAS, SIDE_EFFECTS, RISKS, TESTS, RELEVANT_FILES, POSSIBLE_CHANGE_TARGETS, UNRESOLVED_QUESTIONS.';let text;try{text=await dispatchPlannerWithFailover(planningState,routing,cleanRoot,prompt,physical.path,{isPlanner:false,useProvidedBundle:true,forceFreshChat:true});}catch(err){text=await dispatchPlannerWithFailover(planningState,routing,cleanRoot,prompt,physical.path,{isPlanner:false,useProvidedBundle:true,forceFreshChat:true});}text=truncateUtf8(text,CHUNK_ENGINE_LIMITS.summaryHard);if(!text.includes('CHUNK_ID: '+chunk.chunkId))text='CHUNK_ID: '+chunk.chunkId+NL+text;summaries.push({chunkId:chunk.chunkId,text:text,bytes:Buffer.byteLength(text)});}summaries.sort(function(a,b){return a.chunkId.localeCompare(b.chunkId);});job.phase='PLANNING_FINAL';const finalContext=buildFinalPlanningContext({userRequest:userRequest,repoMap:repoMap,summaries:summaries,criticalWindows:embeddedSpecs,totalRelevantBytes:totalRelevantSourceBytes}),planningPath=path.join(exchangeDir,'planning_context.txt');fs.writeFileSync(planningPath,finalContext.text,'utf8');planText=await dispatchPlannerWithFailover(planningState,routing,cleanRoot,buildSearchAiCleanPrompt('plan'),planningPath,{isPlanner:true,useProvidedBundle:true,userRequest:userRequest,forceFreshChat:true});}const validated=validatePlanOutput(planText,{requiresFiles:false});if(!validated.ok)throw new Error('PLANNING_FINAL_INVALID');fs.writeFileSync(planPath,planText,'utf8');let batches;try{batches=parseAndValidatePlanBatches(planText,graph,scan);}catch(_){const fallback=scan.files.filter(f=>f.sourceScore>0&&f.generatedScore===0).slice(0,1).map(f=>f.path);if(!fallback.length)throw new Error('PLANNING_FINAL_INVALID');batches=partitionCodingBatches(fallback,graph,{});}job.total=batches.length;job.completed=0;if(!fs.existsSync(codePath)){fs.writeFileSync(codePath,'# CHUNKED ENGINE BATCH AUDIT'+NL,'utf8');}const checkpointIdentity=computeCheckpointIdentity(cleanRoot,planText);migrateLegacyCheckpointReceipts(codePath,cleanRoot,checkpointIdentity);const state={scan:scan,graph:graph,repoMap:repoMap,planSlice:planText,contractMemory:'',changedFiles:[],activeCoderEngine:routing.roles.coder,activePlannerEngine:routing.roles.planner,failedEngines:new Set(),engineFailoverCount:0,activeGeminiModelTier:planningState.activeGeminiModelTier||'argon_high'},batchReceipts=[],allWrittenFilesSet=new Set();for(let i=0;i<batches.length;i++){const existingAudit=fs.existsSync(codePath)?fs.readFileSync(codePath,'utf8'):'';const auditIndex=parseCheckpointAudit(existingAudit);const normalizedTargets=batches[i].targets.map(normalizeCheckpointTarget);const verifiedTargets=normalizedTargets.filter(function(t){return isTargetVerifiedForCheckpoint(auditIndex,t,cleanRoot,checkpointIdentity);});if(normalizedTargets.length>0&&verifiedTargets.length===normalizedTargets.length){console.error('[CHECKPOINT_BATCH_SKIPPED] batchId='+batches[i].batchId+' targets='+verifiedTargets.join(',')+' reason=ALL_TARGETS_HASH_VERIFIED');verifiedTargets.forEach(function(t){allWrittenFilesSet.add(t);});job.completed=i+1;continue;}job.phase='CODING_BATCH '+(i+1)+'/'+batches.length;const receipts=await executeBatchWithRecovery(batches[i],state,routing,job,{});for(const receipt of receipts){batchReceipts.push(receipt);receipt.filesWritten.map(normalizeCheckpointTarget).forEach(function(t){allWrittenFilesSet.add(t);});if(!receipt.checkpointPersisted&&receipt.parsedFiles&&receipt.parsedFiles.length&&!receipt.skippedFromCheckpoint)persistCheckpointReceiptOnce(codePath,receipt,receipt.parsedFiles,cleanRoot,checkpointIdentity);state.contractMemory=buildCrossBatchContractSummary(receipt,state.contractMemory).text;state.changedFiles.push(...receipt.filesWritten);}job.completed=i+1;}let allWrittenFiles=Array.from(allWrittenFilesSet).sort();job.phase='FINAL_APPLY_AND_TEST';let finalChecks=runFinalBuildAndTests(cleanRoot,180000);fs.writeFileSync(logPath,JSON.stringify(finalChecks,null,2),'utf8');for(let repairRound=1;repairRound<=2&&finalChecks.status!=='CHECK_PASSED';repairRound++){const errorText=JSON.stringify(finalChecks),knownTargets=Array.from(new Set([...allWrittenFiles,...scan.files.map(function(f){return f.path;})])),mentioned=extractTargetsFromError(errorText,knownTargets);if(!mentioned.length)break;job.phase='INTEGRATION_REPAIR';state.lastErrorReceipt='FINAL_APPLY_AND_TEST_FAILED (round '+repairRound+'):'+NL+truncateUtf8(errorText,12000);const repairBatch={batchId:'INTEGRATION-REPAIR-'+repairRound,targets:mentioned.slice(0,2),halvingLevel:1};const receipts=await executeBatchWithRecovery(repairBatch,state,routing,job,{compact:true,singleRetry:true});for(const receipt of receipts){batchReceipts.push(receipt);receipt.filesWritten.map(normalizeCheckpointTarget).forEach(function(t){allWrittenFilesSet.add(t);});if(!receipt.checkpointPersisted&&receipt.parsedFiles&&receipt.parsedFiles.length&&!receipt.skippedFromCheckpoint){persistCheckpointReceiptOnce(codePath,receipt,receipt.parsedFiles,cleanRoot,checkpointIdentity);}}allWrittenFiles=Array.from(allWrittenFilesSet).sort();finalChecks=runFinalBuildAndTests(cleanRoot,180000);fs.writeFileSync(logPath,JSON.stringify(finalChecks,null,2),'utf8');if(finalChecks.status==='CHECK_PASSED')state.lastErrorReceipt='';}if(finalChecks.status!=='CHECK_PASSED')throw new Error('FINAL_APPLY_AND_TEST_FAILED');allWrittenFiles=Array.from(allWrittenFilesSet).sort();job.phase='REVIEWING';const diff=spawnSync('git',['diff','--',...allWrittenFiles],{cwd:cleanRoot,encoding:'utf8'}),review=buildDiffFocusedReviewContext({plan:planText,changedFiles:allWrittenFiles,diff:(diff.stdout||''),batchReceipts:batchReceipts,finalTests:fs.readFileSync(logPath,'utf8'),knownRisks:[]}),reviewPathContext=path.join(exchangeDir,'rev_ctx.txt');fs.writeFileSync(reviewPathContext,review.chunks.join(NL+NL+'--- REVIEW CHUNK ---'+NL+NL),'utf8');let reviewText='STATUS: PASSED\nSKIPPED: reviewer off',reviewerEngine=routing.roles.reviewer||'off';if(reviewerEngine!=='off'){const reviewerRules=fs.readFileSync(path.join(PLUGIN_ROOT,'rules','reviewer_rules.md'),'utf8'),reviewInline=review.text.length<=CHUNK_ENGINE_LIMITS.maxInlineChars&&review.bytes<=CHUNK_ENGINE_LIMITS.maxInlineBytes,reviewSubject=reviewInline?'kontekstin e meposhtem':path.basename(reviewPathContext)+' te bashkengjitur',baseReviewPrompt=reviewerRules+NL+NL+'Rishiko vetem '+reviewSubject+'. Kthe STATUS: PASSED ose STATUS: CHANGES_REQUIRED.',reviewAttachment=reviewInline?null:reviewPathContext,reviewPrompt=reviewInline?baseReviewPrompt+NL+NL+(review.text||review.chunks[0]||''):baseReviewPrompt,failedReviewEngines=new Set();let reviewAttempt=0;while(reviewAttempt<6){reviewAttempt++;try{if(!reviewInline&&reviewerEngine.startsWith('gemini')){const reviewModelTier=state.activeGeminiModelTier || 'neon';await runGeminiAttachmentIngestHandshake({tabKey:reviewerEngine,projectRoot:cleanRoot,attachmentPath:reviewPathContext,batchId:'REVIEW',reasoningLevel:'high',modelTier:reviewModelTier,forceFreshChat:true});reviewText=await dispatchChunkedEngineTurn(reviewerEngine,cleanRoot,reviewPrompt,null,{forceFreshChat:false,useProvidedBundle:false,disableInternalRetry:true,reasoningLevel:'high',modelTier:reviewModelTier});}else{reviewText=await dispatchChunkedEngineTurn(reviewerEngine,cleanRoot,reviewPrompt,reviewAttachment,{forceFreshChat:true,useProvidedBundle:!reviewInline,disableInternalRetry:reviewerEngine.startsWith('gemini'),reasoningLevel:'high',modelTier:reviewerEngine.startsWith('gemini')?(state.activeGeminiModelTier || 'neon'):'argon_high'});}break;}catch(reviewError){const reviewCode=String(reviewError&&reviewError.message||reviewError),reviewBackend=/GEMINI_CONVERSATION_RESET_AFTER_SEND|GEMINI_TURN_ROLLED_BACK_AFTER_SEND|GEMINI_SILENT_PREFLIGHT_TIMEOUT|GEMINI_THINKING_STALL|GEMINI_HARD_CAP_TIMEOUT|WEB_SERVICE_REFUSAL|SERVICE_REFUSAL|WEB_TRANSIENT_SERVICE_ERROR|WEB_PAYLOAD_REJECTED_OR_OVERSIZED|MODEL_OPTION_NOT_FOUND/.test(reviewCode);if(isEngineFailoverEligible(reviewCode)&&failedReviewEngines.size<3){failedReviewEngines.add(reviewerEngine);const nextReviewer=getFailoverEngines(reviewerEngine,failedReviewEngines)[0];if(nextReviewer){console.error('[REVIEWER_ENGINE_FAILOVER] from='+reviewerEngine+' to='+nextReviewer+' reason='+reviewCode.split(' ')[0]);reviewerEngine=nextReviewer;continue;}}throw reviewError;}}}fs.writeFileSync(reviewPath,reviewText,'utf8');const reviewVerdicts=String(reviewText||'').split(/\r?\n/).map(function(line){return line.replace(/[*#]/g,'').trim();}).map(function(line){return line.match(/^STATUS:\s*(APPROVED|PASSED|CHANGES_REQUIRED|FAILED|REJECTED)\b/i);}).filter(Boolean).map(function(match){return match[1].toUpperCase();}),approved=reviewVerdicts.some(function(verdict){return verdict==='APPROVED'||verdict==='PASSED';})&&!reviewVerdicts.some(function(verdict){return verdict==='CHANGES_REQUIRED'||verdict==='FAILED'||verdict==='REJECTED';});job.running=false;job.phase=approved?'COMPLETED':'FAILED_REVIEW';job.result={status:approved?'CYCLE_COMPLETED':'REVIEW_FAILED',verdict:approved?'APPROVED':'CHANGES_REQUIRED',plannerModel:tabActiveModel[routing.roles.planner]||routing.roles.planner,coderModel:tabActiveModel[routing.roles.coder]||routing.roles.coder,reviewerEngine:reviewerEngine,writtenFiles:Array.from(new Set(allWrittenFiles)),commandsExecuted:finalChecks.receipts.map(x=>x.command),batchReceipts:batchReceipts,finalChecks:finalChecks};}catch(err){job.running=false;job.phase='FAILED';job.error=err.message;job.result=null;}}
 
 
 function resolveAndEmbedExternalFiles(userRequest) {
@@ -1870,7 +2548,8 @@ instruction: 'Puna po vazhdon normalisht ne sfond. Thirr MENJEHERE mjetin check_
 };
 }
 async function executeCoreAction(action, payload) {
-const projectRoot = payload.projectRoot;
+payload = payload || {};
+const projectRoot = payload.projectRoot || payload.project_root || process.cwd();
 const cleanRoot = path.resolve(projectRoot);
 
 // SHTYLLA 1: BLLOKADE FIZIKE ME KOD (CYCLE_EXCLUSIVE_LOCK)
@@ -2080,6 +2759,15 @@ tabStates[k] = {
 open: Boolean(tabs[k] && !tabs[k].isClosed()),
 auth: tabAuthStatus[k],
 model: tabActiveModel[k],
+connectionLabel:
+        (
+          geminiModelReceipts[k] &&
+          geminiModelReceipts[k].verified === true &&
+          geminiModelReceipts[k].family === 'neon'
+        )
+          ? 'E Lidhur (Neon)'
+          : 'E Lidhur',
+      geminiReceipt: geminiModelReceipts[k] || null,
 discoveredModels: tabDiscoveredModels[k] || '-',
 activeProject: activeProjectPerTab[k] ? path.basename(activeProjectPerTab[k]) : 'Asnje'
 };
@@ -2308,7 +2996,7 @@ for (const k of Object.keys(tabs)) tabs[k] = null;
 }
 process.on('SIGINT', async function() { await closeAllContexts(); process.exit(0); });
 process.on('SIGTERM', async function() { await closeAllContexts(); process.exit(0); });
-if(process.env.ANTIGRAVITY_TEST_EXPORT==='1'){module.exports={CHUNK_ENGINE_LIMITS,scanRepositoryUniversal,buildCompactRepoMap,buildDependencyGraph,partitionAnalysisChunks,analyzeRepositoryChunks,buildFinalPlanningContext,parseAndValidatePlanBatches,partitionCodingBatches,buildBatchContext,runCodingBatch,applyBatch,runBatchQuickChecks,repairBatchOnce,halveBatchAdaptively,buildCrossBatchContractSummary,buildDiffFocusedReviewContext,writeChunkContextFile,extractTargetsFromError,scoreAnalysisChunkRelevance,buildLocalStructuralChunkSummary,buildBatchMiniMap,extractBatchPlanSlice,buildMinimalBatchContext,selectCodingTransport,selectAdaptiveReasoningLevel,classifyAttachmentHandshakeStrict,getFailoverEngines,parseCodeBlocksFromMarkdown};}
+if(process.env.ANTIGRAVITY_TEST_EXPORT==='1'){module.exports={CHUNK_ENGINE_LIMITS,scanRepositoryUniversal,buildCompactRepoMap,buildDependencyGraph,partitionAnalysisChunks,analyzeRepositoryChunks,buildFinalPlanningContext,parseAndValidatePlanBatches,partitionCodingBatches,buildBatchContext,runCodingBatch,applyBatch,runBatchQuickChecks,repairBatchOnce,halveBatchAdaptively,buildCrossBatchContractSummary,buildDiffFocusedReviewContext,writeChunkContextFile,extractTargetsFromError,scoreAnalysisChunkRelevance,buildLocalStructuralChunkSummary,buildBatchMiniMap,extractBatchPlanSlice,buildMinimalBatchContext,selectCodingTransport,selectAdaptiveReasoningLevel,classifyAttachmentHandshakeStrict,getFailoverEngines,parseCodeBlocksFromMarkdown,normalizeFailureCode,isAdaptiveHalvingFailure,persistCheckpointReceiptOnce};}
 if(process.env.ANTIGRAVITY_TEST_EXPORT!=='1')startDashboardAndSingletonServer();
 if(process.env.ANTIGRAVITY_TEST_EXPORT!=='1' && !process.stdin.isTTY) {
 const transport = new StdioServerTransport();

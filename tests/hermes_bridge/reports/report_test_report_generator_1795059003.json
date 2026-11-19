@@ -1,0 +1,10 @@
+{
+  "test_name": "test_report_generator",
+  "status": "SUCCESS",
+  "execution_time_seconds": 0.0,
+  "timestamp": "2026-11-19T03:30:03.058971Z",
+  "logs": [
+    "Gjenerimi i raporteve fizike JSON u verifikua.",
+    "T\u00eb gjitha skemat e raporteve jan\u00eb t\u00eb lexueshme nga Orchestratori."
+  ]
+}

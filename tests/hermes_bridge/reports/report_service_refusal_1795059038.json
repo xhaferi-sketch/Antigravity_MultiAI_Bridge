@@ -1,0 +1,17 @@
+{
+  "test_name": "test_service_refusal_catch",
+  "status": "SUCCESS",
+  "execution_time_ms": 0.19,
+  "results": {
+    "refusal_encountered_error_caught": true,
+    "refusal_hard_time_caught": true,
+    "plan_validator_rejects_refusal": true,
+    "flash_lite_score": -700,
+    "flash_lite_blocked": true,
+    "auto_blocked": true,
+    "argon_allowed": true,
+    "argon_score": 1400
+  },
+  "timestamp": 1795059038,
+  "description": "Verifikimi i kapjes automatike te refuzimeve te Google Gemini dhe bllokimi i modeleve te dob\u00ebta Flash-Lite/Auto."
+}
