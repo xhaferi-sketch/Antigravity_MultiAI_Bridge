@@ -7,6 +7,7 @@ const crypto = require('node:crypto');
 const NL = String.fromCharCode(10);
 const FENCE3 = String.fromCharCode(96, 96, 96);
 const GOOGLE_SEARCH_AI_URL = 'https://www.google.com/ai';
+const GOOGLE_SEARCH_AI_DISPLAY_LABEL = 'Search AI (High)';
 
 function buildSearchAiCleanPrompt(kind, data) {
   data = data || {};
@@ -239,12 +240,12 @@ function createGoogleSearchEngine(runtimeContext) {
       }, { wantCarbon: isCarbon }).catch(function(err) { return { ok: false, code: 'SEARCH_AI_TARGET_UNVERIFIED', phase: 'EVALUATE', observation: err.message }; });
       if (result.ok) {
         if (tabKey) {
-          tabActiveModel[tabKey] = targetLabel;
+          tabActiveModel[tabKey] = GOOGLE_SEARCH_AI_DISPLAY_LABEL;
           tabDiscoveredModels[tabKey] = '4 Hydrogen · Everyday help, 4 Carbon · Most complex work';
         }
         console.error('[MODEL_STATE_OBSERVED] model=' + targetLabel + ' reasoning=n/a evidence=' + JSON.stringify(result.evidence));
         console.error('[MODEL_STATE_VERIFIED] tabKey=' + tabKey + ' attempts=' + attempt + ' alreadyActive=' + Boolean(result.alreadyActive));
-        return targetLabel;
+        return GOOGLE_SEARCH_AI_DISPLAY_LABEL;
       }
       lastObservation = result;
       console.error('[MODEL_STATE_FAILED] tabKey=' + tabKey + ' code=' + result.code + ' attempt=' + attempt + ' lastObservation=' + JSON.stringify({ phase: result.phase, observation: result.observation }));
@@ -495,7 +496,7 @@ function createGoogleSearchEngine(runtimeContext) {
             console.error('[SEARCH_AI_PLAN_VALIDATION] valid=' + check.ok + ' gates=' + check.gates + ' missing=' + check.missing.join(','));
             if (check.ok) {
               tabAuthStatus[tabKey] = 'ACTIVE';
-              tabActiveModel[tabKey] = '4 Carbon · Most complex work';
+              tabActiveModel[tabKey] = GOOGLE_SEARCH_AI_DISPLAY_LABEL;
               return ['# PLANI ARKITEKTUROR DHE SPECIFIKIMI I EKZEKUTIMIT (MULTI-AI RELAY)', 'Projekti: ' + path.basename(cleanRoot), 'Data: ' + new Date().toISOString(), ' ', check.text].join(NL);
             }
             lastError = 'INVALID_PLAN_STRUCTURE';

@@ -39,7 +39,8 @@ const {
   selectAdaptiveReasoningLevel,
   classifyAttachmentHandshakeStrict,
   parseCodeBlocksFromMarkdown,
-  persistCheckpointReceiptOnce
+  persistCheckpointReceiptOnce,
+  dispatchAdmittedBatch
 } = require(AUTOPILOT_PATH);
 
 test('autopilot_engine exports all required ledger and blueprint symbols', () => {
@@ -150,4 +151,25 @@ test('selectCodingTransport chooses between INLINE and ATTACHMENT correctly', ()
   assert.equal(largeDecision.transport, 'ATTACHMENT');
   assert.equal(largeDecision.attachmentCount, 1);
   assert.equal(largeDecision.twoStepIngest, true);
+});
+
+
+test('inadmissible batch rejected before engine dispatch', () => {
+  let engineCalls = 0;
+  let tokenConsumption = 0;
+  const mockDispatch = function() {
+    engineCalls++;
+    tokenConsumption += 100;
+    return Promise.resolve('should not execute');
+  };
+  assert.throws(
+    () => dispatchAdmittedBatch({ batchId: 'BATCH-OVERSIZED', patchLines: 501 }, mockDispatch),
+    /PATCH_REQUIRES_EXTENDED_ALLOWANCE: 501 lines/
+  );
+  assert.throws(
+    () => dispatchAdmittedBatch({ batchId: 'BATCH-OVER-MAX', patchLines: 801, allowExtendedPatch: true }, mockDispatch),
+    /PATCH_EXCEEDS_SIZE_LIMIT: 801 lines/
+  );
+  assert.equal(engineCalls, 0);
+  assert.equal(tokenConsumption, 0);
 });

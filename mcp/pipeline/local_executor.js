@@ -312,31 +312,156 @@ function createLocalExecutor(runtimeContext) {
 
   function applyBatch(args) {
     const root = fs.realpathSync(path.resolve(args.projectRoot));
-    args.batch.targets = args.batch.targets.map(normalizeCheckpointTarget);
-    args.parsedFiles = args.parsedFiles.map(x => Object.assign({}, x, { relPath: normalizeCheckpointTarget(x.relPath) }));
-    const expected = new Set(args.batch.targets), seen = new Set(), backups = [];
-    for (const f of args.parsedFiles) {
-      if (seen.has(f.relPath) || !expected.has(f.relPath)) throw new Error('BATCH_OUTPUT_INCOMPLETE');
-      seen.add(f.relPath);
-      const abs = path.resolve(root, f.relPath);
-      if (!abs.startsWith(root + path.sep)) throw new Error('SECURITY_BLOCK');
-      if (detectUnpairedSurrogates(f.code) || Buffer.from(f.code).includes(0)) throw new Error('BUNDLE_INVALID_UNICODE');
-      if (fs.existsSync(abs)) {
-        const existingStat = fs.statSync(abs);
-        if (existingStat.size > 5000 && Buffer.byteLength(f.code, 'utf8') < existingStat.size * 0.25 && f.code.split('\n').length < 30) {
-          throw new Error('BATCH_OUTPUT_COLLAPSED_STUB: ' + f.relPath + ' shrunk from ' + existingStat.size + ' bytes to ' + Buffer.byteLength(f.code, 'utf8') + ' bytes');
-        }
-      }
-      backups.push({ path: f.relPath, exists: fs.existsSync(abs), content: fs.existsSync(abs) ? fs.readFileSync(abs) : null });
-      fs.mkdirSync(path.dirname(abs), { recursive: true });
-      const tmp = abs + '.antigravity-tmp';
-      fs.writeFileSync(tmp, f.code, 'utf8');
-      fs.renameSync(tmp, abs);
-    }
-    if (seen.size !== expected.size) throw new Error('BATCH_OUTPUT_INCOMPLETE');
-    return { status: 'BATCH_APPLIED', filesWritten: Array.from(seen), backups: backups };
-  }
+    const targets = (args.batch && args.batch.targets ? args.batch.targets : []).map(normalizeCheckpointTarget);
+    const parsedFiles = (args.parsedFiles || []).map(function(item) {
+      return Object.assign({}, item, { relPath: normalizeCheckpointTarget(item.relPath) });
+    });
+    const expected = new Set(targets);
+    const seen = new Set();
+    const backups = [];
+    const backedUp = new Set();
+    const temporaryFiles = [];
+    let gitIndexBackup = null;
+    let gitIndexPath = null;
 
+    const absoluteTarget = function(rel) {
+      const abs = path.resolve(root, rel);
+      if (!rel || path.isAbsolute(rel) || (abs !== root && !abs.startsWith(root + path.sep))) {
+        throw new Error('SECURITY_BLOCK: ' + rel);
+      }
+      const parentReal = fs.existsSync(path.dirname(abs)) ? fs.realpathSync(path.dirname(abs)) : null;
+      if (parentReal && parentReal !== root && !parentReal.startsWith(root + path.sep)) {
+        throw new Error('SECURITY_BLOCK: symlink escape ' + rel);
+      }
+      return abs;
+    };
+    const backupOnce = function(rel) {
+      if (backedUp.has(rel)) return;
+      const abs = absoluteTarget(rel);
+      backups.push({ path: rel, exists: fs.existsSync(abs), content: fs.existsSync(abs) ? fs.readFileSync(abs) : null });
+      backedUp.add(rel);
+    };
+    const restoreAll = function() {
+      for (let i = backups.length - 1; i >= 0; i--) {
+        const backup = backups[i];
+        const abs = absoluteTarget(backup.path);
+        if (backup.exists) {
+          fs.mkdirSync(path.dirname(abs), { recursive: true });
+          fs.writeFileSync(abs, backup.content);
+        } else if (fs.existsSync(abs)) {
+          fs.rmSync(abs, { force: true });
+        }
+        const tmp = abs + '.antigravity-tmp';
+        if (fs.existsSync(tmp)) fs.rmSync(tmp, { force: true });
+      }
+      if (gitIndexBackup && gitIndexPath) fs.writeFileSync(gitIndexPath, gitIndexBackup);
+    };
+
+    try {
+      const batchOutput = String(args.batchOutput || args.rawOutput || '');
+      const patchStart = batchOutput.search(/^diff --git a\/[^\r\n]+ b\/[^\r\n]+/m);
+      if (patchStart >= 0) {
+        const patchTail = batchOutput.slice(patchStart);
+        const fileBlockStart = patchTail.search(/^### FILE:/m);
+        const patchText = (fileBlockStart >= 0 ? patchTail.slice(0, fileBlockStart) : patchTail).trimEnd() + NL;
+        const patchLines = patchText.split('\n').length;
+        if (patchLines > 800) {
+          throw new Error('PATCH_EXCEEDS_SIZE_LIMIT: ' + patchLines + ' lines exceeds maximum 800');
+        }
+        if (patchLines > 500 && args.allowExtendedPatch !== true && !(args.batch && args.batch.allowExtendedPatch === true)) {
+          throw new Error('PATCH_REQUIRES_EXTENDED_ALLOWANCE: ' + patchLines + ' lines requires explicit extended allowance');
+        }
+
+        const patchPaths = [];
+        const patchPathPattern = /^diff --git a\/([^\r\n]+) b\/([^\r\n]+)$/gm;
+        let match;
+        while ((match = patchPathPattern.exec(patchText)) !== null) {
+          const oldPath = normalizeCheckpointTarget(match[1]);
+          const newPath = normalizeCheckpointTarget(match[2]);
+          absoluteTarget(oldPath);
+          absoluteTarget(newPath);
+          if (oldPath !== newPath || !expected.has(newPath) || patchPaths.includes(newPath)) {
+            throw new Error('PATCH_TARGET_UNAUTHORIZED: ' + newPath);
+          }
+          patchPaths.push(newPath);
+        }
+        if (!patchPaths.length) throw new Error('PATCH_PARSE_FAILED');
+        const baseSha256 = args.baseSha256 || (args.batch && args.batch.baseSha256);
+        if (baseSha256) {
+          for (const rel of patchPaths) {
+            const abs = absoluteTarget(rel);
+            const expectedBase = typeof baseSha256 === 'object' ? baseSha256[rel] : baseSha256;
+            const currentBase = fs.existsSync(abs) ? crypto.createHash('sha256').update(fs.readFileSync(abs)).digest('hex') : null;
+            if (!expectedBase || String(expectedBase).toLowerCase() !== currentBase) {
+              throw new Error('PATCH_BASE_MISMATCH: ' + rel);
+            }
+          }
+        }
+        patchPaths.forEach(backupOnce);
+
+        const patchFile = path.join(root, '.antigravity-patch-' + process.pid + '-' + crypto.randomBytes(6).toString('hex') + '.patch');
+        temporaryFiles.push(patchFile);
+        fs.writeFileSync(patchFile, patchText, 'utf8');
+        let check = spawnSync('git', ['apply', '--check', '--recount', '--whitespace=error-all', patchFile], { cwd: root, encoding: 'utf8' });
+        let applyArgs = ['apply', '--recount', '--whitespace=error-all', patchFile];
+        if (check.error || check.status !== 0) {
+          const gitDirResult = spawnSync('git', ['rev-parse', '--git-dir'], { cwd: root, encoding: 'utf8' });
+          if (gitDirResult.error || gitDirResult.status !== 0) throw new Error('GIT_THREE_WAY_REQUIRES_REPOSITORY');
+          gitIndexPath = path.join(path.resolve(root, String(gitDirResult.stdout || '').trim()), 'index');
+          gitIndexBackup = fs.existsSync(gitIndexPath) ? fs.readFileSync(gitIndexPath) : null;
+          for (const rel of patchPaths) {
+            const identity = spawnSync('git', ['ls-files', '--stage', '--', rel], { cwd: root, encoding: 'utf8' });
+            const rows = String(identity.stdout || '').trim().split(/\r?\n/).filter(Boolean);
+            if (identity.error || identity.status !== 0 || rows.length !== 1 || !/^100[0-7]{3} [0-9a-f]{40,64} 0\t/.test(rows[0])) {
+              throw new Error('GIT_THREE_WAY_BLOB_IDENTITY_MISSING: ' + rel);
+            }
+          }
+          check = spawnSync('git', ['apply', '--check', '--3way', '--recount', '--whitespace=error-all', patchFile], { cwd: root, encoding: 'utf8' });
+          applyArgs = ['apply', '--3way', '--recount', '--whitespace=error-all', patchFile];
+        }
+        if (check.error || check.status !== 0) {
+          throw new Error('GIT_APPLY_CHECK_FAILED: ' + truncateUtf8((check.stderr || '') + (check.stdout || ''), 4000));
+        }
+        const applied = spawnSync('git', applyArgs, { cwd: root, encoding: 'utf8' });
+        if (applied.error || applied.status !== 0) {
+          throw new Error('GIT_APPLY_FAILED: ' + truncateUtf8((applied.stderr || '') + (applied.stdout || ''), 4000));
+        }
+        if (applyArgs.includes('--3way')) {
+          const unmerged = spawnSync('git', ['ls-files', '--unmerged'], { cwd: root, encoding: 'utf8' });
+          if (unmerged.error || unmerged.status !== 0 || String(unmerged.stdout || '').trim()) throw new Error('GIT_APPLY_THREE_WAY_CONFLICT');
+        }
+        patchPaths.forEach(function(rel) { seen.add(rel); });
+      }
+
+      for (const file of parsedFiles) {
+        if (seen.has(file.relPath) || !expected.has(file.relPath)) throw new Error('BATCH_OUTPUT_INCOMPLETE');
+        const abs = absoluteTarget(file.relPath);
+        if (detectUnpairedSurrogates(file.code) || Buffer.from(file.code).includes(0)) throw new Error('BUNDLE_INVALID_UNICODE');
+        if (fs.existsSync(abs)) {
+          const existingStat = fs.statSync(abs);
+          if (existingStat.size > 5000 && Buffer.byteLength(file.code, 'utf8') < existingStat.size * 0.25 && file.code.split('\n').length < 30) {
+            throw new Error('BATCH_OUTPUT_COLLAPSED_STUB: ' + file.relPath + ' shrunk from ' + existingStat.size + ' bytes to ' + Buffer.byteLength(file.code, 'utf8') + ' bytes');
+          }
+        }
+        backupOnce(file.relPath);
+        fs.mkdirSync(path.dirname(abs), { recursive: true });
+        const tmp = abs + '.antigravity-tmp';
+        fs.writeFileSync(tmp, file.code, 'utf8');
+        fs.renameSync(tmp, abs);
+        seen.add(file.relPath);
+      }
+
+      if (seen.size !== expected.size) throw new Error('BATCH_OUTPUT_INCOMPLETE');
+      return { status: 'BATCH_APPLIED', filesWritten: Array.from(seen), backups: backups };
+    } catch (error) {
+      restoreAll();
+      throw error;
+    } finally {
+      for (const file of temporaryFiles) {
+        if (fs.existsSync(file)) fs.rmSync(file, { force: true });
+      }
+    }
+  }
   function runBatchQuickChecks(args) {
     const receipts = [];
     for (const rel of args.writtenFiles || []) {

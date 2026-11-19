@@ -929,6 +929,60 @@ function resolveAndEmbedExternalFiles(userRequest) {
   return embedded;
 }
 
+
+
+const BATCH_LIFECYCLE_PHASES = Object.freeze({
+  COMMITTED: 'BATCH_N_COMMITTED',
+  PREPARING: 'PREPARE_NEXT_BATCH_SESSION',
+  READY: 'NEXT_BATCH_SESSION_READY',
+  DISPATCH: 'BATCH_N+1_DISPATCH'
+});
+const LIFECYCLE_TRANSIENTS = Object.freeze(new Set([
+  'TRANSIENT_SESSION_JITTER',
+  'TRANSIENT_UI_HYDRATION',
+  'TRANSIENT_MODEL_CONTROL_NOT_READY',
+  'MODEL_TRIGGER_TIMEOUT'
+]));
+function createRecoveryBudgets(input) {
+  input = input || {};
+  return { lifecycleRecoveryBudget: Number(input.lifecycleRecoveryBudget || 3), codingRecoveryBudget: Number(input.codingRecoveryBudget || 2), engineFailoverBudget: Number(input.engineFailoverBudget || 1) };
+}
+function classifyBatchLifecycleError(error) {
+  const code = String(error && (error.code || error.message) || error || '').split(':')[0];
+  return LIFECYCLE_TRANSIENTS.has(code) ? { transient: true, code: code, budget: 'lifecycleRecoveryBudget', fatal: false } : { transient: false, code: code, budget: 'codingRecoveryBudget', fatal: true };
+}
+function consumeRecoveryBudget(budgets, classification) {
+  const next = Object.assign({}, budgets);
+  const key = classification.budget;
+  if (!Object.prototype.hasOwnProperty.call(next, key) || next[key] <= 0) throw new Error(key.toUpperCase() + '_EXHAUSTED');
+  next[key] -= 1;
+  return next;
+}
+function firstUnverifiedBatch(batches, receipts) {
+  receipts = receipts || {};
+  return (batches || []).find(function(batch) { return !(receipts[batch.batchId] && receipts[batch.batchId].verified === true); }) || null;
+}
+async function prepareNextBatchSession(args) {
+  if (!args || typeof args.persistCheckpoint !== 'function') throw new Error('CHECKPOINT_PERSISTOR_REQUIRED');
+  const transitions = [];
+  await args.persistCheckpoint(args.completedBatch);
+  transitions.push(BATCH_LIFECYCLE_PHASES.COMMITTED, BATCH_LIFECYCLE_PHASES.PREPARING);
+  let budgets = createRecoveryBudgets(args.budgets);
+  for (;;) {
+    try {
+      const session = await args.engineAdapter.resetConversation({ resetPolicy: args.resetPolicy, forceFreshChat: true, tabKey: args.tabKey, page: args.page, targetFrame: args.targetFrame });
+      await args.engineAdapter.waitForSessionReady({ tabKey: args.tabKey, page: args.page, targetFrame: args.targetFrame });
+      await args.engineAdapter.ensureGeminiNeonModel(args.targetFrame || args.page, args.tabKey, { forceVerify: session.documentChanged === true });
+      transitions.push(BATCH_LIFECYCLE_PHASES.READY, BATCH_LIFECYCLE_PHASES.DISPATCH);
+      return { status: 'READY', transitions: transitions, budgets: budgets, session: session };
+    } catch (error) {
+      const classified = classifyBatchLifecycleError(error);
+      if (!classified.transient) throw error;
+      budgets = consumeRecoveryBudget(budgets, classified);
+    }
+  }
+}
+
 function createAutopilotEngine(runtimeContext) {
   if (!runtimeContext || typeof runtimeContext !== 'object') {
     throw new Error('Mandatory runtimeContext dependency is required');
@@ -1095,7 +1149,12 @@ function createAutopilotEngine(runtimeContext) {
     const contextPath = path.join(exchangeDir, 'b_' + batch.batchId.replace(/^BATCH-?/i, '').replace(/^INTEGRATION-REPAIR-?/i, 'r').replace(/[^A-Za-z0-9]/g, '').slice(0, 6) + '.txt');
     const rulesPath = path.join(pluginRoot, 'rules', 'coder_rules.md');
     const rules = fs.existsSync(rulesPath) ? fs.readFileSync(rulesPath, 'utf8') : '';
-    const instruction = rules + NL + NL + 'Implemento VETEM target-et (' + batch.targets.join(', ') + '). Kthe VETEM blloqe ### FILE: path me permbajtje te plote.';
+    const instruction = rules + NL + NL + 'Implemento VETEM target-et (' + batch.targets.join(', ') + ').' + NL + NL +
+      'OUTPUT CONTRACT:' + NL +
+      '- For existing files: Return ONLY a valid Git unified diff patch (diff --git a/... b/..., --- a/..., +++ b/..., @@ ... @@).' + NL +
+      '- For new files: Return ### FILE: path followed by complete file code in code fence.' + NL +
+      '- Target 200-500 lines of diff (up to 800 lines max).' + NL +
+      '- Touch ONLY ALLOWED_FILES and SYMBOL_SCOPE. No prose.';
 
     job.currentBatchId = batch.batchId;
     job.currentTargets = batch.targets;
@@ -1106,14 +1165,16 @@ function createAutopilotEngine(runtimeContext) {
     job.handshakeStatus = transport.twoStepIngest ? 'PENDING' : 'NOT_REQUIRED';
 
     const dispatch = function(prompt, attachment, forceFreshChat) {
-      return dispatchChunkedEngineTurn(coderEngine, state.scan.projectRoot, prompt, attachment, {
+      return dispatchAdmittedBatch(batch, function() {
+        return dispatchChunkedEngineTurn(coderEngine, state.scan.projectRoot, prompt, attachment, {
         forceFreshChat: forceFreshChat,
         disableInternalRetry: true,
         reasoningLevel: 'high',
         modelTier: modelTier,
         backoffMs: opts.backoffMs,
         sleepFn: opts.sleepFn || sleepFn,
-        useProvidedBundle: Boolean(attachment)
+          useProvidedBundle: Boolean(attachment)
+        });
       });
     };
 
@@ -1161,12 +1222,13 @@ function createAutopilotEngine(runtimeContext) {
     const repairFormat = async function(failure) {
       if (formatRepairUsed) throw new Error(failure);
       formatRepairUsed = true;
-      const repairPrompt = 'KORRIGJIM I VETEM FORMATI/SINTAKSE. ' + failure + NL + 'Kthe VETEM target-et e autorizuara: ' + batch.targets.join(', ') + NL + 'Per secilin perdor saktesisht ### FILE: path, pastaj nje code fence me permbajtjen e plote. Mos jep snippets ose skedare ekstra.';
+      const repairPrompt = 'KORRIGJIM I VETEM FORMATI/SINTAKSE. ' + failure + NL + 'Kthe VETEM target-et e autorizuara: ' + batch.targets.join(', ') + NL + 'Per skedaret ekzistues kthe Git unified diff; per skedaret e rinj perdor ### FILE: path me code fence te plote. Mos jep prose ose skedare ekstra.';
       return dispatch(repairPrompt, null, false);
     };
 
+    let hasUnifiedDiff = /^diff --git a\/[^\r\n]+ b\/[^\r\n]+/m.test(output);
     let parsedResult = parseExpected(output);
-    if (parsedResult.missing.length) {
+    if (parsedResult.missing.length && !hasUnifiedDiff) {
       const validParsed = parsedResult.parsed.filter(function(x) { return expected.has(x.relPath) && !parsedResult.missing.includes(x.relPath); });
       if (validParsed.length > 0) {
         try {
@@ -1187,24 +1249,34 @@ function createAutopilotEngine(runtimeContext) {
       }
     }
 
-    let applied = executor.applyBatch({ projectRoot: state.scan.projectRoot, batch: batch, parsedFiles: parsedResult.parsed });
-    let quick = executor.runBatchQuickChecks({ projectRoot: state.scan.projectRoot, writtenFiles: applied.filesWritten });
-    if (quick.status !== 'CHECK_PASSED') {
-      if (applied.backups) {
-        for (const backup of applied.backups) {
-          const abs = path.join(state.scan.projectRoot, backup.path);
-          if (backup.exists) fs.writeFileSync(abs, backup.content);
-          else if (fs.existsSync(abs)) fs.unlinkSync(abs);
+    const restoreAppliedBackups = function(appliedBatch) {
+      for (let i = (appliedBatch.backups || []).length - 1; i >= 0; i--) {
+        const backup = appliedBatch.backups[i];
+        const abs = path.join(state.scan.projectRoot, backup.path);
+        if (backup.exists) {
+          fs.mkdirSync(path.dirname(abs), { recursive: true });
+          fs.writeFileSync(abs, backup.content);
+        } else if (fs.existsSync(abs)) {
+          fs.rmSync(abs, { force: true });
         }
       }
+    };
+    let applied = executor.applyBatch({ projectRoot: state.scan.projectRoot, batch: batch, parsedFiles: parsedResult.parsed, batchOutput: output });
+    let quick = executor.runBatchQuickChecks({ projectRoot: state.scan.projectRoot, writtenFiles: applied.filesWritten });
+    if (quick.status !== 'CHECK_PASSED') {
+      restoreAppliedBackups(applied);
       const detail = 'BATCH_SYNTAX_OR_QUICK_CHECK_FAILED: ' + JSON.stringify(quick.receipts || []);
       state.lastErrorReceipt = detail;
       output = await repairFormat(detail);
       parsedResult = parseExpected(output);
       if (parsedResult.missing.length) throw new Error('BATCH_OUTPUT_INCOMPLETE: missing=[' + parsedResult.missing.join(',') + '] extra=[' + parsedResult.extra.join(',') + ']');
-      applied = executor.applyBatch({ projectRoot: state.scan.projectRoot, batch: batch, parsedFiles: parsedResult.parsed });
+      hasUnifiedDiff = /^diff --git a\/[^\r\n]+ b\/[^\r\n]+/m.test(output);
+      applied = executor.applyBatch({ projectRoot: state.scan.projectRoot, batch: batch, parsedFiles: parsedResult.parsed, batchOutput: output });
       quick = executor.runBatchQuickChecks({ projectRoot: state.scan.projectRoot, writtenFiles: applied.filesWritten });
-      if (quick.status !== 'CHECK_PASSED') throw new Error('BATCH_SYNTAX_OR_QUICK_CHECK_FAILED: ' + JSON.stringify(quick.receipts || []));
+      if (quick.status !== 'CHECK_PASSED') {
+        restoreAppliedBackups(applied);
+        throw new Error('BATCH_SYNTAX_OR_QUICK_CHECK_FAILED: ' + JSON.stringify(quick.receipts || []));
+      }
     }
 
     return {
@@ -1676,12 +1748,29 @@ function createAutopilotEngine(runtimeContext) {
     isEngineFailoverEligible,
     parseCodeBlocksFromMarkdown,
     persistCheckpointReceiptOnce,
-    classifyAttachmentHandshakeStrict
+    classifyAttachmentHandshakeStrict,
+    dispatchAdmittedBatch
   };
+}
+
+function dispatchAdmittedBatch(batch, dispatchFn) {
+  const raw = batch && (batch.patchLines != null ? batch.patchLines : (batch.estimatedPatchLines != null ? batch.estimatedPatchLines : batch.patchLineEstimate));
+  const numeric = Number(raw || 0);
+  const patchLines = Number.isFinite(numeric) && numeric > 0 ? Math.ceil(numeric) : 0;
+  if (patchLines > 800) throw new Error('PATCH_EXCEEDS_SIZE_LIMIT: ' + patchLines + ' lines exceeds maximum 800');
+  if (patchLines > 500 && !(batch && batch.allowExtendedPatch === true)) throw new Error('PATCH_REQUIRES_EXTENDED_ALLOWANCE: ' + patchLines + ' lines requires explicit extended allowance');
+  return dispatchFn();
 }
 
 module.exports = {
   createAutopilotEngine,
+  BATCH_LIFECYCLE_PHASES,
+  LIFECYCLE_TRANSIENTS,
+  createRecoveryBudgets,
+  classifyBatchLifecycleError,
+  consumeRecoveryBudget,
+  firstUnverifiedBatch,
+  prepareNextBatchSession,
   PACK_MODES,
   CHUNK_ENGINE_LIMITS,
   scanRepositoryUniversal,
@@ -1712,6 +1801,7 @@ module.exports = {
   classifyAttachmentHandshakeStrict,
   parseCodeBlocksFromMarkdown,
   persistCheckpointReceiptOnce,
+  dispatchAdmittedBatch,
   packWorkspace,
   getBundleAttachmentAndNote,
   resolveAndEmbedExternalFiles,

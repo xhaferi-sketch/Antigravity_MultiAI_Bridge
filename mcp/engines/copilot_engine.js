@@ -13,6 +13,7 @@ const LOGIN_GOOGLE = 'accounts.' + 'google.com';
 const COPILOT_REQUIRED_MODEL = Object.freeze({
   family: 'gpt-5.6-sol-think',
   modelLabel: 'GPT-5.6 Sol Think',
+  displayLabel: 'GPT-5.6 Sol Think (Deep / High)',
   reasoningLabel: 'Think deeper',
   reasoning: 'high'
 });
@@ -160,8 +161,8 @@ function createCopilotEngine(runtimeContext) {
     if (!result.ok) {
       throw new Error('COPILOT_MODEL_LOCK_FAILED: ' + result.reason + ' (active: ' + result.active + ')');
     }
-    if (tabKey) tabActiveModel[tabKey] = contract.modelLabel;
-    return contract.modelLabel;
+    if (tabKey) tabActiveModel[tabKey] = contract.displayLabel;
+    return contract.displayLabel;
   }
 
   return {

@@ -50,6 +50,7 @@ test('createCopilotEngine enforces mandatory runtimeContext dependency', () => {
 test('COPILOT_REQUIRED_MODEL preserves frozen gpt-5.6-sol-think contract', () => {
   assert.equal(COPILOT_REQUIRED_MODEL.family, 'gpt-5.6-sol-think');
   assert.equal(COPILOT_REQUIRED_MODEL.modelLabel, 'GPT-5.6 Sol Think');
+  assert.equal(COPILOT_REQUIRED_MODEL.displayLabel, 'GPT-5.6 Sol Think (Deep / High)');
   assert.equal(COPILOT_REQUIRED_MODEL.reasoningLabel, 'Think deeper');
   assert.equal(COPILOT_REQUIRED_MODEL.reasoning, 'high');
   assert.ok(Object.isFrozen(COPILOT_REQUIRED_MODEL));
@@ -131,7 +132,7 @@ test('ensureCopilotGpt56Model validates active model lock in target frame', asyn
     })
   };
   const model = await engine.ensureCopilotGpt56Model(validFrame, 'web1');
-  assert.equal(model, 'GPT-5.6 Sol Think');
+  assert.equal(model, 'GPT-5.6 Sol Think (Deep / High)');
 
   // Mock frame where model is unavailable
   const failedFrame = {

@@ -11,7 +11,7 @@ const GEMINI_REQUIRED_MODEL = Object.freeze({
   activePattern: '(?:^|\\b)neon(?:\\b|$)',
   menuLabel: 'Deeper analysis (4 Neon)',
   modelLabel: '4 Neon',
-  displayLabel: 'Neon',
+  displayLabel: '4 Neon (High)',
   reasoning: 'high',
   reasoningSource: 'integrated-model-mode'
 });
@@ -325,6 +325,130 @@ async function runGeminiAttachmentIngestHandshake(args) {
   return { status: 'VERIFIED', text: text };
 }
 
+
+
+const GEMINI_SESSION_SELECTORS = Object.freeze({
+  newConversation: [
+    'a[href="/app"]',
+    'button[aria-label*="New chat" i]',
+    '[role="button"][aria-label*="New chat" i]'
+  ],
+  composer: ['rich-textarea', '[contenteditable="true"]', 'textarea'],
+  modelControl: ['button[aria-label*="model" i]', '[role="button"][aria-haspopup="menu"]'],
+  blockingOverlay: ['[role="dialog"]', '.cdk-overlay-backdrop-showing']
+});
+
+function normalizeResetContract(args) {
+  const legacyFresh = Boolean(args && args.forceFreshChat);
+  return Object.assign({
+    strategy: 'SOFT_FIRST',
+    preserveVerifiedModel: true,
+    requireFreshConversation: legacyFresh,
+    allowRouteReopen: true,
+    allowHardReload: true
+  }, args && args.resetPolicy || {});
+}
+
+function readinessSatisfied(state) {
+  return Boolean(state && state.documentReady && state.routeStable && state.composerAvailable &&
+    state.modelControlAvailable && !state.blockingOverlay && state.mutationsSettled &&
+    state.authenticated && state.domainValid);
+}
+
+async function observeSessionReadiness(args) {
+  const target = args.targetFrame || args.page;
+  if (!target || typeof target.evaluate !== 'function') throw new Error('SESSION_TARGET_REQUIRED');
+  const observed = await target.evaluate(function(selectors) {
+    const visible = function(selector) {
+      return Array.from(document.querySelectorAll(selector)).some(function(node) {
+        const style = window.getComputedStyle(node);
+        return style.visibility !== 'hidden' && style.display !== 'none' && node.getClientRects().length > 0;
+      });
+    };
+    const route = location.pathname;
+    return {
+      documentReady: document.readyState === 'complete' || document.readyState === 'interactive',
+      route: route,
+      routeStable: route === '/app' || route.indexOf('/app/') === 0,
+      composerAvailable: selectors.composer.some(visible),
+      modelControlAvailable: selectors.modelControl.some(visible),
+      blockingOverlay: selectors.blockingOverlay.some(visible),
+      authenticated: !document.querySelector('a[href*="accounts.google.com"]'),
+      domainValid: location.hostname === 'gemini.google.com',
+      conversationId: route,
+      composerEmpty: selectors.composer.some(function(selector) {
+        const node = document.querySelector(selector);
+        return node && !String(node.value || node.textContent || '').trim();
+      })
+    };
+  }, GEMINI_SESSION_SELECTORS);
+  observed.mutationsSettled = args.mutationsSettled !== false;
+  observed.ready = readinessSatisfied(observed);
+  return observed;
+}
+
+async function waitForSessionReady(args) {
+  const timeoutMs = Number(args.timeoutMs || 30000);
+  const pollMs = Number(args.pollMs || 250);
+  const deadline = Date.now() + timeoutMs;
+  let stable = 0;
+  let last = null;
+  while (Date.now() <= deadline) {
+    last = await observeSessionReadiness(args);
+    stable = last.ready ? stable + 1 : 0;
+    if (stable >= Number(args.stablePolls || 2)) return Object.assign({}, last, { stablePolls: stable });
+    if (args.page && typeof args.page.waitForTimeout === 'function') await args.page.waitForTimeout(pollMs);
+    else await new Promise(function(resolve) { setTimeout(resolve, pollMs); });
+  }
+  const err = new Error('TRANSIENT_UI_HYDRATION');
+  err.observation = last;
+  throw err;
+}
+
+async function resetConversation(args) {
+  const page = args.page;
+  const target = args.targetFrame || page;
+  const policy = normalizeResetContract(args);
+  const before = args.before || await observeSessionReadiness(args);
+  const preservedReceipt = policy.preserveVerifiedModel ? geminiModelReceipts[args.tabKey] : null;
+  let softFailure = null;
+  try {
+    const clicked = await target.evaluate(function(selectors) {
+      for (const selector of selectors) {
+        const node = document.querySelector(selector);
+        if (node) { node.click(); return true; }
+      }
+      return false;
+    }, GEMINI_SESSION_SELECTORS.newConversation);
+    if (!clicked) throw new Error('NATIVE_NEW_CHAT_UNAVAILABLE');
+    const ready = await waitForSessionReady(args);
+    if (policy.requireFreshConversation && ready.conversationId === before.conversationId && !ready.composerEmpty) throw new Error('CONVERSATION_IDENTITY_UNCHANGED');
+    if (preservedReceipt) geminiModelReceipts[args.tabKey] = preservedReceipt;
+    return { status: 'SESSION_READY', method: 'NATIVE_NEW_CHAT', documentChanged: false, readiness: ready };
+  } catch (error) { softFailure = error; }
+  if (policy.allowRouteReopen && page && typeof page.goto === 'function') {
+    try {
+      await page.goto(GEMINI_APP_URL, { waitUntil: 'domcontentloaded', timeout: Number(args.timeoutMs || 30000) });
+      const ready = await waitForSessionReady(Object.assign({}, args, { targetFrame: page }));
+      if (preservedReceipt) geminiModelReceipts[args.tabKey] = preservedReceipt;
+      return { status: 'SESSION_READY', method: 'ROUTE_REOPEN', documentChanged: false, readiness: ready };
+    } catch (error) { softFailure = error; }
+  }
+  if (!policy.allowHardReload || !page || typeof page.reload !== 'function') throw softFailure || new Error('SESSION_RESET_FAILED');
+  await page.reload({ waitUntil: 'domcontentloaded', timeout: Number(args.timeoutMs || 30000) });
+  invalidateGeminiReceipt(args.tabKey);
+  const readiness = await waitForSessionReady(Object.assign({}, args, { targetFrame: page }));
+  return { status: 'SESSION_READY', method: 'HARD_RELOAD', documentChanged: true, readiness: readiness };
+}
+
+async function recoverGeminiSession(args) {
+  try { return await waitForSessionReady(args); }
+  catch (error) {
+    if (!/^TRANSIENT_|MODEL_TRIGGER_TIMEOUT/.test(String(error && error.message))) throw error;
+    return resetConversation(args);
+  }
+}
+
 function createGeminiEngine(runtimeContext) {
   if (!runtimeContext || typeof runtimeContext !== 'object') {
     throw new Error('Mandatory runtimeContext dependency is required');
@@ -453,12 +577,12 @@ function createGeminiEngine(runtimeContext) {
       thinkingSelectorRequired: false
     };
 
-    tabActiveModel[tabKey] = GEMINI_REQUIRED_MODEL.modelLabel;
+    tabActiveModel[tabKey] = GEMINI_REQUIRED_MODEL.displayLabel;
     tabDiscoveredModels[tabKey] = GEMINI_REQUIRED_MODEL.menuLabel;
 
     console.error('[MODEL_STATE_OBSERVED] tabKey=' + tabKey + ' model=' + GEMINI_REQUIRED_MODEL.modelLabel + ' reasoning=' + GEMINI_REQUIRED_MODEL.reasoning);
     console.error('[MODEL_STATE_VERIFIED] tabKey=' + tabKey + ' receipt=' + JSON.stringify(geminiModelReceipts[tabKey]));
-    return GEMINI_REQUIRED_MODEL.modelLabel;
+    return GEMINI_REQUIRED_MODEL.displayLabel;
   }
 
   async function handleDiagnostics(args) {
@@ -475,6 +599,10 @@ function createGeminiEngine(runtimeContext) {
 
   return {
     ensureGeminiNeonModel,
+    resetConversation,
+    observeSessionReadiness,
+    waitForSessionReady,
+    recoverGeminiSession,
     invalidateGeminiReceipt,
     collectGeminiTerminalDiagnostics: handleDiagnostics,
     runGeminiAttachmentIngestHandshake: handleHandshake,
@@ -489,6 +617,12 @@ function createGeminiEngine(runtimeContext) {
 
 module.exports = {
   createGeminiEngine,
+  resetConversation,
+  observeSessionReadiness,
+  waitForSessionReady,
+  recoverGeminiSession,
+  normalizeResetContract,
+  readinessSatisfied,
   GEMINI_REQUIRED_MODEL,
   GEMINI_APP_URL,
   geminiModelReceipts,

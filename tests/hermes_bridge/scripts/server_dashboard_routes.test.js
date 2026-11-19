@@ -177,3 +177,55 @@ test('server startup is disabled in ANTIGRAVITY_TEST_EXPORT mode', () => {
     /if\s*\(\s*process\.env\.ANTIGRAVITY_TEST_EXPORT\s*!==\s*['"]1['"]\s*\)\s*startDashboardAndSingletonServer\s*\(\s*\)\s*;/
   );
 });
+test('dashboard and state reflect exact high-tier model contract and exclude Gemini Auto', () => {
+  const source = sourceText();
+  const dashboardHtml = fs.readFileSync(path.join(PROJECT_ROOT, 'mcp', 'dashboard.html'), 'utf8');
+
+  assert.match(source, /gemini1:\s*['"]4 Neon \(High\)['"]/);
+  assert.match(source, /web1:\s*['"]GPT-5\.6 Sol Think \(Deep \/ High\)['"]/);
+  assert.match(source, /google_search_1:\s*['"]Search AI \(High\)['"]/);
+
+  assert.equal(/gemini.*auto/i.test(source), false);
+  assert.equal(/gemini.*auto/i.test(dashboardHtml), false);
+
+  assert.ok(dashboardHtml.includes('4 Neon (High)'));
+  assert.ok(dashboardHtml.includes('Search AI (High)'));
+});
+
+test('provider selectors remain separate from user-facing display labels', () => {
+  const geminiSource = fs.readFileSync(path.join(PROJECT_ROOT, 'mcp', 'engines', 'gemini_engine.js'), 'utf8');
+  const copilotSource = fs.readFileSync(path.join(PROJECT_ROOT, 'mcp', 'engines', 'copilot_engine.js'), 'utf8');
+  assert.match(geminiSource, /menuLabel:\s*'Deeper analysis \(4 Neon\)'/);
+  assert.match(geminiSource, /modelLabel:\s*'4 Neon'/);
+  assert.match(copilotSource, /modelLabel:\s*'GPT-5\.6 Sol Think'/);
+  assert.match(copilotSource, /displayLabel:\s*'GPT-5\.6 Sol Think \(Deep \/ High\)'/);
+});
+
+
+test('/api/state executed state builder returns exact High labels and no Auto', () => {
+  const Module = require('node:module');
+  const originalLoad = Module._load;
+  const prior = process.env.ANTIGRAVITY_TEST_EXPORT;
+  process.env.ANTIGRAVITY_TEST_EXPORT = '1';
+  Module._load = function(request, parent, isMain) {
+    if (request === '@modelcontextprotocol/sdk/server/index.js') return { Server: class { setRequestHandler() {} } };
+    if (request === '@modelcontextprotocol/sdk/server/stdio.js') return { StdioServerTransport: class {} };
+    if (request === '@modelcontextprotocol/sdk/types.js') return { CallToolRequestSchema: Symbol('call'), ListToolsRequestSchema: Symbol('list') };
+    if (request === 'playwright') return { chromium: {} };
+    if (request === 'adm-zip') return class {};
+    return originalLoad.call(this, request, parent, isMain);
+  };
+  try {
+    delete require.cache[require.resolve(SERVER_PATH)];
+    const server = require(SERVER_PATH);
+    const state = server.buildDashboardState([]);
+    assert.equal(state.tabs.gemini1.model, '4 Neon (High)');
+    assert.equal(state.tabs.web1.model, 'GPT-5.6 Sol Think (Deep / High)');
+    assert.equal(state.tabs.google_search_1.model, 'Search AI (High)');
+    assert.equal(JSON.stringify(state).includes('Auto'), false);
+  } finally {
+    Module._load = originalLoad;
+    delete require.cache[require.resolve(SERVER_PATH)];
+    if (prior === undefined) delete process.env.ANTIGRAVITY_TEST_EXPORT; else process.env.ANTIGRAVITY_TEST_EXPORT = prior;
+  }
+});

@@ -60,7 +60,8 @@ test('createGeminiEngine enforces mandatory runtimeContext dependency', () => {
 test('GEMINI_REQUIRED_MODEL preserves frozen 4 Neon contract', () => {
   assert.equal(GEMINI_REQUIRED_MODEL.family, 'neon');
   assert.equal(GEMINI_REQUIRED_MODEL.modelLabel, '4 Neon');
-  assert.equal(GEMINI_REQUIRED_MODEL.displayLabel, 'Neon');
+  assert.equal(GEMINI_REQUIRED_MODEL.menuLabel, 'Deeper analysis (4 Neon)');
+  assert.equal(GEMINI_REQUIRED_MODEL.displayLabel, '4 Neon (High)');
   assert.equal(GEMINI_REQUIRED_MODEL.reasoning, 'high');
   assert.equal(GEMINI_REQUIRED_MODEL.reasoningSource, 'integrated-model-mode');
   assert.ok(Object.isFrozen(GEMINI_REQUIRED_MODEL));
@@ -131,8 +132,8 @@ test('ensureGeminiNeonModel verifies and selects 4 Neon via target frame', async
   };
 
   const model = await engine.ensureGeminiNeonModel(successFrame, 'gemini1');
-  assert.equal(model, '4 Neon');
-  assert.equal(tabActiveModel.gemini1, '4 Neon');
+  assert.equal(model, '4 Neon (High)');
+  assert.equal(tabActiveModel.gemini1, '4 Neon (High)');
   assert.equal(tabDiscoveredModels.gemini1, 'Deeper analysis (4 Neon)');
   assert.ok(geminiModelReceipts.gemini1 && geminiModelReceipts.gemini1.verified === true);
 

@@ -1,4 +1,4 @@
-﻿const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
+const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
 const { CallToolRequestSchema, ListToolsRequestSchema } = require('@modelcontextprotocol/sdk/types.js');
 const { chromium } = require('playwright');
@@ -123,7 +123,6 @@ function getAutopilotEngine() {
       ensureProjectSetup,
       readProjectState,
       writeProjectState,
-      withCycleLock,
       applyBatch,
       runBatchQuickChecks,
       runFinalBuildAndTests,
@@ -157,11 +156,11 @@ const tabAuthStatus = {
   google_search_1: 'UNKNOWN', google_search_2: 'UNKNOWN', google_search_3: 'UNKNOWN'
 };
 const tabActiveModel = {
-  web1: '-', web2: '-',
-  gemini1: '-', gemini2: '-', gemini3: '-',
-  google_search_1: '4 Hydrogen · Everyday help & 4 Carbon · Most complex work',
-  google_search_2: '4 Hydrogen · Everyday help & 4 Carbon · Most complex work',
-  google_search_3: '4 Hydrogen · Everyday help & 4 Carbon · Most complex work'
+  web1: 'GPT-5.6 Sol Think (Deep / High)', web2: 'GPT-5.6 Sol Think (Deep / High)',
+  gemini1: '4 Neon (High)', gemini2: '4 Neon (High)', gemini3: '4 Neon (High)',
+  google_search_1: 'Search AI (High)',
+  google_search_2: 'Search AI (High)',
+  google_search_3: 'Search AI (High)'
 };
 const tabDiscoveredModels = {
   web1: '-', web2: '-',
@@ -171,6 +170,25 @@ const tabDiscoveredModels = {
   google_search_3: '4 Hydrogen · Everyday help, 4 Carbon · Most complex work'
 };
 const activeProjectPerTab = {};
+function buildDashboardState(projects) {
+  const tabStates = {};
+  for (const k of Object.keys(tabs)) {
+    tabStates[k] = {
+      open: Boolean(tabs[k] && !tabs[k].isClosed()),
+      auth: tabAuthStatus[k],
+      model: tabActiveModel[k],
+      connectionLabel: (
+        geminiModelReceipts[k] &&
+        geminiModelReceipts[k].verified === true &&
+        geminiModelReceipts[k].family === 'neon'
+      ) ? 'E Lidhur (Neon)' : 'E Lidhur',
+      geminiReceipt: geminiModelReceipts[k] || null,
+      discoveredModels: tabDiscoveredModels[k] || '-',
+      activeProject: activeProjectPerTab[k] ? path.basename(activeProjectPerTab[k]) : 'Asnje'
+    };
+  }
+  return { projects: projects || [], tabs: tabStates };
+}
 const tabLocks = {
   web1: Promise.resolve(),
   web2: Promise.resolve(),
@@ -1342,8 +1360,8 @@ async function runWebDispatchWithRetryPolicy(opts){const dispatchId=opts.dispatc
       }
       let targetFrame = findChatFrameOrPage(page);
       const routing = ensureProjectSetup(projectRoot);
-      if(attempt===2){const backoff=Number.isFinite(opts.backoffMs)?opts.backoffMs:8000+(parseInt(crypto.createHash('sha256').update(diagId).digest('hex').slice(0,8),16)%4001);await (typeof opts.sleepFn==='function'?opts.sleepFn(backoff):new Promise(function(resolve){setTimeout(resolve,backoff);}));await resetChatVerified({page:page,targetFrame:targetFrame,tabKey:tabKey,projectRoot:projectRoot,forceReload:true,reason:'COMPACT_RECOVERY'});targetFrame=findChatFrameOrPage(page);}
-      else if(attempt===1&&opts.forceFreshChat===true){await resetChatVerified({page:page,targetFrame:targetFrame,tabKey:tabKey,projectRoot:projectRoot,forceReload:true,reason:'CODING_BATCH_FRESH_CHAT'});targetFrame=findChatFrameOrPage(page);}
+      if(attempt===2){const backoff=Number.isFinite(opts.backoffMs)?opts.backoffMs:8000+(parseInt(crypto.createHash('sha256').update(diagId).digest('hex').slice(0,8),16)%4001);await (typeof opts.sleepFn==='function'?opts.sleepFn(backoff):new Promise(function(resolve){setTimeout(resolve,backoff);}));await resetChatVerified({page:page,targetFrame:targetFrame,tabKey:tabKey,projectRoot:projectRoot,resetPolicy:normalizeConversationResetPolicy({forceFreshChat:true}),reason:'COMPACT_RECOVERY'});targetFrame=findChatFrameOrPage(page);}
+      else if(attempt===1&&opts.forceFreshChat===true){await resetChatVerified({page:page,targetFrame:targetFrame,tabKey:tabKey,projectRoot:projectRoot,resetPolicy:normalizeConversationResetPolicy({forceFreshChat:true}),reason:'CODING_BATCH_FRESH_CHAT'});targetFrame=findChatFrameOrPage(page);}
       else if(routing.autoNewChatOnProjectSwitch){await resetChatIfNeeded(page,tabKey,projectRoot,false);}
       const verifiedModel = await ensureMaxReasoningMode(targetFrame,tabKey,{reasoningLevel:'high',modelTier:opts.modelTier||'neon'});
       tabActiveModel[tabKey]=verifiedModel;appendDispatchDiag(projectRoot,diagId,'MODEL_VERIFIED',{model:verifiedModel});
@@ -1798,7 +1816,14 @@ function appendBatchAudit(codePath, receipt, parsed, cleanRoot, checkpointIdenti
 function persistCheckpointReceiptOnce(codePath, receipt, parsedFiles, cleanRoot, checkpointIdentity) {
   return getLocalExecutor().persistCheckpointReceiptOnce(codePath, receipt, parsedFiles, cleanRoot, checkpointIdentity);
 }
-async function dispatchChunkedEngineTurn(engine,cleanRoot,prompt,attachment,opts){opts=opts||{};const common={tabKey:engine,projectRoot:cleanRoot,promptText:prompt,attachmentPaths:[attachment],bundlePath:attachment,isPlanner:Boolean(opts.isPlanner),userRequest:opts.userRequest||'',forceFreshChat:opts.forceFreshChat!==false,useProvidedBundle:opts.useProvidedBundle===true,backoffMs:opts.backoffMs,sleepFn:opts.sleepFn,disableInternalRetry:opts.disableInternalRetry===true,reasoningLevel:'high',modelTier:opts.modelTier||'neon',hardCapMs:opts.hardCapMs};return engine.startsWith('google_search_')?dispatchToGoogleSearchAiTab(common):dispatchToWebTab(common);}
+function normalizeConversationResetPolicy(opts) {
+  opts = opts || {};
+  if (opts.resetPolicy) return Object.assign({}, opts.resetPolicy);
+  if (opts.forceFreshChat === true) return { strategy: 'SOFT_FIRST', preserveVerifiedModel: true, requireFreshConversation: true, allowRouteReopen: true, allowHardReload: true };
+  return { strategy: 'SOFT_FIRST', preserveVerifiedModel: true, requireFreshConversation: false, allowRouteReopen: true, allowHardReload: true };
+}
+
+async function dispatchChunkedEngineTurn(engine,cleanRoot,prompt,attachment,opts){opts=opts||{};const common={tabKey:engine,projectRoot:cleanRoot,promptText:prompt,attachmentPaths:[attachment],bundlePath:attachment,isPlanner:Boolean(opts.isPlanner),userRequest:opts.userRequest||'',forceFreshChat:opts.forceFreshChat!==false,resetPolicy:normalizeConversationResetPolicy(opts),useProvidedBundle:opts.useProvidedBundle===true,backoffMs:opts.backoffMs,sleepFn:opts.sleepFn,disableInternalRetry:opts.disableInternalRetry===true,reasoningLevel:'high',modelTier:opts.modelTier||'neon',hardCapMs:opts.hardCapMs};return engine.startsWith('google_search_')?dispatchToGoogleSearchAiTab(common):dispatchToWebTab(common);}
 function getFailoverEngines(primaryEngine, excludedSet) { return getAutopilotEngine().getFailoverEngines(primaryEngine, excludedSet); }
 function isEngineFailoverEligible(code) { return getAutopilotEngine().isEngineFailoverEligible(code); }
 async function dispatchPlannerWithFailover(state, routing, cleanRoot, prompt, attachment, opts) { return getAutopilotEngine().dispatchPlannerWithFailover(state, routing, cleanRoot, prompt, attachment, opts); }
@@ -2011,27 +2036,9 @@ st.phase = liveJob.phase;
 }
 return Object.assign({}, cfg, { state: st });
 });
-const tabStates = {};
-for (const k of Object.keys(tabs)) {
-tabStates[k] = {
-open: Boolean(tabs[k] && !tabs[k].isClosed()),
-auth: tabAuthStatus[k],
-model: tabActiveModel[k],
-connectionLabel:
-        (
-          geminiModelReceipts[k] &&
-          geminiModelReceipts[k].verified === true &&
-          geminiModelReceipts[k].family === 'neon'
-        )
-          ? 'E Lidhur (Neon)'
-          : 'E Lidhur',
-      geminiReceipt: geminiModelReceipts[k] || null,
-discoveredModels: tabDiscoveredModels[k] || '-',
-activeProject: activeProjectPerTab[k] ? path.basename(activeProjectPerTab[k]) : 'Asnje'
-};
-}
+const dashboardState = buildDashboardState(projectsData);
 res.writeHead(200, { 'Content-Type': 'application/json' });
-return res.end(JSON.stringify({ projects: projectsData, tabs: tabStates }));
+return res.end(JSON.stringify(dashboardState));
 }
 let body = '';
 req.on('data', function(chunk) { body += chunk; });
@@ -2255,6 +2262,7 @@ for (const k of Object.keys(tabs)) tabs[k] = null;
 process.on('SIGINT', async function() { await closeAllContexts(); process.exit(0); });
 process.on('SIGTERM', async function() { await closeAllContexts(); process.exit(0); });
 if(process.env.ANTIGRAVITY_TEST_EXPORT==='1'){module.exports={CHUNK_ENGINE_LIMITS,scanRepositoryUniversal,buildCompactRepoMap,buildDependencyGraph,partitionAnalysisChunks,analyzeRepositoryChunks,buildFinalPlanningContext,parseAndValidatePlanBatches,partitionCodingBatches,buildBatchContext,runCodingBatch,applyBatch,runBatchQuickChecks,repairBatchOnce,halveBatchAdaptively,buildCrossBatchContractSummary,buildDiffFocusedReviewContext,writeChunkContextFile,extractTargetsFromError,scoreAnalysisChunkRelevance,buildLocalStructuralChunkSummary,buildBatchMiniMap,extractBatchPlanSlice,buildMinimalBatchContext,selectCodingTransport,selectAdaptiveReasoningLevel,classifyAttachmentHandshakeStrict,getFailoverEngines,parseCodeBlocksFromMarkdown,normalizeFailureCode,isAdaptiveHalvingFailure,persistCheckpointReceiptOnce};}
+if(process.env.ANTIGRAVITY_TEST_EXPORT==='1'){Object.defineProperty(module.exports,'buildDashboardState',{value:buildDashboardState,enumerable:false});}
 if(process.env.ANTIGRAVITY_TEST_EXPORT!=='1')startDashboardAndSingletonServer();
 if(process.env.ANTIGRAVITY_TEST_EXPORT!=='1' && !process.stdin.isTTY) {
 const transport = new StdioServerTransport();
