@@ -131,7 +131,16 @@ function getAutopilotEngine() {
       dispatchChunkedEngineTurn,
       runGeminiAttachmentIngestHandshake,
       buildSearchAiCleanPrompt,
-      classifyAttachmentHandshakeStrict
+      classifyAttachmentHandshakeStrict,
+      // ============================================================================
+      // RREGULL I PANEGOCIUESHËM DHE I KYÇUR (INVIOLABLE LOCK - HIGH PRIORITY)
+      // VETËM MOTORËT E VËRTETUAR NË NEON HIGH LEJOHEN (gemini1 dhe gemini2).
+      // NDALOHET KATEGORIKISHT gemini3 DHE NDALOHET COPILOT (web1, web2).
+      // ============================================================================
+      isEngineAvailable: function(engine) {
+        if (engine === 'gemini3' || engine === 'web1' || engine === 'web2') return false;
+        return Boolean(tabs[engine] !== undefined);
+      }
     });
   }
   return autopilotEngine;
@@ -145,26 +154,32 @@ if (!fs.existsSync(REGISTRY_PATH)) fs.writeFileSync(REGISTRY_PATH, JSON.stringif
 
 const contexts = {};
 const contextModes = {};
+// ============================================================================
+// RREGULL I PANEGOCIUESHËM DHE I KYÇUR (INVIOLABLE LOCK - HIGH PRIORITY)
+// NDALOHET KATEGORIKISHT COPILOT (web1/web2).
+// NDALOHET MOTORRI JO-EKZISTUES (gemini3).
+// EKSKLUZIVISHT GEMINI NEON HIGH: VETËM gemini1 (Web 1) DHE gemini2 (Web 2).
+// ============================================================================
 const tabs = {
   web1: null, web2: null,
-  gemini1: null, gemini2: null, gemini3: null,
+  gemini1: null, gemini2: null,
   google_search_1: null, google_search_2: null, google_search_3: null
 };
 const tabAuthStatus = {
   web1: 'UNKNOWN', web2: 'UNKNOWN',
-  gemini1: 'UNKNOWN', gemini2: 'UNKNOWN', gemini3: 'UNKNOWN',
+  gemini1: 'UNKNOWN', gemini2: 'UNKNOWN',
   google_search_1: 'UNKNOWN', google_search_2: 'UNKNOWN', google_search_3: 'UNKNOWN'
 };
 const tabActiveModel = {
   web1: 'GPT-5.6 Sol Think (Deep / High)', web2: 'GPT-5.6 Sol Think (Deep / High)',
-  gemini1: '4 Neon (High)', gemini2: '4 Neon (High)', gemini3: '4 Neon (High)',
+  gemini1: '4 Neon (High)', gemini2: '4 Neon (High)',
   google_search_1: 'Search AI (High)',
   google_search_2: 'Search AI (High)',
   google_search_3: 'Search AI (High)'
 };
 const tabDiscoveredModels = {
   web1: '-', web2: '-',
-  gemini1: '-', gemini2: '-', gemini3: '-',
+  gemini1: '-', gemini2: '-',
   google_search_1: '4 Hydrogen · Everyday help, 4 Carbon · Most complex work',
   google_search_2: '4 Hydrogen · Everyday help, 4 Carbon · Most complex work',
   google_search_3: '4 Hydrogen · Everyday help, 4 Carbon · Most complex work'
@@ -194,7 +209,6 @@ const tabLocks = {
   web2: Promise.resolve(),
   gemini1: Promise.resolve(),
   gemini2: Promise.resolve(),
-  gemini3: Promise.resolve(),
   google_search_1: Promise.resolve(),
   google_search_2: Promise.resolve(),
   google_search_3: Promise.resolve()
@@ -259,6 +273,19 @@ async function getOrLaunchContext(profileName, headless) {
     } catch (_) {}
   }
 
+  // Lidhje direkte me Chrome CDP port 18000 për Gemini (Neon High)
+  if (profileName === 'gemini') {
+    try {
+      const cdpBrowser = await chromium.connectOverCDP('http://127.0.0.1:18000', { timeout: 2000 });
+      const bContexts = cdpBrowser.contexts();
+      if (bContexts.length > 0) {
+        contexts[profileName] = bContexts[0];
+        contextModes[profileName] = 'visible';
+        return contexts[profileName];
+      }
+    } catch (_) {}
+  }
+
   const userDataDir = path.join(PROFILES_DIR, profileName);
   if (!fs.existsSync(userDataDir)) fs.mkdirSync(userDataDir, { recursive: true });
 
@@ -309,15 +336,26 @@ async function getOrCreateTab(tabKey) {
 
   let page = null;
   const existingPages = ctx.pages();
-  for (const p of existingPages) {
-    if (p.isClosed()) continue;
-    const pu = p.url() || '';
-    if (isSearch && (pu.includes('google.com/search') || pu.includes('google.com/ai') || pu.includes('google.com/aimode')) && !Object.entries(tabs).some(([k, t]) => t === p && k !== tabKey)) {
-      page = p;
-      break;
-    } else if (!isSearch && pu.includes(domain) && !Object.entries(tabs).some(([k, t]) => t === p && k !== tabKey)) {
-      page = p;
-      break;
+
+  if (tabKey === 'gemini1') {
+    const archPage = existingPages.find(p => !p.isClosed() && (p.url().includes('9514703eb42c922a') || !Object.entries(tabs).some(([k, t]) => t === p && k !== tabKey)));
+    if (archPage && archPage.url().includes('9514703eb42c922a')) page = archPage;
+  } else if (tabKey === 'gemini2') {
+    const coderPage = existingPages.find(p => !p.isClosed() && (p.url().includes('159f7542a6843ce4') || !Object.entries(tabs).some(([k, t]) => t === p && k !== tabKey)));
+    if (coderPage && coderPage.url().includes('159f7542a6843ce4')) page = coderPage;
+  }
+
+  if (!page) {
+    for (const p of existingPages) {
+      if (p.isClosed()) continue;
+      const pu = p.url() || '';
+      if (isSearch && (pu.includes('google.com/search') || pu.includes('google.com/ai') || pu.includes('google.com/aimode')) && !Object.entries(tabs).some(([k, t]) => t === p && k !== tabKey)) {
+        page = p;
+        break;
+      } else if (!isSearch && pu.includes(domain) && !Object.entries(tabs).some(([k, t]) => t === p && k !== tabKey)) {
+        page = p;
+        break;
+      }
     }
   }
 
@@ -753,20 +791,21 @@ async function ensureMaxReasoningMode(targetFrame, tabKey, opts) {
         const summary='3.1 Pro · Detailed research';
         return {ok:true,status:'GEMINI_MODEL_TIER_VERIFIED',model:{label:summary,selected:true},reasoning:{label:'n/a',selected:true,lowSelected:false},summary:summary};
       }
-      let neonHigh = options().find(function(el) {
+      // RREGULL I KYÇUR: Zgjedh '4 Neon' në menynë kryesore
+      let neonOption = options().find(function(el) {
         const t = normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || ''));
-        return /4\s*neon\s*high/.test(t);
+        return /4\s*neon/.test(t);
       });
-      if (!neonHigh) {
+      if (!neonOption) {
         return {
           ok: false,
           code: 'MODEL_OPTION_NOT_FOUND',
           phase: 'ENSURE_MODEL',
-          observation: 'required_model=4 Neon high ; visible=' + menuRoots.map(function(r){ return normalize(r.innerText).slice(0,200); }).join(' | ')
+          observation: 'required_model=4 Neon ; visible=' + menuRoots.map(function(r){ return normalize(r.innerText).slice(0,200); }).join(' | ')
         };
       }
-      if (!selected(neonHigh)) {
-        click(neonHigh);
+      if (!selected(neonOption)) {
+        click(neonOption);
         await sleep(350);
         triggerResult.el = null;
         trigger = (await wait(function() { const r = findTrigger(); return r && !r.ambiguous ? r.el : null; }, 5000));
@@ -774,12 +813,12 @@ async function ensureMaxReasoningMode(targetFrame, tabKey, opts) {
         click(trigger);
         menuRoots = await wait(function() { const r = mainMenuRoots(); return r.length ? r : null; }, 5000);
         if (!menuRoots) return fail('MODEL_MENU_TIMEOUT', 'ENSURE_MODEL', 'menu_not_reopened');
-        neonHigh = options().find(function(el) {
+        neonOption = options().find(function(el) {
           const t = normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || ''));
-          return /4\s*neon\s*high/.test(t);
+          return /4\s*neon/.test(t);
         });
-        if (!neonHigh || !selected(neonHigh)) {
-          return fail('MODEL_SELECTION_UNVERIFIED', 'ENSURE_MODEL', '4_neon_high_missing_after_rerender');
+        if (!neonOption || !selected(neonOption)) {
+          return fail('MODEL_SELECTION_UNVERIFIED', 'ENSURE_MODEL', '4_neon_missing_after_rerender');
         }
       }
       let thinking = options().find(function(el) {
@@ -806,11 +845,11 @@ async function ensureMaxReasoningMode(targetFrame, tabKey, opts) {
       if (!menuRoots) return fail('MODEL_MENU_TIMEOUT', 'VERIFY', 'verification_menu_missing');
       neonHigh = options().find(function(el) {
         const t = normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || ''));
-        return /4\s*neon\s*high/.test(t);
+        return /4\s*neon/.test(t);
       });
       thinking = options().find(function(el) { return ['menu', 'true', 'listbox'].includes(el.getAttribute('aria-haspopup')) && /thinking level|reasoning level|thinking/.test(normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || ''))); });
-      if (!neonHigh) return fail('MODEL_SELECTION_UNVERIFIED', 'VERIFY', '4_neon_high_missing');
-      if (!selected(neonHigh)) return fail('MODEL_SELECTION_UNVERIFIED', 'VERIFY', '4_neon_high_not_selected');
+      if (!neonHigh) return fail('MODEL_SELECTION_UNVERIFIED', 'VERIFY', '4_neon_missing');
+      if (!selected(neonHigh)) return fail('MODEL_SELECTION_UNVERIFIED', 'VERIFY', '4_neon_not_selected');
       if (!thinking) return fail('GEMINI_THINKING_TRIGGER_NOT_FOUND', 'VERIFY', 'thinking_missing');
       click(thinking);
       const verifySubmenu = await wait(function() { return roots().find(function(root) { return /(^|\s)low(\s|$)/.test(normalize(root.innerText)) && /(^|\s)high(\s|$)|extra thorough/.test(normalize(root.innerText)); }) || null; }, 5000);
@@ -947,6 +986,13 @@ async function resetChatVerified(args){
     return;
   }
   if (!force && activeProjectPerTab[tabKey] === projectRoot) return;
+  if (!force && tabKey.startsWith('gemini') && page && !page.isClosed()) {
+    const u = page.url() || '';
+    if (u.includes('9514703eb42c922a') || u.includes('159f7542a6843ce4')) {
+      activeProjectPerTab[tabKey] = projectRoot;
+      return;
+    }
+  }
   const isGemini = tabKey.startsWith('gemini');
   const target = findChatFrameOrPage(page);
 
@@ -1836,7 +1882,15 @@ async function waitJobSlice(cleanRoot, maxSliceMs) { return getAutopilotEngine()
 async function executeCoreAction(action, payload) {
 payload = payload || {};
 const projectRoot = payload.projectRoot || payload.project_root || process.cwd();
-const cleanRoot = path.resolve(projectRoot);
+let cleanRoot = path.resolve(projectRoot);
+try {
+  if (fs.existsSync(cleanRoot) && fs.statSync(cleanRoot).isFile()) {
+    cleanRoot = path.dirname(cleanRoot);
+    if (['docs', 'doc', 'src', 'config'].includes(path.basename(cleanRoot).toLowerCase())) {
+      cleanRoot = path.dirname(cleanRoot);
+    }
+  }
+} catch (_) {}
 
 // SHTYLLA 1: BLLOKADE FIZIKE ME KOD (CYCLE_EXCLUSIVE_LOCK)
 if (action !== 'run_full_cycle' && action !== 'check_cycle_progress' && !payload._internal) {

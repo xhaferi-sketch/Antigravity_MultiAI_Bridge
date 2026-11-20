@@ -171,7 +171,8 @@ function parseCodeBlocksFromMarkdown(markdown, expectedTargets) {
     }
     results.push({ relPath: clean, code: normalizedCode });
   };
-  const dynamicFencePattern = new RegExp("(?:(?:###\\s*)?FILE:\\s*([^\\r\\n`]+)\\r?\\n\\s*)?(`{3,})([a-zA-Z0-9_+-]*)\\r?\\n([\\s\\S]*?)\\r?\\n\\2(?:\\r?\\n|$)", "g");
+  // Nxjerrje universale e mbrojtur nga mbetjet e DOM-it te Gemini (p.sh. "Gemini said")
+  const dynamicFencePattern = new RegExp("(?:(?:###\\s*)?(?:Gemini said\\s*)?FILE:\\s*([^\\r\\n`]+)\\r?\\n\\s*)?(`{3,})([a-zA-Z0-9_+-]*)\\r?\\n([\\s\\S]*?)\\r?\\n\\2(?:\\r?\\n|$)", "g");
   let match;
   let fenceIndex = 0;
   while ((match = dynamicFencePattern.exec(source)) !== null) {
@@ -186,7 +187,7 @@ function parseCodeBlocksFromMarkdown(markdown, expectedTargets) {
   }
   if (results.length) return results;
   const markers = [];
-  const marker = /^\s*FILE\s*:\s*([^\r\n]+)$/gmi;
+  const marker = /^\s*(?:###\s*)?(?:Gemini said\s*)?FILE\s*:\s*([^\r\n]+)$/gmi;
   while ((match = marker.exec(source)) !== null) markers.push({ index: match.index, end: marker.lastIndex, line: match[1] });
   const PYTHON_STARTERS = [/^import\s+/, /^from\s+\S+\s+import\s+/, /^def\s+[A-Za-z_]\w*\s*\(/, /^async\s+def\s+[A-Za-z_]\w*\s*\(/, /^class\s+[A-Za-z_]\w*/, /^#/, /^@/, /^#!/, /^if\s+__name__\s*==/, /^try\s*:/, /^with\s+.+:/, /^pass(?:\s|$)/, /^[A-Za-z_]\w*(?:\s*:\s*[^=]+)?\s*=/, /^(?:(?:r|u|f|fr|rf)?(?:"""|'''))/i];
   const JS_STARTERS = [/^(?:import|export)\b/, /^(?:const|let|var)\s+[A-Za-z_$]/, /^function\b/, /^async\s+function\b/, /^class\b/, /^\/\//, /^\/\*/, /^module\.exports\b/, /^require\s*\(/, /^['"]use strict['"];?/, /^(?:describe|test|it)\s*\(/];

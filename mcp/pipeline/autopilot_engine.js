@@ -736,9 +736,30 @@ function buildBatchMiniMap(batch, state, limits) {
 }
 
 function extractBatchPlanSlice(planText, batch) {
-  if (typeof planText !== 'string') return '';
-  const lines = planText.split(/\r?\n/);
+  if (typeof planText !== 'string' || !planText.trim()) return '';
   const targets = new Set(((batch && batch.targets) || []).map(normalizeBatchTarget));
+  if (targets.size === 0) return planText;
+
+  const sections = planText.split(/(?=\n#{1,4}\s+)/);
+  const relevantSections = [];
+  const preambleSections = [];
+
+  for (const sec of sections) {
+    const isTargetSpecific = /FILE_TARGET:|ALLOWED_FILES/i.test(sec);
+    const mentionsTarget = Array.from(targets).some(function(t) { return sec.includes(t); });
+
+    if (mentionsTarget) {
+      relevantSections.push(sec.trim());
+    } else if (!isTargetSpecific && relevantSections.length === 0) {
+      preambleSections.push(sec.trim());
+    }
+  }
+
+  if (relevantSections.length > 0) {
+    return [...preambleSections, ...relevantSections].join(NL + NL);
+  }
+
+  const lines = planText.split(/\r?\n/);
   const slice = lines.filter(function(l) {
     return Array.from(targets).some(function(t) { return l.includes(t); });
   });
@@ -874,6 +895,12 @@ function extractTargetsFromError(errorText, knownTargets) {
 
 function getFailoverEngines(primaryEngine, excludedSet, context) {
   const e = excludedSet instanceof Set ? excludedSet : new Set(excludedSet || []);
+  // ============================================================================
+  // RREGULL I PANEGOCIUESHËM DHE I KYÇUR (INVIOLABLE LOCK - HIGH PRIORITY)
+  // Renditja bazë e motorëve të failover-it. Në runtime, context.isEngineAvailable
+  // filtron dhe garanton EKSKLUZIVISHT motorët aktivë Gemini Neon High (gemini1 <-> gemini2).
+  // NDALOHET KATEGORIKISHT kalimi te Copilot apo te motorë fantazmë!
+  // ============================================================================
   const orders = {
     gemini2: ['gemini3', 'gemini1', 'web2'],
     gemini3: ['gemini2', 'gemini1', 'web2'],
@@ -1582,6 +1609,18 @@ function createAutopilotEngine(runtimeContext) {
         const diffResult = spawnSyncFn('git', ['diff', '--', ...allWrittenFiles], { cwd: cleanRoot, encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
         diffStdout = (diffResult && diffResult.stdout) || '';
       } catch (_) {}
+
+      if (!diffStdout || diffStdout.trim().length === 0) {
+        const diffChunks = [];
+        for (const rel of allWrittenFiles) {
+          const abs = path.join(cleanRoot, rel);
+          if (fs.existsSync(abs)) {
+            const fileLines = fs.readFileSync(abs, 'utf8').split('\n');
+            diffChunks.push('--- /dev/null\n+++ b/' + rel + '\n@@ -0,0 +1,' + fileLines.length + ' @@\n' + fileLines.map(function(l) { return '+' + l; }).join('\n'));
+          }
+        }
+        diffStdout = diffChunks.join('\n');
+      }
 
       const review = buildDiffFocusedReviewContext({
         plan: planText,

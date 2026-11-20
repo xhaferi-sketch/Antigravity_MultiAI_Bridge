@@ -5,10 +5,17 @@ const path = require('node:path');
 
 const GEMINI_APP_URL = 'https://' + 'gemini.' + 'google.com' + '/app';
 
+// ============================================================================
+// RREGULL I PANEGOCIUESHËM DHE I KYÇUR (INVIOLABLE LOCK - HIGH PRIORITY)
+// NDALOHET KATEGORIKISHT ÇDO MODALITET TJETËR PËRVEÇ "NEON HIGH" (EXTRA THOROUGH).
+// NDALOHET KATEGORIKISHT NEON LOW (FAST AND EFFICIENT), FLASH OSE AUTO.
+// BUTONI DUHET TË JETË VETËM "Neon\nHigh" ME ARIA "Open mode picker, currently Neon High".
+// ASNJË AGJENT NUK KA TË DREJTË TA NDRYSHOJË APO ZBUTË KËTË KUSHT KURRË!
+// ============================================================================
 const GEMINI_REQUIRED_MODEL = Object.freeze({
   family: 'neon',
   menuPattern: '4\\s*neon',
-  activePattern: '(?:^|\\b)neon(?:\\b|$)',
+  activePattern: 'neon[\\s\\n]+high|currently\\s*neon\\s*high',
   menuLabel: 'Deeper analysis (4 Neon)',
   modelLabel: '4 Neon',
   displayLabel: '4 Neon (High)',
@@ -18,8 +25,7 @@ const GEMINI_REQUIRED_MODEL = Object.freeze({
 
 const geminiModelReceipts = {
   gemini1: null,
-  gemini2: null,
-  gemini3: null
+  gemini2: null
 };
 
 function invalidateGeminiReceipt(tabKey) {
@@ -486,14 +492,26 @@ function createGeminiEngine(runtimeContext) {
         }) || null;
       };
 
+      // ============================================================================
+      // RREGULL I PANEGOCIUESHËM DHE I KYÇUR (INVIOLABLE LOCK - HIGH PRIORITY)
+      // NDALOHET KATEGORIKISHT NEON LOW (FAST AND EFFICIENT) APO ÇDO MODEL TJETËR.
+      // DETYRIM LIGJOR: VETËM "NEON HIGH" (EXTRA THOROUGH).
+      // BUTONI DUHET TË KETË TEKSTIN 'Neon\nHigh' DHE ARIA 'Open mode picker, currently Neon High'.
+      // ÇDO AGJENT DUHET TË RESPEKTOJË KËTË BLLOKIM PA ASNJË MODIFIKIM!
+      // ============================================================================
       const readTriggerState = function(trigger) {
         const text = String(trigger ? (trigger.innerText || '') : '').trim();
         const aria = String(trigger ? (trigger.getAttribute('aria-label') || '') : '').trim();
         const combined = normalize(text + ' ' + aria);
+        const isNeonHighAria = /currently\s*neon\s*high/i.test(aria);
+        const isNeonHighText = /neon[\s\n]+high/i.test(text);
+        const isNeonLowAria = /currently\s*neon$/i.test(aria) || /currently\s*neon\s*(?:low|fast)/i.test(aria);
+        const isNeonLowText = /^neon$/i.test(text.replace(/\s+/g, ' ').trim());
+        const isStrictHigh = (isNeonHighAria || isNeonHighText || activeRe.test(combined)) && !isNeonLowAria && !isNeonLowText;
         return {
           text: text,
           aria: aria,
-          active: activeRe.test(combined) || /currently neon/i.test(aria)
+          active: Boolean(isStrictHigh)
         };
       };
 
@@ -522,6 +540,34 @@ function createGeminiEngine(runtimeContext) {
 
         neonOption.click();
         await sleep(600);
+
+        // Siguro përzgjedhjen e Thinking Level -> High Extra thorough (RREGULL I KYÇUR)
+        let thinkItem = Array.from(document.querySelectorAll('[role="menuitemradio"], [role="menuitem"], [role="option"], gem-menu-item')).find(function(el) {
+          const txt = normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || ''));
+          return /thinking level/i.test(txt);
+        });
+        if (!thinkItem) {
+          trigger = findTrigger();
+          if (trigger) { trigger.click(); await sleep(400); }
+          thinkItem = Array.from(document.querySelectorAll('[role="menuitemradio"], [role="menuitem"], [role="option"], gem-menu-item')).find(function(el) {
+            const txt = normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || ''));
+            return /thinking level/i.test(txt);
+          });
+        }
+        if (thinkItem) {
+          thinkItem.click();
+          await sleep(500);
+          const subOptions = Array.from(document.querySelectorAll('gem-menu-item, [role="menuitemradio"], [role="menuitem"], [role="option"]'));
+          const highOption = subOptions.find(function(el) {
+            const txt = normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || ''));
+            return /high.*thorough|extra thorough/i.test(txt);
+          });
+          if (highOption) {
+            highOption.click();
+            await sleep(500);
+          }
+        }
+
         document.querySelectorAll('.cdk-overlay-backdrop').forEach(function(b) { b.click(); });
         await sleep(300);
 
