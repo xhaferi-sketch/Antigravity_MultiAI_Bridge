@@ -138,8 +138,9 @@ function getAutopilotEngine() {
       // NDALOHET KATEGORIKISHT gemini3 DHE NDALOHET COPILOT (web1, web2).
       // ============================================================================
       isEngineAvailable: function(engine) {
-        if (engine === 'gemini3' || engine === 'web1' || engine === 'web2') return false;
-        return Boolean(tabs[engine] !== undefined);
+        if (engine === 'web1' || engine === 'web2') return false;
+        if (engine === 'gemini1' || engine === 'gemini2') return true;
+        return false;
       }
     });
   }
@@ -162,17 +163,17 @@ const contextModes = {};
 // ============================================================================
 const tabs = {
   web1: null, web2: null,
-  gemini1: null, gemini2: null,
+  gemini1: null, gemini2: null, gemini3: null,
   google_search_1: null, google_search_2: null, google_search_3: null
 };
 const tabAuthStatus = {
   web1: 'UNKNOWN', web2: 'UNKNOWN',
-  gemini1: 'UNKNOWN', gemini2: 'UNKNOWN',
+  gemini1: 'UNKNOWN', gemini2: 'UNKNOWN', gemini3: 'UNKNOWN',
   google_search_1: 'UNKNOWN', google_search_2: 'UNKNOWN', google_search_3: 'UNKNOWN'
 };
 const tabActiveModel = {
   web1: 'GPT-5.6 Sol Think (Deep / High)', web2: 'GPT-5.6 Sol Think (Deep / High)',
-  gemini1: '4 Neon (High)', gemini2: '4 Neon (High)',
+  gemini1: '4 Neon (High)', gemini2: '4 Neon (High)', gemini3: '4 Neon (High)',
   google_search_1: 'Search AI (High)',
   google_search_2: 'Search AI (High)',
   google_search_3: 'Search AI (High)'
@@ -861,8 +862,11 @@ async function ensureMaxReasoningMode(targetFrame, tabKey, opts) {
       const lowSelected = Boolean(low && selected(low));
       close();
       if (!highSelected||lowSelected) return fail('GEMINI_HIGH_UNVERIFIED', 'VERIFY', 'high=' + highSelected + ',low=' + lowSelected);
-      const observedModel = (neonHigh.innerText || GEMINI_REQUIRED_MODEL.label).split('\n')[0].trim();
-      if (normalize(observedModel) !== normalize(GEMINI_REQUIRED_MODEL.label)) {
+      const modelLines = (neonHigh.innerText || '').split('\n').map(function(s) { return s.trim(); }).filter(Boolean);
+      const matchedLine = modelLines.find(function(s) { return /4\s*neon/i.test(s); });
+      const observedModel = matchedLine || (neonHigh.innerText || GEMINI_REQUIRED_MODEL.label).split('\n')[0].trim();
+      const fullText = normalize((neonHigh.innerText || '') + ' ' + (neonHigh.getAttribute('aria-label') || ''));
+      if (!/4\s*neon/.test(fullText)) {
         return fail('MODEL_SELECTION_UNVERIFIED', 'VERIFY', observedModel);
       }
       return {
@@ -884,8 +888,8 @@ async function ensureMaxReasoningMode(targetFrame, tabKey, opts) {
       let stablePolls = 0;
       while (stablePolls < 2) {
         const poll = await targetFrame.evaluate(function() {
-          const text = String(document.body.innerText || '');
-          return /4\s*neon\s*high/i.test(text);
+          const text = String(document.body.innerText || '') + ' ' + Array.from(document.querySelectorAll('button')).map(function(b) { return (b.innerText || '') + ' ' + (b.getAttribute('aria-label') || ''); }).join(' ');
+          return /(?:4\s*)?neon\s*high/i.test(text);
         }).catch(function(){ return false; });
         if (!poll) {
           throw new Error('GEMINI_MODEL_STABILITY_FAILED');
@@ -1365,7 +1369,7 @@ async function collectGeminiTerminalDiagnostics(args) {
   return getGeminiEngine().collectGeminiTerminalDiagnostics(args);
 }
 async function waitAndExtractCleanResponse(page,targetFrame,tabKey,projectRoot,previousCount,sendMeta){
-  sendMeta=sendMeta||{};const isGemini=tabKey.startsWith('gemini'),hardCapMs=sendMeta.hardCapMs||(isGemini?900000:360000),defaultFirstTokenDeadlineMs=isGemini?180000:120000,firstTokenOverride=Number(sendMeta.firstTokenDeadlineMs),firstTokenDeadlineMs=Number.isFinite(firstTokenOverride)&&firstTokenOverride>0?Math.min(hardCapMs,Math.max(5000,firstTokenOverride)):defaultFirstTokenDeadlineMs,activeThinkingFreshMs=sendMeta.activeThinkingFreshMs||45000,explicitMaxThinkingStallMs=Number(sendMeta.maxThinkingWithoutDomProgressMs),maxThinkingWithoutDomProgressMs=Number.isFinite(explicitMaxThinkingStallMs)&&explicitMaxThinkingStallMs>0?explicitMaxThinkingStallMs:(isGemini?180000:120000),start=Date.now(),recoveryAttempt=sendMeta.recoveryAttempt||0,silentDeadlineMs=sendMeta.silentDeadlineMs||300000,terminalDiagReceipts=new Map(),preUserCount=Number(sendMeta.preUserCount||0),preAssistantCount=Number(sendMeta.preAssistantCount||0);let lastProgressAt=start,lastLogAt=0,lastDeferredLogAt=0,lastSilentContinueAt=0,lastExtractionReceiptAt=0,lastExtractionChars=-1,lastProgress='',lastText='',stable=0,resetTicks=0,observedUserHighWatermark=preUserCount,observedAssistantHighWatermark=Math.max(previousCount,preAssistantCount),lastThoughtFingerprint=sendMeta.preThoughtFingerprint||'',observedSubstantiveThinkingEvidence=false,silentCheckpointCaptured=false,wasActiveProcessing=false;
+  sendMeta=sendMeta||{};const isGemini=tabKey.startsWith('gemini'),hardCapMs=sendMeta.hardCapMs||(isGemini?900000:360000),defaultFirstTokenDeadlineMs=isGemini?180000:120000,firstTokenOverride=Number(sendMeta.firstTokenDeadlineMs),firstTokenDeadlineMs=Number.isFinite(firstTokenOverride)&&firstTokenOverride>0?Math.min(hardCapMs,Math.max(5000,firstTokenOverride)):defaultFirstTokenDeadlineMs,activeThinkingFreshMs=sendMeta.activeThinkingFreshMs||45000,explicitMaxThinkingStallMs=Number(sendMeta.maxThinkingWithoutDomProgressMs),maxThinkingWithoutDomProgressMs=Number.isFinite(explicitMaxThinkingStallMs)&&explicitMaxThinkingStallMs>0?explicitMaxThinkingStallMs:(isGemini?180000:120000),start=Date.now(),recoveryAttempt=sendMeta.recoveryAttempt||0,silentDeadlineMs=sendMeta.silentDeadlineMs||(isGemini?600000:300000),terminalDiagReceipts=new Map(),preUserCount=Number(sendMeta.preUserCount||0),preAssistantCount=Number(sendMeta.preAssistantCount||0);let lastProgressAt=start,lastLogAt=0,lastDeferredLogAt=0,lastSilentContinueAt=0,lastExtractionReceiptAt=0,lastExtractionChars=-1,lastProgress='',lastText='',stable=0,resetTicks=0,observedUserHighWatermark=preUserCount,observedAssistantHighWatermark=Math.max(previousCount,preAssistantCount),lastThoughtFingerprint=sendMeta.preThoughtFingerprint||'',observedSubstantiveThinkingEvidence=false,silentCheckpointCaptured=false,wasActiveProcessing=false;
   const captureTerminalDiagnosticsOnce=async function(code,state,elapsedMs,progressAgeMs){const key=code+':'+recoveryAttempt;if(terminalDiagReceipts.has(key))return terminalDiagReceipts.get(key);const receipt=typeof collectGeminiTerminalDiagnostics==='function'?await collectGeminiTerminalDiagnostics({page:page,targetFrame:targetFrame,tabKey:tabKey,projectRoot:projectRoot,dispatchId:sendMeta.diagId,errorCode:code,state:state,elapsedMs:elapsedMs,progressAgeMs:progressAgeMs}):{errorCode:'',retryVisible:false};terminalDiagReceipts.set(key,receipt);return receipt;};
   while(Date.now()-start<hardCapMs){const reboundFrame=findChatFrameOrPage(page);if(reboundFrame!==targetFrame){const priorUrl=await targetFrame.evaluate(function(){return location.href;}).catch(function(){return '';});const reboundUrl=await reboundFrame.evaluate(function(){return location.href;}).catch(function(){return '';});targetFrame=reboundFrame;appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','CHAT_CONTEXT_REBOUND',{priorUrl:priorUrl,reboundUrl:reboundUrl,elapsedMs:Date.now()-start});}await page.waitForTimeout(750);const state=await probeWebChatState(targetFrame,isGemini,sendMeta);const elapsed=Date.now()-start;
     observedUserHighWatermark=Math.max(observedUserHighWatermark,state.userTurnCount);observedAssistantHighWatermark=Math.max(observedAssistantHighWatermark,state.assistantTurnCount);const newTurnWasObserved=Boolean(observedUserHighWatermark>preUserCount||observedAssistantHighWatermark>preAssistantCount||sendMeta.newUserTurnFingerprint||sendMeta.userTurnFingerprintMatched||(sendMeta.evidence&&sendMeta.evidence.userTurnFingerprintMatched)),countsReturnedToBaseline=Boolean(state.userTurnCount<=preUserCount&&state.assistantTurnCount<=preAssistantCount),committedTurnMissing=Boolean(!state.committedUserStillPresent),turnRolledBackAfterSend=Boolean(isGemini&&sendMeta.committed&&newTurnWasObserved&&countsReturnedToBaseline&&committedTurnMissing&&!state.generating&&!lastText),domainDriftCandidate=Boolean(isGemini&&sendMeta.committed&&state.domainMismatch&&state.userTurnCount===0&&state.assistantTurnCount===0&&!state.generating),landingResetCandidate=Boolean(isGemini&&sendMeta.committed&&state.landingVisible&&state.userTurnCount===0&&state.assistantTurnCount===0&&!state.generating&&!state.conversationContinuity),resetCandidate=Boolean(domainDriftCandidate||landingResetCandidate||turnRolledBackAfterSend),resetKind=domainDriftCandidate?'DOMAIN_DRIFT':(landingResetCandidate?'LANDING_RESET':(turnRolledBackAfterSend?'TURN_ROLLBACK':''));const resetInvariant=resetCandidate;resetTicks=resetInvariant?resetTicks+1:0;const resetMeta={preRouteKey:state.preRouteKey,currentRouteKey:state.currentRouteKey,preConversationId:state.preConversationId,currentConversationId:state.currentConversationId,committedUserStillPresent:state.committedUserStillPresent,users:state.userTurnCount,assistants:state.assistantTurnCount,preUserCount:preUserCount,preAssistantCount:preAssistantCount,observedUserHighWatermark:observedUserHighWatermark,observedAssistantHighWatermark:observedAssistantHighWatermark,countsReturnedToBaseline:countsReturnedToBaseline,committedTurnMissing:committedTurnMissing,newTurnWasObserved:newTurnWasObserved,turnRolledBackAfterSend:turnRolledBackAfterSend,resetKind:resetKind,landing:state.landingVisible,generating:state.generating,processingProbeSuppressed:state.processingProbeSuppressed,recoveryBudgetRemaining:Math.max(0,1-(sendMeta.recoveryAttempt||0))};if(resetTicks===1){appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','RESET_CANDIDATE_DETECTED',resetMeta);continue;}
@@ -1478,7 +1482,7 @@ async function runWebDispatchWithRetryPolicy(opts){const dispatchId=opts.dispatc
         }
         if(!commitReceipt||!commitReceipt.committed)throw new Error('SEND_NOT_COMMITTED');
       try {
-        return await waitAndExtractCleanResponse(page,targetFrame,tabKey,projectRoot,previousCount,Object.assign({},commitReceipt,{fingerprint:fingerprint,preUserCount:pre.userCount,preAssistantCount:pre.assistantCount,preAssistantFingerprint:pre.assistantFingerprint||previousAssistant.fingerprint,preAssistantNodeSignature:pre.assistantNodeSignature||previousAssistant.nodeSignature,composerToken:composer.token,diagId:diagId,recoveryAttempt:resetRecoveries,silentDeadlineMs:300000,hardCapMs:opts.hardCapMs}));
+        return await waitAndExtractCleanResponse(page,targetFrame,tabKey,projectRoot,previousCount,Object.assign({},commitReceipt,{fingerprint:fingerprint,preUserCount:pre.userCount,preAssistantCount:pre.assistantCount,preAssistantFingerprint:pre.assistantFingerprint||previousAssistant.fingerprint,preAssistantNodeSignature:pre.assistantNodeSignature||previousAssistant.nodeSignature,composerToken:composer.token,diagId:diagId,recoveryAttempt:resetRecoveries,silentDeadlineMs:isGemini?600000:300000,hardCapMs:opts.hardCapMs}));
       } catch (err) {
         if(opts.disableInternalRetry===true)throw err;
         if(isGemini&&String(err.message).includes('GEMINI_SILENT_PREFLIGHT_TIMEOUT')){

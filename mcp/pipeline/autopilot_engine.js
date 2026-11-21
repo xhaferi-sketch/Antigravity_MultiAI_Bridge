@@ -1178,7 +1178,7 @@ function createAutopilotEngine(runtimeContext) {
     const rules = fs.existsSync(rulesPath) ? fs.readFileSync(rulesPath, 'utf8') : '';
     const instruction = rules + NL + NL + 'Implemento VETEM target-et (' + batch.targets.join(', ') + ').' + NL + NL +
       'OUTPUT CONTRACT:' + NL +
-      '- For existing files: Return ONLY a valid Git unified diff patch (diff --git a/... b/..., --- a/..., +++ b/..., @@ ... @@).' + NL +
+      '- For existing or new files: Return EITHER complete file in ### FILE: path code fence OR valid Git unified diff patch (diff --git a/... b/...).' + NL +
       '- For new files: Return ### FILE: path followed by complete file code in code fence.' + NL +
       '- Target 200-500 lines of diff (up to 800 lines max).' + NL +
       '- Touch ONLY ALLOWED_FILES and SYMBOL_SCOPE. No prose.';
@@ -1249,7 +1249,7 @@ function createAutopilotEngine(runtimeContext) {
     const repairFormat = async function(failure) {
       if (formatRepairUsed) throw new Error(failure);
       formatRepairUsed = true;
-      const repairPrompt = 'KORRIGJIM I VETEM FORMATI/SINTAKSE. ' + failure + NL + 'Kthe VETEM target-et e autorizuara: ' + batch.targets.join(', ') + NL + 'Per skedaret ekzistues kthe Git unified diff; per skedaret e rinj perdor ### FILE: path me code fence te plote. Mos jep prose ose skedare ekstra.';
+      const repairPrompt = 'KORRIGJIM I VETEM FORMATI/SINTAKSE. ' + failure + NL + 'Kthe VETEM target-et e autorizuara: ' + batch.targets.join(', ') + NL + 'Per skedaret e autorizuar kthe EITHER ### FILE: path me code fence te plote OR Git unified diff. Mos jep prose ose skedare ekstra.';
       return dispatch(repairPrompt, null, false);
     };
 

@@ -299,6 +299,126 @@ function freshProjectErrorLog(projectRoot, startedMs, fsModule) {
   }
 }
 
+function tryExtractFileFromAllAdditions(patchText, relPath) {
+  const fileHeader = 'diff --git a/' + relPath + ' b/' + relPath;
+  const match = patchText.indexOf(fileHeader);
+  if (match < 0) return null;
+  const tail = patchText.slice(match);
+  const nextDiffIndex = tail.slice(fileHeader.length).search(/^diff --git /m);
+  const fileDiff = nextDiffIndex >= 0 ? tail.slice(0, fileHeader.length + nextDiffIndex) : tail;
+  
+  const hunkStart = fileDiff.search(/^@@ /m);
+  if (hunkStart < 0) return null;
+  const lines = fileDiff.slice(hunkStart).split(/\r?\n/);
+  const contentLines = [];
+  let inHunk = false;
+  let hasPlus = false;
+  for (const line of lines) {
+    if (line.startsWith('@@ ')) {
+      inHunk = true;
+      continue;
+    }
+    if (!inHunk) continue;
+    if (line.startsWith('+')) {
+      contentLines.push(line.slice(1));
+      hasPlus = true;
+    } else if (line.startsWith('-') || line.startsWith(' ')) {
+      return null;
+    } else if (line.startsWith('\\ No newline')) {
+      continue;
+    } else if (!line.trim()) {
+      contentLines.push('');
+    } else {
+      return null;
+    }
+  }
+  return hasPlus ? contentLines.join('\n') : null;
+}
+
+function applyHunksToText(originalText, fileDiff) {
+  const hunkPattern = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/gm;
+  const hunkMatches = [];
+  let m;
+  while ((m = hunkPattern.exec(fileDiff)) !== null) {
+    hunkMatches.push({
+      index: m.index,
+      oldStart: parseInt(m[1], 10),
+      oldLen: m[2] !== undefined ? parseInt(m[2], 10) : 1,
+      newStart: parseInt(m[3], 10),
+      newLen: m[4] !== undefined ? parseInt(m[4], 10) : 1,
+      headerLength: m[0].length
+    });
+  }
+  if (!hunkMatches.length) return null;
+
+  let origLines = originalText.split(/\r?\n/);
+  let lineOffset = 0;
+
+  for (let i = 0; i < hunkMatches.length; i++) {
+    const cur = hunkMatches[i];
+    const hunkStart = cur.index + cur.headerLength;
+    const hunkEnd = i + 1 < hunkMatches.length ? hunkMatches[i + 1].index : fileDiff.length;
+    const hunkBody = fileDiff.slice(hunkStart, hunkEnd);
+    const hunkLines = hunkBody.split(/\r?\n/).filter((l, idx, arr) => {
+      if (idx === arr.length - 1 && l === '') return false;
+      return true;
+    });
+
+    const expectedOld = [];
+    const replacementNew = [];
+
+    for (const hl of hunkLines) {
+      if (hl.startsWith('+')) {
+        replacementNew.push(hl.slice(1));
+      } else if (hl.startsWith('-')) {
+        expectedOld.push(hl.slice(1));
+      } else if (hl.startsWith(' ')) {
+        expectedOld.push(hl.slice(1));
+        replacementNew.push(hl.slice(1));
+      } else if (hl.startsWith('\\ No newline')) {
+        continue;
+      }
+    }
+
+    if (!expectedOld.length && !replacementNew.length) continue;
+
+    let searchStart = Math.max(0, cur.oldStart - 1 + lineOffset);
+    let matchIdx = -1;
+
+    const matchesAt = (pos) => {
+      if (pos + expectedOld.length > origLines.length) return false;
+      for (let k = 0; k < expectedOld.length; k++) {
+        if (origLines[pos + k].trimEnd() !== expectedOld[k].trimEnd()) return false;
+      }
+      return true;
+    };
+
+    if (matchesAt(searchStart)) {
+      matchIdx = searchStart;
+    } else {
+      for (let delta = 1; delta <= 50; delta++) {
+        if (searchStart - delta >= 0 && matchesAt(searchStart - delta)) {
+          matchIdx = searchStart - delta;
+          break;
+        }
+        if (searchStart + delta < origLines.length && matchesAt(searchStart + delta)) {
+          matchIdx = searchStart + delta;
+          break;
+        }
+      }
+    }
+
+    if (matchIdx < 0) {
+      return null;
+    }
+
+    origLines.splice(matchIdx, expectedOld.length, ...replacementNew);
+    lineOffset += replacementNew.length - expectedOld.length;
+  }
+
+  return origLines.join('\n');
+}
+
 function createLocalExecutor(runtimeContext) {
   if (!runtimeContext || typeof runtimeContext !== 'object') {
     throw new Error('Mandatory runtimeContext dependency is required for createLocalExecutor');
@@ -364,7 +484,9 @@ function createLocalExecutor(runtimeContext) {
       if (patchStart >= 0) {
         const patchTail = batchOutput.slice(patchStart);
         const fileBlockStart = patchTail.search(/^### FILE:/m);
-        const patchText = (fileBlockStart >= 0 ? patchTail.slice(0, fileBlockStart) : patchTail).trimEnd() + NL;
+        let rawPatch = (fileBlockStart >= 0 ? patchTail.slice(0, fileBlockStart) : patchTail).trimEnd();
+        rawPatch = rawPatch.replace(/\r?\n```[a-zA-Z0-9_-]*\s*$/g, '').trimEnd();
+        const patchText = rawPatch + NL;
         const patchLines = patchText.split('\n').length;
         if (patchLines > 800) {
           throw new Error('PATCH_EXCEEDS_SIZE_LIMIT: ' + patchLines + ' lines exceeds maximum 800');
@@ -420,16 +542,53 @@ function createLocalExecutor(runtimeContext) {
           check = spawnSync('git', ['apply', '--check', '--3way', '--recount', '--whitespace=error-all', patchFile], { cwd: root, encoding: 'utf8' });
           applyArgs = ['apply', '--3way', '--recount', '--whitespace=error-all', patchFile];
         }
+        let gitApplySuccess = false;
         if (check.error || check.status !== 0) {
-          throw new Error('GIT_APPLY_CHECK_FAILED: ' + truncateUtf8((check.stderr || '') + (check.stdout || ''), 4000));
+          let fallbackSuccess = true;
+          for (const rel of patchPaths) {
+            const abs = absoluteTarget(rel);
+            const extractedAllAdd = tryExtractFileFromAllAdditions(patchText, rel);
+            if (extractedAllAdd !== null) {
+              backupOnce(rel);
+              const tmp = abs + '.antigravity-tmp';
+              fs.writeFileSync(tmp, extractedAllAdd, 'utf8');
+              fs.renameSync(tmp, abs);
+              continue;
+            }
+            if (fs.existsSync(abs)) {
+              const origText = fs.readFileSync(abs, 'utf8');
+              const fileHeader = 'diff --git a/' + rel + ' b/' + rel;
+              const fStart = patchText.indexOf(fileHeader);
+              const fTail = fStart >= 0 ? patchText.slice(fStart) : patchText;
+              const nextDiffIdx = fTail.slice(fileHeader.length).search(/^diff --git /m);
+              const fileDiff = nextDiffIdx >= 0 ? fTail.slice(0, fileHeader.length + nextDiffIdx) : fTail;
+              const patched = applyHunksToText(origText, fileDiff);
+              if (patched !== null) {
+                backupOnce(rel);
+                const tmp = abs + '.antigravity-tmp';
+                fs.writeFileSync(tmp, patched, 'utf8');
+                fs.renameSync(tmp, abs);
+                continue;
+              }
+            }
+            fallbackSuccess = false;
+            break;
+          }
+          if (fallbackSuccess) {
+            gitApplySuccess = true;
+          } else {
+            throw new Error('GIT_APPLY_CHECK_FAILED: ' + truncateUtf8((check.stderr || '') + (check.stdout || ''), 4000));
+          }
         }
-        const applied = spawnSync('git', applyArgs, { cwd: root, encoding: 'utf8' });
-        if (applied.error || applied.status !== 0) {
-          throw new Error('GIT_APPLY_FAILED: ' + truncateUtf8((applied.stderr || '') + (applied.stdout || ''), 4000));
-        }
-        if (applyArgs.includes('--3way')) {
-          const unmerged = spawnSync('git', ['ls-files', '--unmerged'], { cwd: root, encoding: 'utf8' });
-          if (unmerged.error || unmerged.status !== 0 || String(unmerged.stdout || '').trim()) throw new Error('GIT_APPLY_THREE_WAY_CONFLICT');
+        if (!gitApplySuccess) {
+          const applied = spawnSync('git', applyArgs, { cwd: root, encoding: 'utf8' });
+          if (applied.error || applied.status !== 0) {
+            throw new Error('GIT_APPLY_FAILED: ' + truncateUtf8((applied.stderr || '') + (applied.stdout || ''), 4000));
+          }
+          if (applyArgs.includes('--3way')) {
+            const unmerged = spawnSync('git', ['ls-files', '--unmerged'], { cwd: root, encoding: 'utf8' });
+            if (unmerged.error || unmerged.status !== 0 || String(unmerged.stdout || '').trim()) throw new Error('GIT_APPLY_THREE_WAY_CONFLICT');
+          }
         }
         patchPaths.forEach(function(rel) { seen.add(rel); });
       }

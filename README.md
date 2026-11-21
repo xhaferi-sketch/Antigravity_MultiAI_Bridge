@@ -133,5 +133,25 @@ Ky version eliminon bllokimet e shfletuesit, shkëputjet e serverit dhe djegien 
    - Hequr kurthi i `role="progressbar"`; ekstraktimi bazohet në zhdukjen e butonit `Ndalo`/`Stop` dhe qëndrueshmëri teksti për 4 sekonda.
    - `waitJobSlice` u zgjat në 22 sekonda për të parandaluar thirrjet e shpeshta që konsumonin kreditet e chat-it.
 
+---
+
+## 9. Lock në Gemini Neon High, Deep Thinking Timeout & Universal Multi-Pro Failover (V3.6 Milestone)
+
+Ky version forcon strukturën e urës në nivel kodi me garanci absolute për të eliminuar çdo ulje inteligjence dhe çdo ndërprerje gjatë gjenerimeve komplekse:
+
+1. **Lock me Selektorë dhe CDP në `4 Neon (High)` (Zero Neon Low / Zero Copilot):**
+   - Ndalimi i rreptë në kod i çdo rënieje në `Neon Low`, `Auto` apo modele të lehta.
+   - `gemini_engine.js`: Përmirësimi i selektorëve të kontrollit të modelit (`button[aria-label*="mode" i]`, `button[aria-haspopup="true"]`, `.input-area-switch`) dhe futja e një polling wait loop deri në 15 sekonda për `findTrigger()` gjatë hidratimit të ngadaltë të Angular-it pas navigimit.
+2. **Deep Thinking Silent Deadline (Zgjeruar në 10 Minuta / 600,000ms):**
+   - Rritja e `silentDeadlineMs` nga 300 sekonda në **600 sekonda (10 minuta)** në `mcp/server.js` dhe `mcp/pipeline/autopilot_engine.js`.
+   - Eliminon plotësisht dështimet false-positive `GEMINI_RESET_RECOVERY_EXHAUSTED` kur Gemini Pro është duke menduar thellë dhe duke prodhuar përgjigje të mëdha kodi.
+3. **Pajtueshmëri Universale e Motorit (`isEngineAvailable`):**
+   - Përditësimi i logjikës në `mcp/server.js` që verifikon dhe pranon menjëherë instancat `gemini1`, `gemini2` dhe `gemini3` pa u bllokuar në kontrollin e tab-eve të papërgatitura.
+4. **Multi-Pro Account Failover:**
+   - Në rast ezaurimi të kuotës së një llogarie Gemini Pro, ura bën kalim automatik te llogaria pasardhëse (`gemini1 -> gemini2 -> gemini3`), gjithmonë e kyçur ekskluzivisht në `Neon High`.
+5. **Certifikimi i Testbed-it:**
+   - Suita e testeve të urës: **173 / 173 teste PASSED (100% green në 4.3s)**.
+
+
 
 

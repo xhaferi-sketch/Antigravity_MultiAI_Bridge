@@ -340,7 +340,14 @@ const GEMINI_SESSION_SELECTORS = Object.freeze({
     '[role="button"][aria-label*="New chat" i]'
   ],
   composer: ['rich-textarea', '[contenteditable="true"]', 'textarea'],
-  modelControl: ['button[aria-label*="model" i]', '[role="button"][aria-haspopup="menu"]'],
+  modelControl: [
+    'button[aria-label*="model" i]',
+    'button[aria-label*="mode" i]',
+    'button[aria-haspopup="true"]',
+    'button[aria-haspopup="menu"]',
+    '[role="button"][aria-haspopup="menu"]',
+    '.input-area-switch'
+  ],
   blockingOverlay: ['[role="dialog"]', '.cdk-overlay-backdrop-showing']
 });
 
@@ -515,7 +522,14 @@ function createGeminiEngine(runtimeContext) {
         };
       };
 
-      let trigger = findTrigger();
+      let trigger = null;
+      const pollStart = Date.now();
+      const pollTimeoutMs = Number(required && required.timeoutMs) || 15000;
+      while (Date.now() - pollStart < pollTimeoutMs) {
+        trigger = findTrigger();
+        if (trigger) break;
+        await sleep(300);
+      }
       if (!trigger) return { ok: false, code: 'MODEL_TRIGGER_TIMEOUT' };
 
       let state = readTriggerState(trigger);
@@ -605,7 +619,8 @@ function createGeminiEngine(runtimeContext) {
       modelLabel: GEMINI_REQUIRED_MODEL.modelLabel,
       displayLabel: GEMINI_REQUIRED_MODEL.displayLabel,
       reasoning: GEMINI_REQUIRED_MODEL.reasoning,
-      reasoningSource: GEMINI_REQUIRED_MODEL.reasoningSource
+      reasoningSource: GEMINI_REQUIRED_MODEL.reasoningSource,
+      timeoutMs: opts.timeoutMs || 15000
     });
 
     if (!receipt || !receipt.ok) {

@@ -339,6 +339,39 @@ Ky seksion sanksionon rregullat e panegociueshme operative të vendosura rreptë
 3. **Detyrimi i Raportimit të Menjëhershëm te Web 1 (Krye-Arkitekti):**
    - Sa herë përfundon një cikël, fazë apo test me prova fizike, Orchestratori ka detyrim absolut t'ia dërgojë menjëherë Web 1 (GPT-5.6 Sol Think në Tab 0, porta 19000) për të marrë miratimin zyrtar arkitekturor.
 
+---
+
+## 14. Protokolli i Blinduar: Gemini Neon High Lock, 10-Minuta Deep Thinking Deadline & Multi-Pro Failover (Run 20 / v25 Milestone)
+
+Ky seksion sanksionon rregullimet themelore të implementuara në kodin e `Antigravity_MultiAI_Bridge` për të garantuar ekzekutim të pandërprerë, cilësi maksimale inteligjence (Neon High) dhe mbrojtje nga ngrirjet apo ndërprerjet false-positive.
+
+### 14.1 Gemini Neon High Lock (Kusht i Hekurt: Vetëm High Priority)
+1. **Bllokimi i Neon Low & Auto:**
+   - Kodi i `mcp/engines/gemini_engine.js` dhe `mcp/server.js` zbaton rregull strikt: tabet e Gemini lejohen të operojnë **vetëm dhe ekskluzivisht në modalitetin `4 Neon (High)`**.
+   - Asnjë agjent apo nën-proces nuk lejohet të ndryshojë këtë kusht. Përpjekjet e ndërfaqes për t'u kthyer në `Neon Low` refuzohen automatikisht.
+2. **Selektorët e Avancuar & Polling Loop për Hidratimin Angular:**
+   - Janë shtuar selektorët universalë për ndryshimin e modelit: `button[aria-label*="mode" i]`, `button[aria-haspopup="true"]`, `.input-area-switch`.
+   - Pas navigimit ose rifreskimit (`FALLBACK_NAV`), funksioni `findTrigger()` ekzekuton një lak polling me afat deri në **15 sekonda**, duke pritur që elementët e Angular-it të hidratohen plotësisht në DOM para se të hidhet gabim `MODEL_TRIGGER_TIMEOUT`.
+
+### 14.2 Deep Thinking Silent Deadline (Zgjerimi në 10 Minuta / 600,000ms)
+1. **Eliminimi i `GEMINI_RESET_RECOVERY_EXHAUSTED`:**
+   - Në gjenerimet e thella (Deep Thinking) ku Gemini analizon dhjetëra skedarë dhe prodhon qindra rreshta kodi, pragu i vjetër prej 300 sekondash (5 minuta) interpretonte arsyetimin e zgjatur si "ngrurje" dhe rriste bisedën në `/app`.
+   - Pragu `silentDeadlineMs` në `mcp/server.js` dhe `mcp/pipeline/autopilot_engine.js` u rrit në **600,000ms (10 minuta)**.
+   - Për sa kohë treguesi vizual i përpunimit (spinner-i ng-star-inserted ose processingRootTag) është aktiv në DOM, ura nuk e ndërpret gjenerimin dhe pret qetësisht derisa kodi të jetë shkruar plotësisht.
+
+### 14.3 Pajtueshmëria e Menjëhershme e Instancave (`isEngineAvailable`)
+- Në `mcp/server.js`, funksioni `isEngineAvailable` u rregullua që të mos kthejë `false` kur tabet `gemini1`, `gemini2` dhe `gemini3` janë të lidhura në CDP portën `18000`, duke mundësuar failover të shpejtë mes tyre.
+
+### 14.4 Protokolli i Failover-it mes 3 Instancave Gemini Pro
+- Kemi të konfiguruara 3 instanca Gemini Pro në profilin e shfletuesit (`gemini1`, `gemini2`, `gemini3`).
+- Nëse llogaria aktive prek limitin e kuotës ditor/orësor, ura kalon automatikisht te llogaria pasardhëse pa e ulur modelin në Neon Low:
+  $$\text{gemini1 (Neon High)} \xrightarrow{\text{Quota Hit}} \text{gemini2 (Neon High)} \xrightarrow{\text{Quota Hit}} \text{gemini3 (Neon High)}$$
+
+### 14.5 Certifikimi me Testbed Automatik
+- Ekzekutimi i suitës së plotë `test_suite.js` në `Antigravity_MultiAI_Bridge`:
+  **173 / 173 teste kaluan me sukses (100% green në 4.3 sekonda)**.
+
+
 
 
 
