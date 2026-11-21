@@ -1058,7 +1058,7 @@ function createAutopilotEngine(runtimeContext) {
   }
 
   async function waitJobSlice(cleanRoot, maxSliceMs) {
-    if (!maxSliceMs) maxSliceMs = 22000;
+    if (!maxSliceMs) maxSliceMs = 240000;
     const norm = path.resolve(cleanRoot);
     const start = Date.now();
     while (Date.now() - start < maxSliceMs) {
@@ -1092,8 +1092,12 @@ function createAutopilotEngine(runtimeContext) {
       repoMapReceipt: job && job.repoMapReceipt || null,
       planningPath: job && job.planningPath || null,
       elapsedSeconds: job ? Math.round((Date.now() - job.startedAt) / 1000) : 0,
+      canonicalToolName: 'mcp__multi_ai_relay__check_cycle_progress',
+      alternativeToolNames: ['check_cycle_progress', 'mcp__multi_ai_relay__check_cycle_progress', 'multi-ai-relay/check_cycle_progress'],
       nextRequiredToolCall: 'check_cycle_progress',
-      instruction: 'Puna po vazhdon normalisht ne sfond. Thirr MENJEHERE mjetin check_cycle_progress(projectRoot) PA ekzekutuar asnje komande terminali!'
+      doNotReplyToUser: true,
+      pollIntervalMs: 5000,
+      instruction: 'Puna po vazhdon normalisht ne sfond. Thirr MENJEHERE mjetin mcp__multi_ai_relay__check_cycle_progress(projectRoot) ose check_cycle_progress(projectRoot) PA ekzekutuar asnje komande terminali dhe PA kthyer pergjigje te perdoruesi!'
     };
   }
 
@@ -1420,6 +1424,13 @@ function createAutopilotEngine(runtimeContext) {
 
     try {
       const routing = ensureProjectSetup(cleanRoot);
+      if (!routing.roles) {
+        routing.roles = {
+          planner: routing.targets?.web1?.accountPool?.[0] || 'gemini1',
+          coder: routing.targets?.web2?.accountPool?.[0] || 'gemini2',
+          reviewer: routing.targets?.web1?.accountPool?.[0] || 'gemini1'
+        };
+      }
       const exchangeDir = path.join(cleanRoot, '.antigravity', 'bridge', 'exchange');
       if (!fs.existsSync(exchangeDir)) fs.mkdirSync(exchangeDir, { recursive: true });
       const planPath = path.join(exchangeDir, 'plan.md');
@@ -1731,15 +1742,49 @@ function createAutopilotEngine(runtimeContext) {
 
   async function runFullCycle(projectRoot, userRequest, opts) {
     const cleanRoot = path.resolve(projectRoot);
-    if (!activeCycleJobs[cleanRoot] || !activeCycleJobs[cleanRoot].running) {
-      runAutonomousPipeline(cleanRoot, userRequest || '', opts).catch(function(_) {});
+    let job = activeCycleJobs[cleanRoot];
+    if (!job || !job.running) {
+      const p = runAutonomousPipeline(cleanRoot, userRequest || '', opts);
+      job = activeCycleJobs[cleanRoot];
+      if (job) job.promise = p;
     }
-    const maxSlice = (opts && opts.maxSliceMs) || 22000;
-    return await waitJobSlice(cleanRoot, maxSlice);
+    // Only if client explicitly requested non-blocking legacy slice (e.g. web dashboard)
+    if (opts && opts.blocking === false) {
+      return await waitJobSlice(cleanRoot, opts.maxSliceMs || 22000);
+    }
+    // Arkitekture e vertete Reaktive: Event-driven Promise await pa asnje kufi mekanik kohor!
+    if (job && job.promise) {
+      try {
+        return await job.promise;
+      } catch (err) {
+        if (job && job.result) return job.result;
+        throw err;
+      }
+    }
+    while (job && job.running) {
+      await sleepFn(200);
+    }
+    if (job && job.error) throw new Error(job.error);
+    return job ? job.result : { status: 'NO_ACTIVE_JOB' };
   }
 
   async function checkCycleProgress(projectRoot, maxSliceMs) {
-    return await waitJobSlice(projectRoot, maxSliceMs || 22000);
+    const cleanRoot = path.resolve(projectRoot);
+    const job = activeCycleJobs[cleanRoot];
+    if (!job) return { status: 'NO_ACTIVE_JOB' };
+    if (!job.running) {
+      if (job.error) throw new Error(job.error);
+      return job.result;
+    }
+    if (!maxSliceMs && job.promise) {
+      try {
+        return await job.promise;
+      } catch (err) {
+        if (job.result) return job.result;
+        throw err;
+      }
+    }
+    return await waitJobSlice(cleanRoot, maxSliceMs || 180000);
   }
 
   return {

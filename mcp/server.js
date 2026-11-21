@@ -1473,9 +1473,37 @@ async function runWebDispatchWithRetryPolicy(opts){const dispatchId=opts.dispatc
         let commitReceipt=null;
         for(let sendAttempt=1;sendAttempt<=2;sendAttempt++){
           let send=await resolveSendButton(targetFrame,isGemini,composer.token);
-          if(send){console.error('[SEND_ACTION] tabKey='+tabKey+' attempt='+sendAttempt+' locator='+send.strategy+' click=playwright');try{await send.locator.click({timeout:5000});}catch(e){await page.waitForTimeout(250);send=await resolveSendButton(targetFrame,isGemini,composer.token);if(send)await send.locator.click({timeout:5000});else throw e;}}
-          else if(!isGemini){console.error('[SEND_ACTION] tabKey='+tabKey+' attempt='+sendAttempt+' locator=editor-enter click=keyboard');await composer.locator.press('Enter');}
-          else throw new Error('SEND_BUTTON_NOT_FOUND');
+          if(!send){
+            await page.waitForTimeout(600);
+            try {
+              await composer.locator.evaluate(function(el){
+                el.dispatchEvent(new Event('input',{bubbles:true}));
+                el.dispatchEvent(new Event('change',{bubbles:true}));
+              });
+            } catch(_){}
+            send=await resolveSendButton(targetFrame,isGemini,composer.token);
+          }
+          if(send){
+            console.error('[SEND_ACTION] tabKey='+tabKey+' attempt='+sendAttempt+' locator='+send.strategy+' click=playwright');
+            try{
+              await send.locator.click({timeout:5000});
+            }catch(e){
+              await page.waitForTimeout(250);
+              send=await resolveSendButton(targetFrame,isGemini,composer.token);
+              if(send)await send.locator.click({timeout:5000});
+              else {
+                console.error('[SEND_ACTION] fallback locator=editor-enter click=keyboard');
+                await composer.locator.press('Enter');
+              }
+            }
+          } else {
+            console.error('[SEND_ACTION] tabKey='+tabKey+' attempt='+sendAttempt+' locator=editor-enter-universal click=keyboard');
+            try {
+              await composer.locator.press('Enter');
+            } catch(e) {
+              throw new Error('SEND_BUTTON_NOT_FOUND');
+            }
+          }
           commitReceipt=await waitForSendCommit(targetFrame,{composerToken:composer.token,isGemini:isGemini,attachmentNames:attachmentNames,fingerprint:fingerprint,pre:pre,timeoutMs:15000});
           if(commitReceipt.committed){appendDispatchDiag(projectRoot,diagId,'SEND_COMMITTED',{routeKey:commitReceipt.routeKey,evidence:commitReceipt.evidence});if(resetRecoveries===1)appendDispatchDiag(projectRoot,diagId,'RECOVERY_COMMITTED',{attempt:resetRecoveries,routeKey:commitReceipt.routeKey});console.error('[SEND_COMMITTED] tabKey='+tabKey+' attempt='+sendAttempt+' evidence='+JSON.stringify(commitReceipt.evidence));break;}
           console.error('[SEND_NOT_COMMITTED] tabKey='+tabKey+' attempt='+sendAttempt+' evidence='+JSON.stringify(commitReceipt.evidence));
@@ -1760,7 +1788,15 @@ function ensureProjectSetup(projectRoot) {
     } catch (ignoreErr) {}
   }
 
-  return JSON.parse(fs.readFileSync(routingPath, 'utf8'));
+  const parsedRouting = JSON.parse(fs.readFileSync(routingPath, 'utf8'));
+  if (!parsedRouting.roles) {
+    parsedRouting.roles = {
+      planner: parsedRouting.targets?.web1?.accountPool?.[0] || 'gemini1',
+      coder: parsedRouting.targets?.web2?.accountPool?.[0] || 'gemini2',
+      reviewer: parsedRouting.targets?.web1?.accountPool?.[0] || 'gemini1'
+    };
+  }
+  return parsedRouting;
 }
 
 function purgeExchangeArtifacts(projectRoot) {
@@ -1883,18 +1919,77 @@ const activeCycleJobs = {};
 async function runAutonomousPipeline(cleanRoot, userRequest) { return getAutopilotEngine().runAutonomousPipeline(cleanRoot, userRequest); }
 function resolveAndEmbedExternalFiles(userRequest) { return autopilotEngineModule.resolveAndEmbedExternalFiles ? autopilotEngineModule.resolveAndEmbedExternalFiles(userRequest) : ''; }
 async function waitJobSlice(cleanRoot, maxSliceMs) { return getAutopilotEngine().waitJobSlice(cleanRoot, maxSliceMs); }
-async function executeCoreAction(action, payload) {
-payload = payload || {};
-const projectRoot = payload.projectRoot || payload.project_root || process.cwd();
-let cleanRoot = path.resolve(projectRoot);
-try {
-  if (fs.existsSync(cleanRoot) && fs.statSync(cleanRoot).isFile()) {
-    cleanRoot = path.dirname(cleanRoot);
-    if (['docs', 'doc', 'src', 'config'].includes(path.basename(cleanRoot).toLowerCase())) {
-      cleanRoot = path.dirname(cleanRoot);
+function resolveTargetProjectAndRequest(payload) {
+  payload = payload || {};
+  let rawRoot = (payload.projectRoot || payload.project_root || '').trim();
+  let cleanRoot = rawRoot ? path.resolve(rawRoot) : '';
+
+  if (!cleanRoot || cleanRoot.toLowerCase() === PLUGIN_ROOT.toLowerCase() || !fs.existsSync(cleanRoot)) {
+    const activeRoots = Object.keys(activeCycleJobs).filter(function(k) { return activeCycleJobs[k] && activeCycleJobs[k].running; });
+    if (activeRoots.length > 0) {
+      cleanRoot = activeRoots[0];
+    }
+    if (!cleanRoot) {
+      for (const t of Object.keys(activeProjectPerTab)) {
+        if (activeProjectPerTab[t] && fs.existsSync(activeProjectPerTab[t])) {
+          cleanRoot = path.resolve(activeProjectPerTab[t]);
+          break;
+        }
+      }
+    }
+    if (!cleanRoot && fs.existsSync(REGISTRY_PATH)) {
+      try {
+        const reg = JSON.parse(fs.readFileSync(REGISTRY_PATH, 'utf8'));
+        const valid = (reg.projects || []).filter(function(p) { return fs.existsSync(p); });
+        if (valid.length > 0) {
+          cleanRoot = path.resolve(valid[valid.length - 1]);
+        }
+      } catch (_) {}
+    }
+    if (!cleanRoot) {
+      cleanRoot = process.cwd();
     }
   }
-} catch (_) {}
+
+  try {
+    if (fs.existsSync(cleanRoot) && fs.statSync(cleanRoot).isFile()) {
+      cleanRoot = path.dirname(cleanRoot);
+    }
+    if (['docs', 'doc', 'src', 'config', 'kerkesa_revit_pyetjet'].includes(path.basename(cleanRoot).toLowerCase())) {
+      cleanRoot = path.dirname(cleanRoot);
+    }
+  } catch (_) {}
+
+  let req = (payload.userRequest || payload.user_request || payload.prompt || '').trim();
+  const isGeneric = !req || req === 'null' || req === 'undefined' || req.includes('Perdoruesi thirri /run-cycle');
+  if (isGeneric) {
+    const candidateFiles = [
+      path.join(cleanRoot, 'URDHER_PUNE.md'),
+      path.join(cleanRoot, 'docs', 'URDHER_PUNE.md'),
+      'C:\\Users\\Vladi\\Documents\\revi vila test mep\\URDHER_PUNE_HERMES_REVIT_VILA_2025.md',
+      path.join(cleanRoot, 'MASTER_DYNAMIC_MEP_ARCHITECTURE_BLUEPRINT.md'),
+      path.join(cleanRoot, 'KUSHTETUTA_PROJEKTIT.md')
+    ];
+    for (const f of candidateFiles) {
+      if (fs.existsSync(f)) {
+        req = 'Zbato kerkesen dhe urdhrin e punes nga skedari: ' + f + '\n\n' + fs.readFileSync(f, 'utf8').slice(0, 10000);
+        break;
+      }
+    }
+    if (!req || req.includes('Perdoruesi thirri /run-cycle')) {
+      req = 'Ekzekuto ciklin autonom te plote (Pack -> Planner -> Coder -> Apply -> Reviewer) per projektin aktiv [' + cleanRoot + '].';
+    }
+  }
+
+  return { cleanRoot: cleanRoot, userRequest: req };
+}
+
+async function executeCoreAction(action, payload) {
+payload = payload || {};
+action = action ? action.replace(/^(mcp__multi_ai_relay__|multi-ai-relay[/:])/, '') : action;
+const resolved = resolveTargetProjectAndRequest(payload);
+const cleanRoot = resolved.cleanRoot;
+const userRequest = resolved.userRequest;
 
 // SHTYLLA 1: BLLOKADE FIZIKE ME KOD (CYCLE_EXCLUSIVE_LOCK)
 if (action !== 'run_full_cycle' && action !== 'check_cycle_progress' && !payload._internal) {
@@ -1903,10 +1998,10 @@ if (action !== 'run_full_cycle' && action !== 'check_cycle_progress' && !payload
   }
 }
 if (action === 'run_full_cycle') {
-  return await getAutopilotEngine().runFullCycle(cleanRoot, payload.userRequest || '');
+  return await getAutopilotEngine().runFullCycle(cleanRoot, userRequest, { blocking: payload.blocking !== false });
 }
 if (action === 'check_cycle_progress') {
-  return await getAutopilotEngine().checkCycleProgress(cleanRoot, 22000);
+  return await getAutopilotEngine().checkCycleProgress(cleanRoot, payload.waitMs || payload.maxSliceMs);
 }
 if (action === 'pack_workspace') {
   const info = getAutopilotEngine().packWorkspace(cleanRoot, payload.mode || PACK_MODES.PLANNING_FULL);
@@ -2185,6 +2280,18 @@ const result = await executeCoreAction(data.action, data.payload);
 res.writeHead(200, { 'Content-Type': 'application/json' });
 return res.end(JSON.stringify(result));
 }
+if (req.url === '/run_cycle' || req.url === '/api/run-cycle') {
+const root = path.resolve(data.projectRoot || '.');
+const result = await executeCoreAction('run_full_cycle', { projectRoot: root, userRequest: data.userRequest || data.prompt || '' });
+res.writeHead(200, { 'Content-Type': 'application/json' });
+return res.end(JSON.stringify(result));
+}
+if (req.url === '/check_cycle_progress' || req.url === '/api/check-progress' || (req.url.startsWith('/cycle/') && req.url.endsWith('/wait'))) {
+const root = path.resolve(data.projectRoot || '.');
+const result = await executeCoreAction('check_cycle_progress', { projectRoot: root, waitMs: data.waitMs || 20000, _internal: true });
+res.writeHead(200, { 'Content-Type': 'application/json' });
+return res.end(JSON.stringify(result));
+}
 res.writeHead(404);
 res.end('Not found');
 } catch (err) {
@@ -2202,6 +2309,7 @@ console.error('[DASHBOARD READY] http://' + HOST + ':' + PORT);
 });
 }
 async function dispatchActionSingleton(action, payload) {
+action = action ? action.replace(/^(mcp__multi_ai_relay__|multi-ai-relay[/:])/, '') : action;
 if (isPrimaryInstance) return await executeCoreAction(action, payload);
 const resp = await fetch('http://' + HOST + ':' + PORT + '/api/mcp-proxy', {
 method: 'POST',
@@ -2222,23 +2330,21 @@ return {
 tools: [
 {
 name: 'run_full_cycle',
-description: 'MJETI KRYESOR AUTOPILOT (THIRRE KETE TE PARIN!): Nis ne Node.js gjithe ciklin (pack -> planner -> coder -> apply_and_test -> reviewer) me 0 komanda terminali! Kthen rezultatin ose STILL_RUNNING_CALL_CHECK_PROGRESS pas 25s. NDALOHET perdorimi i terminalit ose leximi i state.json!',
+description: 'MJETI KRYESOR AUTOPILOT: Ekzekuton ne menyre te bllokuar (blocking) te gjithe ciklin autonom (pack -> planner -> coder -> apply -> reviewer) dhe kthen raportin e certifikuar final me 0 babysitting. Nese projectRoot ose userRequest mungojne, ura i zgjidh automatikisht nga projekti aktiv dhe urdhri i punes ne disk.',
 inputSchema: {
 type: 'object',
 properties: {
-projectRoot: { type: 'string' },
-userRequest: { type: 'string' }
-},
-required: ['projectRoot', 'userRequest']
+projectRoot: { type: 'string', description: 'Rruga e projektit (nese lihet bosh, merret projekti aktiv)' },
+userRequest: { type: 'string', description: 'Kerkesa e punes (nese lihet bosh, merret urdhri i punes nga disku)' }
+}
 }
 },
 {
 name: 'check_cycle_progress',
-description: 'Pret deri ne 25s te tjera kur run_full_cycle kthen STILL_RUNNING_CALL_CHECK_PROGRESS. Thirre ne zinxhir derisa te ktheje CYCLE_COMPLETED. Mos perdor kurre sleep/wait ne terminal!',
+description: 'Pret ecurine e ciklit aktiv ne menyre deterministe derisa te ktheje CYCLE_COMPLETED. Thirre ne zinxhir nese merr STILL_RUNNING. Mos perdor kurre terminal!',
 inputSchema: {
 type: 'object',
-properties: { projectRoot: { type: 'string' } },
-required: ['projectRoot']
+properties: { projectRoot: { type: 'string', description: 'Rruga e projektit (opsionale)' } }
 }
 },
 {

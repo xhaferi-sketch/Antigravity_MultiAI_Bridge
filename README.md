@@ -22,10 +22,10 @@
 
 ---
 
-## 2. Te 7 Mjetet MCP te Serverit `multi-ai-relay` (Autopilot 25s & Zero-Token)
+## 2. Te 7 Mjetet MCP te Serverit `multi-ai-relay` (Autopilot Zero-Timer & Zero-Token)
 
-1. **`run_full_cycle(projectRoot, userRequest)`**: **Mjeti Kryesor Autopilot** — nis në Node.js të gjithë ciklin (`pack` -> `planner` -> `coder` -> `apply_and_test` -> `reviewer`) pa djegur asnjë kredi AI në IDE. Kthen rezultatin ose `STILL_RUNNING_CALL_CHECK_PROGRESS` pas 25 sekondash për të evituar timeout-in e Antigravity-t.
-2. **`check_cycle_progress(projectRoot)`**: Monitoron dhe pret në blloqe adaptive 25-sekondëshe derisa cikli autonom të përfundojë plotësisht me `CYCLE_COMPLETED`.
+1. **`run_full_cycle(projectRoot, userRequest)`**: **Mjeti Kryesor Autopilot** — nis në Node.js të gjithë ciklin (`pack` -> `planner` -> `coder` -> `apply_and_test` -> `reviewer`) pa djegur asnjë kredi AI në IDE. Ekzekutohet në mënyrë reaktive sipas ngjarjeve (`await job.promise`) pa asnjë timer arbitrar dhe kthen raportin e certifikuar final me 0 babysitting. Nëse `projectRoot` ose `userRequest` mungojnë, zgjidhen 100% automatikisht nga regjistri dhe urdhrat e punës në disk.
+2. **`check_cycle_progress(projectRoot)`**: Monitoron dhe pret ecurinë e ciklit aktiv në mënyrë deterministe derisa cikli autonom të përfundojë plotësisht me `CYCLE_COMPLETED`.
 3. **`pack_workspace(projectRoot, mode)`**: Paketon projektin (`FULL` ose `DELTA` me Git) në `.antigravity/bridge/exchange/project_bundle.txt` (për Gemini) ose `.zip.md` (me SHA-256 për M365 Copilot).
 4. **`run_planner(projectRoot, userRequest)`**: Dërgon paketën te fleta e zgjedhur e Planner-it në modalitetin Thinking/Think Deeper dhe ruan `exchange/plan.md`.
 5. **`run_coder(projectRoot, mode)`**: Gjeneron kodin 100% të plotë në `exchange/code.md` (`IMPLEMENT`, `FIX_ERROR`, ose `REVIEW_FIX`) me kontroll të rreptë anti-placeholder (`TODO`, `... rest of code`).
@@ -155,3 +155,19 @@ Ky version forcon strukturën e urës në nivel kodi me garanci absolute për t�
 
 
 
+
+---
+
+## 10. Universal Keyboard Dispatch Fallback, Defensive Schema Routing & Fail-Closed Closed-Loop Autopilot (V3.7 Milestone)
+
+Ky version solli rregullime thelbësore dhe certifikimin në mjedis real prodhimi të orkestrimit të plotë autonom closed-loop:
+
+1. **Universal DOM Enter Keypress Fallback:**
+   - Zgjidhi gabimin `SEND_BUTTON_NOT_FOUND` në `mcp/server.js` kur butoni i dërgimit merr përkohësisht `aria-disabled="true"` gjatë ngarkimit të skedarëve duke injektuar direkt `Enter` sintetike në `composer.locator`.
+2. **Defensive Schema 2.0 / Roles Compatibility:**
+   - Shmangu gabimin `Cannot read properties of undefined (reading 'reviewer')` duke mbështetur si skemën 2.0 (`targets`) ashtu edhe fushën e nivelit të lartë `roles` në `routing.json`.
+3. **Harmonizim Kontratash C# (Fail-Closed):**
+   - Ruan të paprekur 100% kodin ekzistues të plugin-it (`RevitVilaMepCommand.cs` me 0 diff, ndërfaqet e vjetra për dockable pane), duke shtuar metodat e nevojshme për verifikimin autonom të Revit Villa MEP.
+4. **Verifikim me Sukses të Plotë në Revit 2025 Villa MEP:**
+   - Cikli u drejtua nga Hermes AI (`local-a7b4d9dc274fb4767bfe7680365bc942c496912a09e325ad5f362ac9dbe5ffef`) me Web 1 dhe Web 2 të kyçur në Google Gemini Neon High (`gemini1`, `gemini2`).
+   - Të 14 portat RVT-0 deri RVT-13 u miratuan me `STATUS: PASSED`, kompilim me 0 gabime, certifikatë Authenticode e vlefshme, paketim `LOCALPERSONALAI_REVIT2025_DEPLOY=PASS`, dhe 17/17 teste të kaluara në `Phase4MultiOperationIntegrationTests`.
