@@ -852,11 +852,26 @@ function createLocalExecutor(runtimeContext) {
         const patchFile = path.join(cleanRoot, '.antigravity-patch-' + process.pid + '-' + crypto.randomBytes(6).toString('hex') + '.patch');
         fs.writeFileSync(patchFile, rawPatch, 'utf8');
 
-        let applyResult = spawnSync('git', ['apply', '--3way', '--recount', '--whitespace=nowarn', patchFile], { cwd: cleanRoot, encoding: 'utf8' });
+        let gitDirArg = [];
+        try {
+          const revParse = spawnSync('git', ['rev-parse', '--show-toplevel'], { cwd: cleanRoot, encoding: 'utf8' });
+          if (revParse.status === 0 && revParse.stdout) {
+            const gitTop = path.resolve(revParse.stdout.trim());
+            const absClean = path.resolve(cleanRoot);
+            if (gitTop !== absClean && absClean.startsWith(gitTop)) {
+              const relSub = path.relative(gitTop, absClean).replace(/\\/g, '/');
+              if (relSub) gitDirArg = ['--directory=' + relSub];
+            }
+          }
+        } catch (_) {}
+
+        let gitArgs = ['apply', '--3way', '--recount', '--whitespace=nowarn'].concat(gitDirArg).concat([patchFile]);
+        let applyResult = spawnSync('git', gitArgs, { cwd: cleanRoot, encoding: 'utf8' });
         try { fs.unlinkSync(patchFile); } catch (_) {}
 
-        if (applyResult.error || applyResult.status !== 0) {
-          throw new Error('GIT_APPLY_FAILED: ' + (applyResult.stderr || applyResult.stdout || (applyResult.error ? applyResult.error.message : 'Unknown git apply error')));
+        const outText = (applyResult.stdout || '') + (applyResult.stderr || '');
+        if (applyResult.error || applyResult.status !== 0 || outText.includes('Skipped patch')) {
+          throw new Error('GIT_APPLY_FAILED: ' + (outText || (applyResult.error ? applyResult.error.message : 'Unknown git apply error')));
         }
 
         const pathMatches = Array.from(rawPatch.matchAll(/^(?:diff --git a\/([^\r\n]+) b\/([^\r\n]+)|--- a\/([^\r\n]+))/gm));
