@@ -823,7 +823,7 @@ function buildBudgetedWorkspaceBundle(projectRoot, opts) {
   opts = opts || {};
   const cleanRoot = fs.realpathSync(path.resolve(projectRoot));
   const mode = PACK_MODES[opts.mode] ? opts.mode : PACK_MODES.PLANNING_FULL;
-  const budget = Math.min(512 * 1024, Math.max(4096, Number(opts.budgetBytes || 256 * 1024)));
+  const budget = Math.min(512 * 1024, Math.max(4096, Number(opts.budgetBytes || (mode === PACK_MODES.CODING_FOCUSED ? 448 * 1024 : 256 * 1024))));
   const targets = new Set((opts.explicitTargets || []).map(function(x) { return String(x).replace(/\\/g, '/'); }));
   const errors = new Set((opts.errorReferenced || []).map(function(x) { return String(x).replace(/\\/g, '/'); }));
   const files = [], excluded = [], hashes = new Map();
@@ -893,7 +893,8 @@ function buildBudgetedWorkspaceBundle(projectRoot, opts) {
       excluded.push({ rel: f.rel, reason: 'BUDGET' });
       continue;
     }
-    const compact = compactWorkspaceContent(f.rel, content, Math.min(64 * 1024, remaining - 128), f.classification);
+    const maxFileBytes = (f.meta && f.meta.explicitTarget) ? Math.max(64 * 1024, remaining - 128) : Math.min(64 * 1024, remaining - 128);
+    const compact = compactWorkspaceContent(f.rel, content, maxFileBytes, f.classification);
     const block = NL + '--- FILE: ' + f.rel + ' tier=' + f.classification.tier + ' score=' + f.score + (compact.summarized ? ' summarized=true' : '') + ' ---' + NL + compact.text + NL;
     if (Buffer.byteLength(out + block) > budget - 256) {
       excluded.push({ rel: f.rel, reason: 'BUDGET' });

@@ -265,9 +265,13 @@ function parseCodeBlocksFromMarkdown(markdown, expectedTargets, projectRoot) {
 }
 
 function validateGeneratedCodeMarkdown(markdown, projectRoot) {
+  const hasDiffPatch = /^(?:diff --git a\/[^\r\n]+ b\/[^\r\n]+|--- a\/[^\r\n]+\r?\n\+\+\+ b\/[^\r\n]+)/m.test(markdown);
+  if (hasDiffPatch) {
+    return { valid: true, isPatch: true, fileBlocks: [] };
+  }
   const fileBlocks = parseCodeBlocksFromMarkdown(markdown, null, projectRoot);
   if (fileBlocks.length === 0) {
-    return { valid: false, reason: 'Mungojne blloqet e skedareve me etiketen ### FILE: path/to/file.ext.' };
+    return { valid: false, reason: 'Mungojne blloqet e kodit (kerkohet diff --git ose ### FILE:).' };
   }
   const forbiddenPatterns = [
     /\/\/\s*\.\.\.\s*(rest of|existing|previous|other)/i,
@@ -837,16 +841,42 @@ function createLocalExecutor(runtimeContext) {
     }
 
     const writtenFiles = [];
-    for (const item of check.fileBlocks) {
-      const cleanRel = sanitizeTargetPath(item.relPath, cleanRoot).path || item.relPath;
-      const targetAbs = path.resolve(cleanRoot, cleanRel);
-      if (!targetAbs.startsWith(cleanRoot + path.sep) && targetAbs !== cleanRoot) {
-        throw new Error('SECURITY_BLOCK: Tentative shkrimi jashte projectRoot: ' + item.relPath);
+    if (check.isPatch) {
+      const patchStart = rawMarkdown.search(/^(?:diff --git a\/[^\r\n]+ b\/[^\r\n]+|--- a\/[^\r\n]+\r?\n\+\+\+ b\/[^\r\n]+)/m);
+      if (patchStart >= 0) {
+        let rawPatch = rawMarkdown.slice(patchStart);
+        const codeFenceEnd = rawPatch.search(/\r?\n```/);
+        if (codeFenceEnd >= 0) rawPatch = rawPatch.slice(0, codeFenceEnd);
+        rawPatch = rawPatch.trimEnd() + NL;
+
+        const patchFile = path.join(cleanRoot, '.antigravity-patch-' + process.pid + '-' + crypto.randomBytes(6).toString('hex') + '.patch');
+        fs.writeFileSync(patchFile, rawPatch, 'utf8');
+
+        let applyResult = spawnSync('git', ['apply', '--3way', '--recount', '--whitespace=nowarn', patchFile], { cwd: cleanRoot, encoding: 'utf8' });
+        try { fs.unlinkSync(patchFile); } catch (_) {}
+
+        if (applyResult.error || applyResult.status !== 0) {
+          throw new Error('GIT_APPLY_FAILED: ' + (applyResult.stderr || applyResult.stdout || (applyResult.error ? applyResult.error.message : 'Unknown git apply error')));
+        }
+
+        const pathMatches = Array.from(rawPatch.matchAll(/^(?:diff --git a\/([^\r\n]+) b\/([^\r\n]+)|--- a\/([^\r\n]+))/gm));
+        pathMatches.forEach(function(m) {
+          const p = m[2] || m[1] || m[3];
+          if (p && !writtenFiles.includes(p)) writtenFiles.push(p);
+        });
       }
-      const parentDir = path.dirname(targetAbs);
-      if (!fs.existsSync(parentDir)) fs.mkdirSync(parentDir, { recursive: true });
-      atomicWriteValidated(targetAbs, item.code, fs, crypto);
-      writtenFiles.push(item.relPath);
+    } else {
+      for (const item of check.fileBlocks) {
+        const cleanRel = sanitizeTargetPath(item.relPath, cleanRoot).path || item.relPath;
+        const targetAbs = path.resolve(cleanRoot, cleanRel);
+        if (!targetAbs.startsWith(cleanRoot + path.sep) && targetAbs !== cleanRoot) {
+          throw new Error('SECURITY_BLOCK: Tentative shkrimi jashte projectRoot: ' + item.relPath);
+        }
+        const parentDir = path.dirname(targetAbs);
+        if (!fs.existsSync(parentDir)) fs.mkdirSync(parentDir, { recursive: true });
+        atomicWriteValidated(targetAbs, item.code, fs, crypto);
+        writtenFiles.push(item.relPath);
+      }
     }
 
     const commands = [routing.buildCmd, routing.testCmd].map(function(c) { return (c || '').trim(); }).filter(Boolean);

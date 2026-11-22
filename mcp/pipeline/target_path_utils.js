@@ -533,10 +533,12 @@ function extractPlanMetadataHeader(planText) {
 function classifyPlanSectionHeading(headingText) {
   const upper = String(headingText || '').normalize('NFKC').toUpperCase();
   const hasAllowed = /\bALLOWED[_ ]FILES\b/.test(upper);
+  const hasGoals = /\b(OBJEKTIV|OBJEKTIVI|GOAL|GOALS)\b/.test(upper);
   const hasForbidden = /\b(FORBIDDEN[_ ]FILES|FORBIDDEN|NON-GOALS|NON_GOALS|ZERO-DIFF|ZERO_DIFF|READ-ONLY|READ_ONLY|OUT OF SCOPE)\b/.test(upper);
 
-  // Combined parent heading like "## 3. ALLOWED_FILES & FORBIDDEN_FILES" stays NEUTRAL until subheadings appear
+  // Combined parent heading like "## 3. ALLOWED_FILES & FORBIDDEN_FILES" or "## 1. OBJEKTIVI & NON-GOALS" stays NEUTRAL until subheadings appear
   if (hasAllowed && hasForbidden) return 'NEUTRAL';
+  if (hasGoals && hasForbidden) return 'NEUTRAL';
   if (hasForbidden) return 'FORBIDDEN';
   if (hasAllowed) return 'ALLOWED';
   return 'NEUTRAL';
@@ -862,6 +864,15 @@ function extractPlanTargets(planText, projectRoot) {
     if (inFencedCode) continue;
     if (!trimmed) continue;
 
+    // Standalone directive line without markdown heading (e.g. "ALLOWED_FILES:" or "**ALLOWED_FILES:**" or "FORBIDDEN_FILES:")
+    const standaloneSectionMatch = trimmed.match(/^(?:\*\*|__)?\s*(ALLOWED[_ ]FILES|FORBIDDEN[_ ]FILES)\s*:?\s*(?:\*\*|__)?\s*$/i);
+    if (standaloneSectionMatch) {
+      const norm = standaloneSectionMatch[1].toUpperCase().replace(/\s+/g, '_');
+      sectionMode = norm === 'ALLOWED_FILES' ? 'ALLOWED' : 'FORBIDDEN';
+      sectionLevel = 99;
+      continue;
+    }
+
     // Detect Markdown headings or standalone bold headings (excluding bold-wrapped code/link tokens)
     const mdHeadingMatch = trimmed.match(/^(#{1,6})\s+(.+)$/);
     let boldHeadingMatch = !mdHeadingMatch ? trimmed.match(/^\*\*([^*]+)\*\*\s*$/) : null;
@@ -982,6 +993,20 @@ function extractPlanTargets(planText, projectRoot) {
             source: 'ALLOWED_FILES'
           });
         }
+        continue;
+      }
+
+      // Direct relative path without list marker (e.g. "src/LocalPersonalAI...cs")
+      if (/^[a-zA-Z0-9_.-]+[\\/][a-zA-Z0-9_./\\-]+\.[a-zA-Z0-9]+(?:\s.*)?$/.test(trimmed)) {
+        const candidates = splitTargetCandidates(trimmed, projectRoot);
+        for (const cand of candidates) {
+          allowedListCandidates.push({
+            raw: trimmed,
+            candidate: cand,
+            source: 'ALLOWED_FILES'
+          });
+        }
+        continue;
       }
     }
   }
