@@ -5,6 +5,9 @@ const path = require('node:path');
 
 const GEMINI_APP_URL = 'https://' + 'gemini.' + 'google.com' + '/app';
 
+const DEFAULT_STANDARD_HARD_CAP_MS = 65000;
+const HIGH_REASONING_HARD_CAP_MS = 240000;
+
 // ============================================================================
 // RREGULL I PANEGOCIUESHËM DHE I KYÇUR (INVIOLABLE LOCK - HIGH PRIORITY)
 // NDALOHET KATEGORIKISHT ÇDO MODALITET TJETËR PËRVEÇ "NEON HIGH" (EXTRA THOROUGH).
@@ -22,6 +25,62 @@ const GEMINI_REQUIRED_MODEL = Object.freeze({
   reasoning: 'high',
   reasoningSource: 'integrated-model-mode'
 });
+
+function normalizeHardCapToken(value) {
+  if (typeof value !== 'string') return '';
+  return value.normalize('NFKC').trim().toLowerCase();
+}
+
+function resolveGeminiHardCapMs(args) {
+  if (!args || typeof args !== 'object') {
+    return DEFAULT_STANDARD_HARD_CAP_MS;
+  }
+
+  if (typeof args.hardCapMs === 'number' && Number.isFinite(args.hardCapMs) && args.hardCapMs > 0) {
+    const explicitCap = Math.floor(args.hardCapMs);
+    if (explicitCap > 0) {
+      return explicitCap;
+    }
+  }
+
+  const tier = normalizeHardCapToken(args.modelTier);
+  const reasoning = normalizeHardCapToken(args.reasoningLevel) || normalizeHardCapToken(args.thinkingLevel);
+  const active = normalizeHardCapToken(args.activeModel) ||
+    normalizeHardCapToken(args.modelLabel) ||
+    normalizeHardCapToken(args.model);
+  const normalizedReasoning = reasoning.replace(/\s+/g, ' ');
+
+  if (tier === 'pro_31') {
+    return HIGH_REASONING_HARD_CAP_MS;
+  }
+
+  if (
+    normalizedReasoning === 'high' ||
+    normalizedReasoning === 'extra_thorough' ||
+    normalizedReasoning === 'extra thorough'
+  ) {
+    return HIGH_REASONING_HARD_CAP_MS;
+  }
+
+  if (
+    /(?:^|[\s_.-])(neon|argon|pro|thinking|reasoning)[\s_.-]*high(?:$|[\s_.-])/.test(tier) ||
+    tier === 'high' ||
+    tier === 'high_reasoning'
+  ) {
+    return HIGH_REASONING_HARD_CAP_MS;
+  }
+
+  if (
+    normalizedReasoning !== 'low' &&
+    /\b(neon|argon|pro)\b/.test(active) &&
+    /\b(high|extra\s+thorough)\b/.test(active) &&
+    !/\b(low|fast|flash|lite)\b/.test(active)
+  ) {
+    return HIGH_REASONING_HARD_CAP_MS;
+  }
+
+  return DEFAULT_STANDARD_HARD_CAP_MS;
+}
 
 const geminiModelReceipts = {
   gemini1: null,
@@ -311,6 +370,22 @@ async function runGeminiAttachmentIngestHandshake(args) {
     throw new Error('Mandatory dispatchToWebTab dispatcher is required for handshake');
   }
 
+  const resolvedModelTier = args.modelTier || 'neon';
+  const resolvedReasoningLevel = (typeof args.reasoningLevel === 'string' && args.reasoningLevel.trim())
+    ? args.reasoningLevel
+    : ((typeof args.thinkingLevel === 'string' && args.thinkingLevel.trim()) ? args.thinkingLevel : 'high');
+  const receipt = args.tabKey && Object.prototype.hasOwnProperty.call(geminiModelReceipts, args.tabKey)
+    ? geminiModelReceipts[args.tabKey]
+    : null;
+  const resolvedActiveModel = args.activeModel || args.modelLabel || args.model || (receipt && receipt.displayLabel) || undefined;
+  const hardCapMs = resolveGeminiHardCapMs({
+    hardCapMs: args.hardCapMs,
+    modelTier: resolvedModelTier,
+    reasoningLevel: resolvedReasoningLevel,
+    thinkingLevel: args.thinkingLevel,
+    activeModel: resolvedActiveModel
+  });
+
   const text = await dispatcher({
     tabKey: args.tabKey,
     projectRoot: args.projectRoot,
@@ -318,9 +393,9 @@ async function runGeminiAttachmentIngestHandshake(args) {
     attachmentPaths: [args.attachmentPath],
     forceFreshChat: args.forceFreshChat !== false,
     disableInternalRetry: true,
-    reasoningLevel: 'high',
-    modelTier: args.modelTier || 'neon',
-    hardCapMs: args.modelTier === 'pro_31' ? 240000 : 65000
+    reasoningLevel: resolvedReasoningLevel,
+    modelTier: resolvedModelTier,
+    hardCapMs: hardCapMs
   });
 
   const check = classifyAttachmentHandshakeStrict(text);
@@ -330,8 +405,6 @@ async function runGeminiAttachmentIngestHandshake(args) {
   console.error('[GEMINI_ATTACHMENT_INGEST_VERIFIED] batchId=' + (args.batchId || '') + ' chars=' + text.length);
   return { status: 'VERIFIED', text: text };
 }
-
-
 
 const GEMINI_SESSION_SELECTORS = Object.freeze({
   newConversation: [
@@ -652,10 +725,16 @@ function createGeminiEngine(runtimeContext) {
   }
 
   async function handleHandshake(args) {
-    args = Object.assign({}, args, {
-      dispatchToWebTab: args.dispatchToWebTab || dispatchToWebTab
+    args = args || {};
+    const tabKey = args.tabKey;
+    const activeModelFromTab = tabKey && tabActiveModel && tabActiveModel[tabKey] && tabActiveModel[tabKey] !== '-'
+      ? tabActiveModel[tabKey]
+      : undefined;
+    const enrichedArgs = Object.assign({}, args, {
+      dispatchToWebTab: args.dispatchToWebTab || dispatchToWebTab,
+      activeModel: args.activeModel || activeModelFromTab
     });
-    return runGeminiAttachmentIngestHandshake(args);
+    return runGeminiAttachmentIngestHandshake(enrichedArgs);
   }
 
   return {
@@ -670,6 +749,9 @@ function createGeminiEngine(runtimeContext) {
     classifyAttachmentHandshakeStrict,
     classifyResetCandidate,
     classifyGeminiRecovery,
+    resolveGeminiHardCapMs,
+    DEFAULT_STANDARD_HARD_CAP_MS,
+    HIGH_REASONING_HARD_CAP_MS,
     geminiModelReceipts,
     GEMINI_REQUIRED_MODEL,
     GEMINI_APP_URL
@@ -686,6 +768,9 @@ module.exports = {
   readinessSatisfied,
   GEMINI_REQUIRED_MODEL,
   GEMINI_APP_URL,
+  DEFAULT_STANDARD_HARD_CAP_MS,
+  HIGH_REASONING_HARD_CAP_MS,
+  resolveGeminiHardCapMs,
   geminiModelReceipts,
   invalidateGeminiReceipt,
   classifyAttachmentHandshakeStrict,

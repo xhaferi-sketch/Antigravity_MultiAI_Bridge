@@ -3,7 +3,37 @@
 const nodeFs = require('node:fs');
 const nodePath = require('node:path');
 const nodeCrypto = require('node:crypto');
-const { execSync: nodeExecSync, spawnSync: nodeSpawnSync } = require('node:child_process');
+const { execSync: nodeExecSync, spawnSync: nodeSpawnSync, spawn: nodeSpawn } = require('node:child_process');
+let targetPathUtilsModule = null;
+function getTargetPathUtils() {
+  if (!targetPathUtilsModule) {
+    try {
+      const modName = ['./', 'target_path_utils'].join('');
+      targetPathUtilsModule = module.require(modName);
+    } catch (_) {
+      targetPathUtilsModule = {};
+    }
+  }
+  return targetPathUtilsModule;
+}
+function sanitizeTargetPath(rawEntry, projectRoot) {
+  const mod = getTargetPathUtils();
+  return typeof mod.sanitizeTargetPath === 'function'
+    ? mod.sanitizeTargetPath(rawEntry, projectRoot)
+    : { path: String(rawEntry || '').replace(/\\/g, '/').replace(/^\.\//, '') };
+}
+function normalizeTargetKey(val, projectRoot) {
+  const mod = getTargetPathUtils();
+  return typeof mod.normalizeTargetKey === 'function'
+    ? mod.normalizeTargetKey(val, projectRoot)
+    : String(val || '').toLowerCase().replace(/\\/g, '/');
+}
+function isValidCleanRelativePath(val) {
+  const mod = getTargetPathUtils();
+  return typeof mod.isValidCleanRelativePath === 'function'
+    ? mod.isValidCleanRelativePath(val)
+    : Boolean(val && !val.startsWith('..') && !val.startsWith('/'));
+}
 
 const NL = String.fromCharCode(10);
 const FENCE3 = String.fromCharCode(96, 96, 96);
@@ -56,7 +86,8 @@ function truncateUtf8(text, maxBytes) {
 }
 
 function normalizeCheckpointTarget(target) {
-  return String(target || '').replace(/\\/g, '/').replace(/^\.\/+/, '');
+  const sanitized = sanitizeTargetPath(target);
+  return sanitized.path || String(target || '').replace(/\\/g, '/').replace(/^\.\/+/, '');
 }
 
 function checkpointTargetAbsolute(cleanRoot, target) {
@@ -79,7 +110,8 @@ function computeRepositoryFingerprint(cleanRoot, execSyncFn) {
 
 function computeCheckpointIdentity(cleanRoot, planText, execSyncFn) {
   const repoFp = computeRepositoryFingerprint(cleanRoot, execSyncFn);
-  const planFp = nodeCrypto.createHash('sha256').update(String(planText || '').trim()).digest('hex');
+  const cleanPlan = String(planText || '').replace(/^\uFEFF?\s*<!--\s*ANTIGRAVITY_PLAN_META\b[\s\S]*?-->\s*/i, '').trim();
+  const planFp = nodeCrypto.createHash('sha256').update(cleanPlan).digest('hex');
   return { repositoryFingerprint: repoFp, planFingerprint: planFp };
 }
 
@@ -150,26 +182,28 @@ function checkpointSyntaxQuickCheck(targetAbs, spawnSyncFn, fsModule) {
   return fs.statSync(targetAbs).size > 0;
 }
 
-function parseCodeBlocksFromMarkdown(markdown, expectedTargets) {
+function parseCodeBlocksFromMarkdown(markdown, expectedTargets, projectRoot) {
   const source = String(markdown || '');
   const results = [];
-  const expected = new Set((expectedTargets || []).map(function(x) {
-    return String(x).replace(/\\/g, '/').replace(/^\.\//, '');
-  }));
-  const safePath = function(value) {
-    const normalized = String(value || '').trim().replace(/^[\x22\x27]|[\x22\x27]$/g, '').replace(/\\/g, '/');
-    if (!normalized || normalized.startsWith('/') || /^[A-Za-z]:\//.test(normalized) || normalized.split('/').includes('..')) return '';
-    return normalized;
-  };
+  const expectedMap = new Map();
+  (expectedTargets || []).forEach(function(x) {
+    const k = normalizeTargetKey(x, projectRoot);
+    const clean = sanitizeTargetPath(x, projectRoot).path || String(x).replace(/\\/g, '/').replace(/^\.\//, '');
+    if (k && clean) expectedMap.set(k, clean);
+  });
   const accept = function(relPath, code) {
-    const clean = safePath(relPath);
-    if (!clean || !String(code || '').trim() || (expected.size && !expected.has(clean))) return;
+    const sanitized = sanitizeTargetPath(relPath, projectRoot);
+    const clean = sanitized.path;
+    const k = normalizeTargetKey(relPath, projectRoot);
+    if (!clean || !String(code || '').trim()) return;
+    if (expectedMap.size && !expectedMap.has(k)) return;
+    const finalRelPath = expectedMap.get(k) || clean;
     const normalizedCode = normalizeGeneratedSourceText(code);
     const unsafeChars = findUnsafeGeneratedSourceCharacters(normalizedCode);
     if (unsafeChars.length > 0) {
-      throw new Error('GENERATED_SOURCE_UNSAFE_UNICODE: ' + clean + ' ' + JSON.stringify(unsafeChars));
+      throw new Error('GENERATED_SOURCE_UNSAFE_UNICODE: ' + finalRelPath + ' ' + JSON.stringify(unsafeChars));
     }
-    results.push({ relPath: clean, code: normalizedCode });
+    results.push({ relPath: finalRelPath, code: normalizedCode });
   };
   // Nxjerrje universale e mbrojtur nga mbetjet e DOM-it te Gemini (p.sh. "Gemini said")
   const dynamicFencePattern = new RegExp("(?:(?:###\\s*)?(?:Gemini said\\s*)?FILE:\\s*([^\\r\\n`]+)\\r?\\n\\s*)?(`{3,})([a-zA-Z0-9_+-]*)\\r?\\n([\\s\\S]*?)\\r?\\n\\2(?:\\r?\\n|$)", "g");
@@ -181,7 +215,7 @@ function parseCodeBlocksFromMarkdown(markdown, expectedTargets) {
     if (declaredTarget) {
       accept(declaredTarget, code);
     } else {
-      const target = Array.from(expected)[fenceIndex++];
+      const target = Array.from(expectedMap.values())[fenceIndex++];
       if (target) accept(target, code);
     }
   }
@@ -196,7 +230,7 @@ function parseCodeBlocksFromMarkdown(markdown, expectedTargets) {
   markers.forEach(function(item, i) {
     const tail = source.slice(item.end, i + 1 < markers.length ? markers[i + 1].index : source.length);
     let target = '';
-    const candidates = Array.from(expected).map(normalizeCheckpointTarget).sort(function(a, b) { return b.length - a.length; });
+    const candidates = Array.from(expectedMap.values()).map(normalizeCheckpointTarget).sort(function(a, b) { return b.length - a.length; });
     const lowerLine = item.line.toLowerCase();
     target = candidates.find(function(c) {
       const lowerC = c.toLowerCase();
@@ -204,8 +238,9 @@ function parseCodeBlocksFromMarkdown(markdown, expectedTargets) {
       const next = item.line.slice(c.length, c.length + 1);
       return next === '' || /\s/.test(next);
     }) || '';
-    if (!target) { const token = item.line.trim().split(/\s+/)[0]; target = safePath(token); }
-    if (!target || (expected.size && !expected.has(target))) return;
+    if (!target) { const token = item.line.trim().split(/\s+/)[0]; target = sanitizeTargetPath(token).path || ''; }
+    const targetKey = normalizeTargetKey(target);
+    if (!target || (expectedMap.size && !expectedMap.has(targetKey))) return;
     let code = (item.line.slice(target.length) + tail).trim();
     code = code.replace(/^(?:python|javascript|typescript|csharp|json|html|css|bash|shell)\s*/i, '');
     const ext = nodePath.extname(target).slice(1).toLowerCase();
@@ -223,13 +258,14 @@ function parseCodeBlocksFromMarkdown(markdown, expectedTargets) {
     else if (starters[kind]) lexical = starters[kind].test(code);
     if (!lexical) return;
     accept(target, code);
-    if (results.some(function(x) { return x.relPath === target; })) console.error('[UNFENCED_OUTPUT_RECOVERED] target=' + target + ' parserMode=UNFENCED_FILE_FALLBACK');
+    const resolvedTarget = expectedMap.get(targetKey) || target;
+    if (results.some(function(x) { return x.relPath === resolvedTarget; })) console.error('[UNFENCED_OUTPUT_RECOVERED] target=' + resolvedTarget + ' parserMode=UNFENCED_FILE_FALLBACK');
   });
   return results;
 }
 
-function validateGeneratedCodeMarkdown(markdown) {
-  const fileBlocks = parseCodeBlocksFromMarkdown(markdown);
+function validateGeneratedCodeMarkdown(markdown, projectRoot) {
+  const fileBlocks = parseCodeBlocksFromMarkdown(markdown, null, projectRoot);
   if (fileBlocks.length === 0) {
     return { valid: false, reason: 'Mungojne blloqet e skedareve me etiketen ### FILE: path/to/file.ext.' };
   }
@@ -429,25 +465,23 @@ function createLocalExecutor(runtimeContext) {
   const crypto = ctx.crypto || nodeCrypto;
   const execSync = ctx.execSync || nodeExecSync;
   const spawnSync = ctx.spawnSync || nodeSpawnSync;
-  const ensureProjectSetup = ctx.ensureProjectSetup || function() { return {}; };
+  const ensureProjectSetup = ctx.ensureProjectSetup || function(pRoot) {
+    try {
+      const rp = path.join(pRoot, '.antigravity', 'bridge', 'routing.json');
+      if (fs.existsSync(rp)) return JSON.parse(fs.readFileSync(rp, 'utf8'));
+    } catch (_) {}
+    return {};
+  };
 
   function applyBatch(args) {
     const root = fs.realpathSync(path.resolve(args.projectRoot));
-    const targets = (args.batch && args.batch.targets ? args.batch.targets : []).map(normalizeCheckpointTarget);
-    const parsedFiles = (args.parsedFiles || []).map(function(item) {
-      return Object.assign({}, item, { relPath: normalizeCheckpointTarget(item.relPath) });
-    });
-    const expected = new Set(targets);
-    const seen = new Set();
-    const backups = [];
-    const backedUp = new Set();
-    const temporaryFiles = [];
-    let gitIndexBackup = null;
-    let gitIndexPath = null;
 
     const absoluteTarget = function(rel) {
+      if (!rel || typeof rel !== 'string') throw new Error('SECURITY_BLOCK: ' + rel);
+      const hasTraversal = /(?:^|[\\/])\.\.(?:[\\/]|$)/.test(rel);
+      if (hasTraversal) throw new Error('SECURITY_BLOCK: ' + rel);
       const abs = path.resolve(root, rel);
-      if (!rel || path.isAbsolute(rel) || (abs !== root && !abs.startsWith(root + path.sep))) {
+      if (path.isAbsolute(rel) || (abs !== root && !abs.startsWith(root + path.sep))) {
         throw new Error('SECURITY_BLOCK: ' + rel);
       }
       const parentReal = fs.existsSync(path.dirname(abs)) ? fs.realpathSync(path.dirname(abs)) : null;
@@ -456,6 +490,28 @@ function createLocalExecutor(runtimeContext) {
       }
       return abs;
     };
+
+    const expectedMap = new Map();
+    (args.batch && args.batch.targets ? args.batch.targets : []).forEach(function(t) {
+      absoluteTarget(t);
+      const sanitized = sanitizeTargetPath(t, root);
+      const clean = sanitized.path || normalizeCheckpointTarget(t);
+      const k = normalizeTargetKey(t, root);
+      if (k && clean) expectedMap.set(k, clean);
+    });
+    const targets = Array.from(expectedMap.values());
+    const parsedFiles = (args.parsedFiles || []).map(function(item) {
+      absoluteTarget(item.relPath);
+      const sanitized = sanitizeTargetPath(item.relPath, root);
+      return Object.assign({}, item, { relPath: sanitized.path || normalizeCheckpointTarget(item.relPath) });
+    });
+    const expected = new Set(targets);
+    const seen = new Set();
+    const backups = [];
+    const backedUp = new Set();
+    const temporaryFiles = [];
+    let gitIndexBackup = null;
+    let gitIndexPath = null;
     const backupOnce = function(rel) {
       if (backedUp.has(rel)) return;
       const abs = absoluteTarget(rel);
@@ -503,7 +559,8 @@ function createLocalExecutor(runtimeContext) {
           const newPath = normalizeCheckpointTarget(match[2]);
           absoluteTarget(oldPath);
           absoluteTarget(newPath);
-          if (oldPath !== newPath || !expected.has(newPath) || patchPaths.includes(newPath)) {
+          const patchKey = normalizeTargetKey(newPath, root);
+          if (oldPath !== newPath || !expectedMap.has(patchKey) || patchPaths.includes(newPath)) {
             throw new Error('PATCH_TARGET_UNAUTHORIZED: ' + newPath);
           }
           patchPaths.push(newPath);
@@ -594,24 +651,26 @@ function createLocalExecutor(runtimeContext) {
       }
 
       for (const file of parsedFiles) {
-        if (seen.has(file.relPath) || !expected.has(file.relPath)) throw new Error('BATCH_OUTPUT_INCOMPLETE');
-        const abs = absoluteTarget(file.relPath);
+        const fileKey = normalizeTargetKey(file.relPath, root);
+        if (seen.has(file.relPath) || !expectedMap.has(fileKey)) throw new Error('BATCH_OUTPUT_INCOMPLETE');
+        const canonicalRel = expectedMap.get(fileKey) || file.relPath;
+        const abs = absoluteTarget(canonicalRel);
         if (detectUnpairedSurrogates(file.code) || Buffer.from(file.code).includes(0)) throw new Error('BUNDLE_INVALID_UNICODE');
         if (fs.existsSync(abs)) {
           const existingStat = fs.statSync(abs);
           if (existingStat.size > 5000 && Buffer.byteLength(file.code, 'utf8') < existingStat.size * 0.25 && file.code.split('\n').length < 30) {
-            throw new Error('BATCH_OUTPUT_COLLAPSED_STUB: ' + file.relPath + ' shrunk from ' + existingStat.size + ' bytes to ' + Buffer.byteLength(file.code, 'utf8') + ' bytes');
+            throw new Error('BATCH_OUTPUT_COLLAPSED_STUB: ' + canonicalRel + ' shrunk from ' + existingStat.size + ' bytes to ' + Buffer.byteLength(file.code, 'utf8') + ' bytes');
           }
         }
-        backupOnce(file.relPath);
+        backupOnce(canonicalRel);
         fs.mkdirSync(path.dirname(abs), { recursive: true });
         const tmp = abs + '.antigravity-tmp';
         fs.writeFileSync(tmp, file.code, 'utf8');
         fs.renameSync(tmp, abs);
-        seen.add(file.relPath);
+        seen.add(canonicalRel);
       }
 
-      if (seen.size !== expected.size) throw new Error('BATCH_OUTPUT_INCOMPLETE');
+      if (seen.size !== expectedMap.size) throw new Error('BATCH_OUTPUT_INCOMPLETE');
       return { status: 'BATCH_APPLIED', filesWritten: Array.from(seen), backups: backups };
     } catch (error) {
       restoreAll();
@@ -645,17 +704,91 @@ function createLocalExecutor(runtimeContext) {
     return { status: 'CHECK_PASSED', receipts: receipts };
   }
 
-  function runFinalBuildAndTests(projectRoot, timeoutMs) {
+  function executeProcessWithIdleWatchdog(command, cwd, idleTimeoutMs) {
+    idleTimeoutMs = idleTimeoutMs || 300000;
+    return new Promise(function(resolve) {
+      let stdout = '';
+      let stderr = '';
+      let lastActivityTs = Date.now();
+      let timedOut = false;
+      let proc;
+      try {
+        proc = nodeSpawn(command, { cwd: cwd, shell: true });
+      } catch (err) {
+        return resolve({
+          status: 1, signal: null, stdout: '', stderr: String(err && err.message), timedOut: false
+        });
+      }
+
+      if (proc.stdout) {
+        proc.stdout.on('data', function(chunk) {
+          lastActivityTs = Date.now();
+          stdout += chunk.toString('utf8');
+          if (stdout.length > 64 * 1024 * 1024) stdout = stdout.slice(-32 * 1024 * 1024);
+        });
+      }
+      if (proc.stderr) {
+        proc.stderr.on('data', function(chunk) {
+          lastActivityTs = Date.now();
+          stderr += chunk.toString('utf8');
+          if (stderr.length > 64 * 1024 * 1024) stderr = stderr.slice(-32 * 1024 * 1024);
+        });
+      }
+
+      const interval = setInterval(function() {
+        const idleTime = Date.now() - lastActivityTs;
+        if (idleTime >= idleTimeoutMs) {
+          timedOut = true;
+          clearInterval(interval);
+          try {
+            if (process.platform === 'win32' && proc.pid) {
+              nodeSpawnSync('taskkill', ['/PID', String(proc.pid), '/T', '/F'], { stdio: 'ignore' });
+            } else if (proc.pid) {
+              process.kill(-proc.pid, 'SIGKILL');
+            }
+          } catch (_) {}
+        }
+      }, 2000);
+
+      proc.on('close', function(code, signal) {
+        clearInterval(interval);
+        resolve({
+          status: timedOut ? 1 : (code ?? 0),
+          signal: signal || null,
+          stdout: stdout,
+          stderr: stderr,
+          timedOut: timedOut
+        });
+      });
+
+      proc.on('error', function(err) {
+        clearInterval(interval);
+        resolve({
+          status: 1,
+          signal: null,
+          stdout: stdout,
+          stderr: stderr + '\n' + String(err && err.message),
+          timedOut: false
+        });
+      });
+    });
+  }
+
+  async function runFinalBuildAndTests(projectRoot, optionsOrIdleMs) {
     const routing = ensureProjectSetup(projectRoot);
     const commands = [routing.buildCmd, routing.testCmd].filter(Boolean);
     const receipts = [];
     const logDir = path.join(projectRoot, '.localpersonalai', 'run-logs');
     fs.mkdirSync(logDir, { recursive: true });
+    const idleTimeoutMs = (typeof optionsOrIdleMs === 'number' && optionsOrIdleMs > 0)
+      ? optionsOrIdleMs
+      : (optionsOrIdleMs && optionsOrIdleMs.idleTimeoutMs) || 300000;
+
     for (let i = 0; i < commands.length; i++) {
       const command = commands[i];
       const startedMs = Date.now();
       const started = process.hrtime.bigint();
-      const run = spawnSync(command, { cwd: projectRoot, shell: true, encoding: 'utf8', timeout: timeoutMs || 180000, maxBuffer: 64 * 1024 * 1024 });
+      const run = await executeProcessWithIdleWatchdog(command, projectRoot, idleTimeoutMs);
       const stdout = String(run.stdout || '');
       const stderr = String(run.stderr || '');
       const durationMs = Math.round(Number(process.hrtime.bigint() - started) / 1e6);
@@ -670,7 +803,7 @@ function createLocalExecutor(runtimeContext) {
       const so = boundedDiagnosticExcerpt(stdout);
       const receipt = {
         command: command, cwd: '.', status: run.status, exitCode: run.status, signal: run.signal || null,
-        timedOut: Boolean(run.error && run.error.code === 'ETIMEDOUT'), durationMs: durationMs,
+        timedOut: Boolean(run.timedOut), durationMs: durationMs,
         stdoutBytes: Buffer.byteLength(stdout), stderrBytes: Buffer.byteLength(stderr),
         stdoutTruncated: so.truncated, stderrTruncated: se.truncated, logSource: source,
         logPath: path.relative(projectRoot, logPath).replace(/\\/g, '/'),
@@ -683,7 +816,7 @@ function createLocalExecutor(runtimeContext) {
     return { status: 'CHECK_PASSED', receipts: receipts };
   }
 
-  function applyAndTestDeterministically(projectRoot) {
+  async function applyAndTestDeterministically(projectRoot) {
     const resumeBatchId = 'BATCH-001';
     console.error('[CHECKPOINT_RESUME] resumeBatchId=' + resumeBatchId + ' destructiveReset=false');
     const routing = ensureProjectSetup(projectRoot);
@@ -698,14 +831,15 @@ function createLocalExecutor(runtimeContext) {
     }
 
     const rawMarkdown = fs.readFileSync(codePath, 'utf8');
-    const check = validateGeneratedCodeMarkdown(rawMarkdown);
+    const check = validateGeneratedCodeMarkdown(rawMarkdown, cleanRoot);
     if (!check.valid) {
       return { status: 'DELEGATE_FALLBACK_EXECUTOR', reason: check.reason, codeFile: codePath };
     }
 
     const writtenFiles = [];
     for (const item of check.fileBlocks) {
-      const targetAbs = path.resolve(cleanRoot, item.relPath);
+      const cleanRel = sanitizeTargetPath(item.relPath, cleanRoot).path || item.relPath;
+      const targetAbs = path.resolve(cleanRoot, cleanRel);
       if (!targetAbs.startsWith(cleanRoot + path.sep) && targetAbs !== cleanRoot) {
         throw new Error('SECURITY_BLOCK: Tentative shkrimi jashte projectRoot: ' + item.relPath);
       }
@@ -720,7 +854,7 @@ function createLocalExecutor(runtimeContext) {
 
     for (const cmd of commands) {
       combinedLogs += NL + '$ ' + cmd + NL;
-      const run = spawnSync(cmd, { cwd: cleanRoot, shell: true, encoding: 'utf8', timeout: 180000 });
+      const run = await executeProcessWithIdleWatchdog(cmd, cleanRoot, 300000);
       const out = (run.stdout || '') + NL + (run.stderr || '');
       combinedLogs += out;
 
@@ -810,7 +944,7 @@ function createLocalExecutor(runtimeContext) {
 let defaultLocalExecutorInstance = null;
 function getDefaultLocalExecutor() {
   if (!defaultLocalExecutorInstance) {
-    defaultLocalExecutorInstance = createLocalExecutor();
+    defaultLocalExecutorInstance = createLocalExecutor({});
   }
   return defaultLocalExecutorInstance;
 }

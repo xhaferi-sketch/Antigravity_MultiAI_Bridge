@@ -8,6 +8,12 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { execSync, spawnSync } = require('child_process');
+const {
+  resolveProjectRoot,
+  computeRequestFingerprint,
+  computePlanFingerprint,
+  embedPlanMetadataHeader
+} = require('./pipeline/target_path_utils');
 
 const PORT = 4321;
 const HOST = '127.0.0.1';
@@ -127,7 +133,6 @@ function getAutopilotEngine() {
       runBatchQuickChecks,
       runFinalBuildAndTests,
       validatePlanOutput,
-      dispatchPlannerWithFailover,
       dispatchChunkedEngineTurn,
       runGeminiAttachmentIngestHandshake,
       buildSearchAiCleanPrompt,
@@ -1192,6 +1197,15 @@ async function attachFilesSafely(page, targetFrame, tabKey, projectRoot, validFi
   const started=Date.now();
   if(!validFiles.length)return {status:'ATTACHMENTS_READY',files:[],sendReady:true,elapsedMs:0};
   const isGemini=tabKey.startsWith('gemini');
+  if(isGemini && Array.isArray(validFiles)) {
+    validFiles = validFiles.map(function(filePath) {
+      if(typeof filePath === 'string' && path.extname(filePath).toLowerCase() === '.md') {
+        const txtPath = filePath.replace(/\.md$/i, '.txt');
+        try { fs.copyFileSync(filePath, txtPath); return txtPath; } catch(_) { return filePath; }
+      }
+      return filePath;
+    });
+  }
   let input=await page.$('input#upload-file-button, input[type="file"]');
   if(input){
     await input.setInputFiles(validFiles);
@@ -1369,7 +1383,7 @@ async function collectGeminiTerminalDiagnostics(args) {
   return getGeminiEngine().collectGeminiTerminalDiagnostics(args);
 }
 async function waitAndExtractCleanResponse(page,targetFrame,tabKey,projectRoot,previousCount,sendMeta){
-  sendMeta=sendMeta||{};const isGemini=tabKey.startsWith('gemini'),hardCapMs=sendMeta.hardCapMs||(isGemini?900000:360000),defaultFirstTokenDeadlineMs=isGemini?180000:120000,firstTokenOverride=Number(sendMeta.firstTokenDeadlineMs),firstTokenDeadlineMs=Number.isFinite(firstTokenOverride)&&firstTokenOverride>0?Math.min(hardCapMs,Math.max(5000,firstTokenOverride)):defaultFirstTokenDeadlineMs,activeThinkingFreshMs=sendMeta.activeThinkingFreshMs||45000,explicitMaxThinkingStallMs=Number(sendMeta.maxThinkingWithoutDomProgressMs),maxThinkingWithoutDomProgressMs=Number.isFinite(explicitMaxThinkingStallMs)&&explicitMaxThinkingStallMs>0?explicitMaxThinkingStallMs:(isGemini?180000:120000),start=Date.now(),recoveryAttempt=sendMeta.recoveryAttempt||0,silentDeadlineMs=sendMeta.silentDeadlineMs||(isGemini?600000:300000),terminalDiagReceipts=new Map(),preUserCount=Number(sendMeta.preUserCount||0),preAssistantCount=Number(sendMeta.preAssistantCount||0);let lastProgressAt=start,lastLogAt=0,lastDeferredLogAt=0,lastSilentContinueAt=0,lastExtractionReceiptAt=0,lastExtractionChars=-1,lastProgress='',lastText='',stable=0,resetTicks=0,observedUserHighWatermark=preUserCount,observedAssistantHighWatermark=Math.max(previousCount,preAssistantCount),lastThoughtFingerprint=sendMeta.preThoughtFingerprint||'',observedSubstantiveThinkingEvidence=false,silentCheckpointCaptured=false,wasActiveProcessing=false;
+  sendMeta=sendMeta||{};const isGemini=tabKey.startsWith('gemini'),hardCapMs=sendMeta.hardCapMs||(isGemini?900000:360000),defaultFirstTokenDeadlineMs=isGemini?600000:120000,firstTokenOverride=Number(sendMeta.firstTokenDeadlineMs),firstTokenDeadlineMs=Number.isFinite(firstTokenOverride)&&firstTokenOverride>0?Math.min(hardCapMs,Math.max(5000,firstTokenOverride)):defaultFirstTokenDeadlineMs,activeThinkingFreshMs=sendMeta.activeThinkingFreshMs||45000,explicitMaxThinkingStallMs=Number(sendMeta.maxThinkingWithoutDomProgressMs),maxThinkingWithoutDomProgressMs=Number.isFinite(explicitMaxThinkingStallMs)&&explicitMaxThinkingStallMs>0?explicitMaxThinkingStallMs:(isGemini?180000:120000),start=Date.now(),recoveryAttempt=sendMeta.recoveryAttempt||0,silentDeadlineMs=sendMeta.silentDeadlineMs||(isGemini?600000:300000),terminalDiagReceipts=new Map(),preUserCount=Number(sendMeta.preUserCount||0),preAssistantCount=Number(sendMeta.preAssistantCount||0);let lastProgressAt=start,lastLogAt=0,lastDeferredLogAt=0,lastSilentContinueAt=0,lastExtractionReceiptAt=0,lastExtractionChars=-1,lastProgress='',lastText='',stable=0,resetTicks=0,observedUserHighWatermark=preUserCount,observedAssistantHighWatermark=Math.max(previousCount,preAssistantCount),lastThoughtFingerprint=sendMeta.preThoughtFingerprint||'',observedSubstantiveThinkingEvidence=false,silentCheckpointCaptured=false,wasActiveProcessing=false;
   const captureTerminalDiagnosticsOnce=async function(code,state,elapsedMs,progressAgeMs){const key=code+':'+recoveryAttempt;if(terminalDiagReceipts.has(key))return terminalDiagReceipts.get(key);const receipt=typeof collectGeminiTerminalDiagnostics==='function'?await collectGeminiTerminalDiagnostics({page:page,targetFrame:targetFrame,tabKey:tabKey,projectRoot:projectRoot,dispatchId:sendMeta.diagId,errorCode:code,state:state,elapsedMs:elapsedMs,progressAgeMs:progressAgeMs}):{errorCode:'',retryVisible:false};terminalDiagReceipts.set(key,receipt);return receipt;};
   while(Date.now()-start<hardCapMs){const reboundFrame=findChatFrameOrPage(page);if(reboundFrame!==targetFrame){const priorUrl=await targetFrame.evaluate(function(){return location.href;}).catch(function(){return '';});const reboundUrl=await reboundFrame.evaluate(function(){return location.href;}).catch(function(){return '';});targetFrame=reboundFrame;appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','CHAT_CONTEXT_REBOUND',{priorUrl:priorUrl,reboundUrl:reboundUrl,elapsedMs:Date.now()-start});}await page.waitForTimeout(750);const state=await probeWebChatState(targetFrame,isGemini,sendMeta);const elapsed=Date.now()-start;
     observedUserHighWatermark=Math.max(observedUserHighWatermark,state.userTurnCount);observedAssistantHighWatermark=Math.max(observedAssistantHighWatermark,state.assistantTurnCount);const newTurnWasObserved=Boolean(observedUserHighWatermark>preUserCount||observedAssistantHighWatermark>preAssistantCount||sendMeta.newUserTurnFingerprint||sendMeta.userTurnFingerprintMatched||(sendMeta.evidence&&sendMeta.evidence.userTurnFingerprintMatched)),countsReturnedToBaseline=Boolean(state.userTurnCount<=preUserCount&&state.assistantTurnCount<=preAssistantCount),committedTurnMissing=Boolean(!state.committedUserStillPresent),turnRolledBackAfterSend=Boolean(isGemini&&sendMeta.committed&&newTurnWasObserved&&countsReturnedToBaseline&&committedTurnMissing&&!state.generating&&!lastText),domainDriftCandidate=Boolean(isGemini&&sendMeta.committed&&state.domainMismatch&&state.userTurnCount===0&&state.assistantTurnCount===0&&!state.generating),landingResetCandidate=Boolean(isGemini&&sendMeta.committed&&state.landingVisible&&state.userTurnCount===0&&state.assistantTurnCount===0&&!state.generating&&!state.conversationContinuity),resetCandidate=Boolean(domainDriftCandidate||landingResetCandidate||turnRolledBackAfterSend),resetKind=domainDriftCandidate?'DOMAIN_DRIFT':(landingResetCandidate?'LANDING_RESET':(turnRolledBackAfterSend?'TURN_ROLLBACK':''));const resetInvariant=resetCandidate;resetTicks=resetInvariant?resetTicks+1:0;const resetMeta={preRouteKey:state.preRouteKey,currentRouteKey:state.currentRouteKey,preConversationId:state.preConversationId,currentConversationId:state.currentConversationId,committedUserStillPresent:state.committedUserStillPresent,users:state.userTurnCount,assistants:state.assistantTurnCount,preUserCount:preUserCount,preAssistantCount:preAssistantCount,observedUserHighWatermark:observedUserHighWatermark,observedAssistantHighWatermark:observedAssistantHighWatermark,countsReturnedToBaseline:countsReturnedToBaseline,committedTurnMissing:committedTurnMissing,newTurnWasObserved:newTurnWasObserved,turnRolledBackAfterSend:turnRolledBackAfterSend,resetKind:resetKind,landing:state.landingVisible,generating:state.generating,processingProbeSuppressed:state.processingProbeSuppressed,recoveryBudgetRemaining:Math.max(0,1-(sendMeta.recoveryAttempt||0))};if(resetTicks===1){appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','RESET_CANDIDATE_DETECTED',resetMeta);continue;}
@@ -1740,7 +1754,7 @@ function writeProjectState(projectRoot, patch) {
   const statePath = path.join(bridgeDir, 'state.json');
   const cur = readProjectState(projectRoot);
   const next = Object.assign({}, cur, patch, { updatedAt: new Date().toISOString() });
-  fs.writeFileSync(statePath, JSON.stringify(next, null, 2), 'utf8');
+  autopilotEngineModule.writeFileAtomic(statePath, JSON.stringify(next, null, 2));
   return next;
 }
 
@@ -1828,17 +1842,15 @@ function purgeExchangeArtifacts(projectRoot) {
   return { ok: true, removedCount: count };
 }
 
-  function classifyWorkspaceFile(rel, meta) { return autopilotEngineModule.classifyWorkspaceFile ? autopilotEngineModule.classifyWorkspaceFile(rel, meta) : {}; }
+function classifyWorkspaceFile(rel, meta) { return autopilotEngineModule.classifyWorkspaceFile ? autopilotEngineModule.classifyWorkspaceFile(rel, meta) : {}; }
 function scoreWorkspaceFile(info) { return autopilotEngineModule.scoreWorkspaceFile ? autopilotEngineModule.scoreWorkspaceFile(info) : 0; }
 function compactWorkspaceContent(rel, content, maxBytes, classification) { return autopilotEngineModule.compactWorkspaceContent ? autopilotEngineModule.compactWorkspaceContent(rel, content, maxBytes, classification) : { text: content, summarized: false }; }
 function buildBudgetedWorkspaceBundle(projectRoot, opts) { return autopilotEngineModule.buildBudgetedWorkspaceBundle ? autopilotEngineModule.buildBudgetedWorkspaceBundle(projectRoot, opts) : { content: '', receipt: {}, files: [] }; }
 function packWorkspace(projectRoot, mode) { return getAutopilotEngine().packWorkspace(projectRoot, mode); }
 function getBundleAttachmentAndNote(projectRoot, targetEngine) { return getAutopilotEngine().getBundleAttachmentAndNote(projectRoot, targetEngine); }
 
-
-
-function applyAndTestDeterministically(projectRoot) {
-  return getLocalExecutor().applyAndTestDeterministically(projectRoot);
+async function applyAndTestDeterministically(projectRoot) {
+  return await getLocalExecutor().applyAndTestDeterministically(projectRoot);
 }
 
 const CHUNK_ENGINE_LIMITS = autopilotEngineModule.CHUNK_ENGINE_LIMITS;
@@ -1854,7 +1866,7 @@ async function analyzeRepositoryChunks(chunks, opts) { return getAutopilotEngine
 function scoreAnalysisChunkRelevance(chunk, scan, graph, userRequest) { return getAutopilotEngine().scoreAnalysisChunkRelevance(chunk, scan, graph, userRequest); }
 function buildLocalStructuralChunkSummary(chunk, scan) { return getAutopilotEngine().buildLocalStructuralChunkSummary(chunk, scan); }
 function buildFinalPlanningContext(args) { return getAutopilotEngine().buildFinalPlanningContext(args); }
-function parseAndValidatePlanBatches(plan, graph, scan) { return getAutopilotEngine().parseAndValidatePlanBatches(plan, graph, scan); }
+function parseAndValidatePlanBatches(plan, graph, scan, projectRoot) { return getAutopilotEngine().parseAndValidatePlanBatches(plan, graph, scan, projectRoot); }
 function partitionCodingBatches(targets, graph, limits) { return getAutopilotEngine().partitionCodingBatches(targets, graph, limits); }
 function buildBatchMiniMap(batch, state, limits) { return getAutopilotEngine().buildBatchMiniMap(batch, state, limits); }
 function extractBatchPlanSlice(planText, batch) { return getAutopilotEngine().extractBatchPlanSlice(planText, batch); }
@@ -1880,8 +1892,8 @@ function runBatchQuickChecks(args) {
   return getLocalExecutor().runBatchQuickChecks(args);
 }
 
-function runFinalBuildAndTests(projectRoot, timeoutMs) {
-  return getLocalExecutor().runFinalBuildAndTests(projectRoot, timeoutMs);
+async function runFinalBuildAndTests(projectRoot, timeoutMs) {
+  return await getLocalExecutor().runFinalBuildAndTests(projectRoot, timeoutMs);
 }
 
 async function repairBatchOnce(args) { if (args.repairsUsed >= 1) throw new Error('BATCH_REPAIR_EXHAUSTED'); const result = await runCodingBatch(args.batch, args.context, args.engine, Object.assign({}, args, { repair: true })); return Object.assign(result, { repairsUsed: 1 }); }
@@ -1916,7 +1928,7 @@ async function dispatchPlannerWithFailover(state, routing, cleanRoot, prompt, at
 async function executeCodingLeaf(batch, state, routing, job, opts) { return getAutopilotEngine().executeCodingLeaf(batch, state, routing, job, opts); }
 async function executeBatchWithRecovery(batch, state, routing, job, opts) { return getAutopilotEngine().executeBatchWithRecovery(batch, state, routing, job, opts); }
 const activeCycleJobs = {};
-async function runAutonomousPipeline(cleanRoot, userRequest) { return getAutopilotEngine().runAutonomousPipeline(cleanRoot, userRequest); }
+async function runAutonomousPipeline(cleanRoot, userRequest, opts) { return getAutopilotEngine().runAutonomousPipeline(cleanRoot, userRequest, opts); }
 function resolveAndEmbedExternalFiles(userRequest) { return autopilotEngineModule.resolveAndEmbedExternalFiles ? autopilotEngineModule.resolveAndEmbedExternalFiles(userRequest) : ''; }
 async function waitJobSlice(cleanRoot, maxSliceMs) { return getAutopilotEngine().waitJobSlice(cleanRoot, maxSliceMs); }
 function resolveTargetProjectAndRequest(payload) {
@@ -1951,32 +1963,30 @@ function resolveTargetProjectAndRequest(payload) {
     }
   }
 
-  try {
-    if (fs.existsSync(cleanRoot) && fs.statSync(cleanRoot).isFile()) {
-      cleanRoot = path.dirname(cleanRoot);
-    }
-    if (['docs', 'doc', 'src', 'config', 'kerkesa_revit_pyetjet'].includes(path.basename(cleanRoot).toLowerCase())) {
-      cleanRoot = path.dirname(cleanRoot);
-    }
-  } catch (_) {}
+  cleanRoot = resolveProjectRoot(cleanRoot).root;
 
   let req = (payload.userRequest || payload.user_request || payload.prompt || '').trim();
   const isGeneric = !req || req === 'null' || req === 'undefined' || req.includes('Perdoruesi thirri /run-cycle');
   if (isGeneric) {
-    const candidateFiles = [
-      path.join(cleanRoot, 'URDHER_PUNE.md'),
-      path.join(cleanRoot, 'docs', 'URDHER_PUNE.md'),
-      'C:\\Users\\Vladi\\Documents\\revi vila test mep\\URDHER_PUNE_HERMES_REVIT_VILA_2025.md',
-      path.join(cleanRoot, 'MASTER_DYNAMIC_MEP_ARCHITECTURE_BLUEPRINT.md'),
-      path.join(cleanRoot, 'KUSHTETUTA_PROJEKTIT.md')
-    ];
-    for (const f of candidateFiles) {
-      if (fs.existsSync(f)) {
-        req = 'Zbato kerkesen dhe urdhrin e punes nga skedari: ' + f + '\n\n' + fs.readFileSync(f, 'utf8').slice(0, 10000);
-        break;
-      }
+    const searchDirs = [cleanRoot, path.join(cleanRoot, 'docs')].filter(function(d) { return fs.existsSync(d); });
+    let foundWorkOrder = null;
+
+    for (const dir of searchDirs) {
+      try {
+        const files = fs.readdirSync(dir);
+        const match = files.find(function(f) {
+          return /^(urdher_pune|work_order|task|blueprint|specification|plan|prompt)/i.test(f) && f.endsWith('.md');
+        });
+        if (match) {
+          foundWorkOrder = path.join(dir, match);
+          break;
+        }
+      } catch (_) {}
     }
-    if (!req || req.includes('Perdoruesi thirri /run-cycle')) {
+
+    if (foundWorkOrder && fs.existsSync(foundWorkOrder)) {
+      req = 'Zbato kerkesen dhe urdhrin e punes nga skedari: ' + foundWorkOrder + '\n\n' + fs.readFileSync(foundWorkOrder, 'utf8').slice(0, 15000);
+    } else {
       req = 'Ekzekuto ciklin autonom te plote (Pack -> Planner -> Coder -> Apply -> Reviewer) per projektin aktiv [' + cleanRoot + '].';
     }
   }
@@ -1998,7 +2008,10 @@ if (action !== 'run_full_cycle' && action !== 'check_cycle_progress' && !payload
   }
 }
 if (action === 'run_full_cycle') {
-  return await getAutopilotEngine().runFullCycle(cleanRoot, userRequest, { blocking: payload.blocking !== false });
+  return await getAutopilotEngine().runFullCycle(cleanRoot, userRequest, {
+    blocking: payload.blocking !== false,
+    forceReplan: payload.forceReplan === true
+  });
 }
 if (action === 'check_cycle_progress') {
   return await getAutopilotEngine().checkCycleProgress(cleanRoot, payload.waitMs || payload.maxSliceMs);
@@ -2017,13 +2030,17 @@ const errorPath = path.join(exchangeDir, 'last_error.txt');
 if (action === 'run_planner') {
 const engine = routing.roles.planner;
 if (engine === 'antigravity') return { status: 'DELEGATE_TO_ANTIGRAVITY', role: 'planner', targetFile: planPath };
+const effectiveUserRequest = (typeof payload.userRequest === 'string' && payload.userRequest.trim())
+  ? payload.userRequest
+  : userRequest;
+const embeddedSpecs = resolveAndEmbedExternalFiles(effectiveUserRequest);
+const currentRequestFingerprint = computeRequestFingerprint(effectiveUserRequest, embeddedSpecs);
 const bundle = getBundleAttachmentAndNote(cleanRoot, engine);
 let rule = fs.readFileSync(path.join(PLUGIN_ROOT, 'rules', 'planner_rules.md'), 'utf8');
 if (engine.startsWith('google_search_') || engine.startsWith('gemini')) {
   rule = rule.replace(/\([^)]*zip[^)]*\)/gi, '(Kodi i plotë i projektit është në formatin .txt (project_bundle.txt) i përfshirë në mesazh).');
 }
-const embeddedSpecs = resolveAndEmbedExternalFiles(payload.userRequest);
-const prompt = rule + bundle.note + embeddedSpecs + NL + NL + 'KERKESA E PERDORUESIT:' + NL + (payload.userRequest || 'Analizo dhe planifiko ndryshimet.');
+const prompt = rule + bundle.note + embeddedSpecs + NL + NL + 'KERKESA E PERDORUESIT:' + NL + (effectiveUserRequest || 'Analizo dhe planifiko ndryshimet.');
 
 let response;
 if (engine.startsWith('google_search_')) {
@@ -2033,7 +2050,7 @@ if (engine.startsWith('google_search_')) {
     promptText: prompt,
     bundlePath: bundle.path,
     isPlanner: true,
-    userRequest: payload.userRequest
+    userRequest: effectiveUserRequest
   });
 } else {
   response = await dispatchToWebTab({
@@ -2048,9 +2065,37 @@ const isPlanRefusal = (response || '').trim().length < 500 && SERVICE_ERROR_PATT
 if (!response || response.trim().length < 100 || isPlanRefusal) {
   throw new Error('PLANNER_INVALID_OR_REFUSED_OUTPUT nga [' + engine + ']: Plani u refuzua ose eshte teper i shkurter (' + (response || '').slice(0, 120).trim() + ').');
 }
-fs.writeFileSync(planPath, response, 'utf8');
-writeProjectState(cleanRoot, { phase: 'PLANNED', retryCount: 0, lastStatus: 'PLAN_READY' });
-return { status: 'EXTERNAL_COMPLETED', engine: engine, activeModel: tabActiveModel[engine], outputFile: planPath };
+const planFingerprint = computePlanFingerprint(response);
+const wrappedPlan = embedPlanMetadataHeader(response, {
+  requestFingerprint: currentRequestFingerprint,
+  planFingerprint: planFingerprint,
+  generatedAt: new Date().toISOString()
+});
+autopilotEngineModule.writeFileAtomic(planPath, wrappedPlan);
+for (const staleDownstream of [codePath, reviewPath, logPath, errorPath, path.join(exchangeDir, 'rev_ctx.txt')]) {
+  try {
+    fs.unlinkSync(staleDownstream);
+  } catch (unlinkErr) {
+    if (unlinkErr && unlinkErr.code !== 'ENOENT') throw unlinkErr;
+  }
+}
+writeProjectState(cleanRoot, {
+  phase: 'PLANNED',
+  retryCount: 0,
+  lastStatus: 'PLAN_READY',
+  requestFingerprint: currentRequestFingerprint,
+  planFingerprint: planFingerprint,
+  verifiedBatches: {},
+  checkpoints: {}
+});
+return {
+  status: 'EXTERNAL_COMPLETED',
+  engine: engine,
+  activeModel: tabActiveModel[engine],
+  outputFile: planPath,
+  requestFingerprint: currentRequestFingerprint,
+  planFingerprint: planFingerprint
+};
 }
 if (action === 'run_coder') {
 const engine = routing.roles.coder;
@@ -2115,12 +2160,12 @@ if (!validation.valid) {
     });
   }
 }
-fs.writeFileSync(codePath, response, 'utf8');
+autopilotEngineModule.writeFileAtomic(codePath, response);
 writeProjectState(cleanRoot, { phase: 'CODED', lastStatus: 'CODE_READY' });
 return { status: 'EXTERNAL_COMPLETED', engine: engine, activeModel: tabActiveModel[engine], outputFile: codePath };
 }
 if (action === 'apply_and_test') {
-return applyAndTestDeterministically(cleanRoot);
+return await applyAndTestDeterministically(cleanRoot);
 }
 if (action === 'run_reviewer') {
 const engine = routing.roles.reviewer;
@@ -2280,13 +2325,18 @@ const result = await executeCoreAction(data.action, data.payload);
 res.writeHead(200, { 'Content-Type': 'application/json' });
 return res.end(JSON.stringify(result));
 }
-if (req.url === '/run_cycle' || req.url === '/api/run-cycle') {
+const reqPath = req.url || '';
+if (reqPath === '/run_cycle' || reqPath === '/api/run-cycle') {
 const root = path.resolve(data.projectRoot || '.');
-const result = await executeCoreAction('run_full_cycle', { projectRoot: root, userRequest: data.userRequest || data.prompt || '' });
+const result = await executeCoreAction('run_full_cycle', {
+  projectRoot: root,
+  userRequest: data.userRequest || data.prompt || '',
+  forceReplan: data.forceReplan === true
+});
 res.writeHead(200, { 'Content-Type': 'application/json' });
 return res.end(JSON.stringify(result));
 }
-if (req.url === '/check_cycle_progress' || req.url === '/api/check-progress' || (req.url.startsWith('/cycle/') && req.url.endsWith('/wait'))) {
+if (reqPath === '/check_cycle_progress' || reqPath === '/api/check-progress' || (reqPath.startsWith('/cycle/') && reqPath.endsWith('/wait'))) {
 const root = path.resolve(data.projectRoot || '.');
 const result = await executeCoreAction('check_cycle_progress', { projectRoot: root, waitMs: data.waitMs || 20000, _internal: true });
 res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -2311,14 +2361,44 @@ console.error('[DASHBOARD READY] http://' + HOST + ':' + PORT);
 async function dispatchActionSingleton(action, payload) {
 action = action ? action.replace(/^(mcp__multi_ai_relay__|multi-ai-relay[/:])/, '') : action;
 if (isPrimaryInstance) return await executeCoreAction(action, payload);
-const resp = await fetch('http://' + HOST + ':' + PORT + '/api/mcp-proxy', {
-method: 'POST',
-headers: { 'Content-Type': 'application/json' },
-body: JSON.stringify({ action: action, payload: payload })
+
+return new Promise(function(resolve, reject) {
+  const postData = JSON.stringify({ action: action, payload: payload });
+  const req = http.request({
+    hostname: HOST,
+    port: PORT,
+    path: '/api/mcp-proxy',
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(postData)
+    },
+    timeout: 0 // Zero timeout: no artificial 300s socket drops
+  }, function(res) {
+    let responseBody = '';
+    res.setEncoding('utf8');
+    res.on('data', function(chunk) { responseBody += chunk; });
+    res.on('end', function() {
+      try {
+        const data = JSON.parse(responseBody);
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          resolve(data);
+        } else {
+          reject(new Error(data.error || ('Proxy HTTP ' + res.statusCode + ': ' + responseBody.slice(0, 500))));
+        }
+      } catch (parseErr) {
+        reject(new Error('Invalid proxy JSON response: ' + parseErr.message + ' (' + responseBody.slice(0, 200) + ')'));
+      }
+    });
+  });
+
+  req.on('error', function(err) {
+    reject(new Error('Proxy connection error to http://' + HOST + ':' + PORT + ' (' + err.message + ')'));
+  });
+
+  req.write(postData);
+  req.end();
 });
-const data = await resp.json();
-if (!resp.ok) throw new Error(data.error || 'Singleton proxy error');
-return data;
 }
 // ---------------- MCP TOOLS DEFINITION ----------------
 const mcpServer = new Server(
@@ -2336,7 +2416,8 @@ type: 'object',
 properties: {
 projectRoot: { type: 'string', description: 'Rruga e projektit (nese lihet bosh, merret projekti aktiv)' },
 userRequest: { type: 'string', description: 'Kerkesa e punes (nese lihet bosh, merret urdhri i punes nga disku)' }
-}
+},
+required: ['projectRoot', 'userRequest']
 }
 },
 {
@@ -2344,7 +2425,8 @@ name: 'check_cycle_progress',
 description: 'Pret ecurine e ciklit aktiv ne menyre deterministe derisa te ktheje CYCLE_COMPLETED. Thirre ne zinxhir nese merr STILL_RUNNING. Mos perdor kurre terminal!',
 inputSchema: {
 type: 'object',
-properties: { projectRoot: { type: 'string', description: 'Rruga e projektit (opsionale)' } }
+properties: { projectRoot: { type: 'string', description: 'Rruga e projektit (opsionale)' } },
+required: ['projectRoot']
 }
 },
 {
@@ -2434,5 +2516,3 @@ mcpServer.connect(transport);
 } else if(process.env.ANTIGRAVITY_TEST_EXPORT!=='1') {
 console.error('[STANDALONE MODE] Shtyp Ctrl+C per ta ndalur.');
 }
-
-

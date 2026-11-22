@@ -3,7 +3,23 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { spawnSync } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
+
+function notifyWhatsApp(msg) {
+  try {
+    const text = String(msg || '')
+      .replace(/["'\\&|;<>^%$`!()\r\n]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!text) return;
+    const child = spawn('hermes', ['send', '--to', 'whatsapp', text], {
+      stdio: 'ignore',
+      detached: true,
+      shell: true
+    });
+    child.unref();
+  } catch (_) {}
+}
 
 let AdmZip;
 try {
@@ -14,17 +30,23 @@ try {
 
 const localExecutorModule = require('./local_executor');
 const {
+  sanitizeTargetPath,
+  normalizeTargetKey,
+  isValidCleanRelativePath,
+  normalizeFingerprintText,
+  computeRequestFingerprint,
+  stripPlanMetadataHeader,
+  computePlanFingerprint,
+  embedPlanMetadataHeader,
+  extractPlanMetadataHeader,
+  extractPlanTargets
+} = require('./target_path_utils');
+const {
   createLocalExecutor,
-  parseCodeBlocksFromMarkdown,
   computeCheckpointIdentity,
   parseCheckpointAudit,
   normalizeCheckpointTarget,
-  isTargetVerifiedForCheckpoint,
-  migrateLegacyCheckpointReceipts,
-  appendBatchAudit,
-  runBatchQuickChecks,
-  applyBatch,
-  runFinalBuildAndTests
+  isTargetVerifiedForCheckpoint
 } = localExecutorModule;
 
 let defaultLocalExecutor = null;
@@ -37,8 +59,473 @@ function getDefaultLocalExecutor() {
   return defaultLocalExecutor;
 }
 
+function parseCodeBlocksFromMarkdown(markdown, expectedTargets) {
+  if (typeof localExecutorModule.parseCodeBlocksFromMarkdown === 'function') {
+    return localExecutorModule.parseCodeBlocksFromMarkdown(markdown, expectedTargets);
+  }
+  return getDefaultLocalExecutor().parseCodeBlocksFromMarkdown(markdown, expectedTargets);
+}
+
+function applyBatch(args) {
+  if (typeof localExecutorModule.applyBatch === 'function') {
+    return localExecutorModule.applyBatch(args);
+  }
+  return getDefaultLocalExecutor().applyBatch(args);
+}
+
+function runBatchQuickChecks(args) {
+  if (typeof localExecutorModule.runBatchQuickChecks === 'function') {
+    return localExecutorModule.runBatchQuickChecks(args);
+  }
+  return getDefaultLocalExecutor().runBatchQuickChecks(args);
+}
+
+async function runFinalBuildAndTests(projectRoot, timeoutMs) {
+  if (typeof localExecutorModule.runFinalBuildAndTests === 'function') {
+    return await localExecutorModule.runFinalBuildAndTests(projectRoot, timeoutMs);
+  }
+  return await getDefaultLocalExecutor().runFinalBuildAndTests(projectRoot, timeoutMs);
+}
+
+function migrateLegacyCheckpointReceipts(codePath, cleanRoot, checkpointIdentity) {
+  if (typeof localExecutorModule.migrateLegacyCheckpointReceipts === 'function') {
+    return localExecutorModule.migrateLegacyCheckpointReceipts(codePath, cleanRoot, checkpointIdentity);
+  }
+  return getDefaultLocalExecutor().migrateLegacyCheckpointReceipts(codePath, cleanRoot, checkpointIdentity);
+}
+
+function appendBatchAudit(codePath, receipt, parsed, cleanRoot, checkpointIdentity) {
+  if (typeof localExecutorModule.appendBatchAudit === 'function') {
+    return localExecutorModule.appendBatchAudit(codePath, receipt, parsed, cleanRoot, checkpointIdentity);
+  }
+  return getDefaultLocalExecutor().appendBatchAudit(codePath, receipt, parsed, cleanRoot, checkpointIdentity);
+}
+
 function persistCheckpointReceiptOnce(codePath, receipt, parsedFiles, cleanRoot, checkpointIdentity) {
   return getDefaultLocalExecutor().persistCheckpointReceiptOnce(codePath, receipt, parsedFiles, cleanRoot, checkpointIdentity);
+}
+
+const SHA256_HEX_RE = /^[a-f0-9]{64}$/i;
+
+function writeFileAtomic(filePath, content) {
+  const dir = path.dirname(filePath);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  const tmpPath = filePath + '.' + process.pid + '.' + Date.now() + '.' + crypto.randomBytes(4).toString('hex') + '.tmp';
+  try {
+    fs.writeFileSync(tmpPath, content, 'utf8');
+    fs.renameSync(tmpPath, filePath);
+  } catch (err) {
+    try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (_) {}
+    throw err;
+  }
+}
+
+const RESUMABLE_PLANNED_PHASES = Object.freeze(new Set([
+  'PLANNED',
+  'CODED',
+  'CODING',
+  'CODING_BATCH',
+  'APPLYING',
+  'APPLYING_AND_TESTING',
+  'FINAL_APPLY_AND_TEST',
+  'INTEGRATION_REPAIR',
+  'BUILD_FAILED',
+  'APPLIED_AND_VERIFIED',
+  'REVIEWING',
+  'REVIEW_CHANGES_REQUESTED',
+  'REVIEW_FIX'
+]));
+
+function isResumablePlannedPhase(phase) {
+  if (typeof phase !== 'string' || !phase.trim()) return false;
+  const p = phase.trim().toUpperCase();
+  if (RESUMABLE_PLANNED_PHASES.has(p)) return true;
+  if (p.startsWith('CODING_BATCH')) return true;
+  if (p.startsWith('AUTO_HEAL_RETRY')) return true;
+  return false;
+}
+
+function readDiskStateSafely(cleanRoot) {
+  const statePath = path.join(path.resolve(cleanRoot), '.antigravity', 'bridge', 'state.json');
+  if (!fs.existsSync(statePath)) {
+    return { exists: false, corrupted: false, state: null };
+  }
+  try {
+    const raw = fs.readFileSync(statePath, 'utf8');
+    if (!raw || !raw.trim()) {
+      return { exists: true, corrupted: true, state: null, error: 'EMPTY_STATE_JSON' };
+    }
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { exists: true, corrupted: true, state: null, error: 'INVALID_STATE_OBJECT' };
+    }
+    return { exists: true, corrupted: false, state: parsed };
+  } catch (err) {
+    return { exists: true, corrupted: true, state: null, error: err.message };
+  }
+}
+
+function evaluatePlanCache(cleanRoot, currentRequestFingerprint, state, options) {
+  options = options || {};
+  const resolvedRoot = path.resolve(cleanRoot);
+
+  if (options.forceReplan === true) {
+    return { reusable: false, reason: 'FORCE_REPLAN' };
+  }
+
+  let effectiveState = state;
+  if (effectiveState === undefined) {
+    const diskState = readDiskStateSafely(resolvedRoot);
+    if (diskState.corrupted) {
+      return { reusable: false, reason: 'STATE_CORRUPTED_STALE', detail: diskState.error };
+    }
+    effectiveState = diskState.state;
+  } else if (effectiveState && effectiveState.__corrupted === true) {
+    return { reusable: false, reason: 'STATE_CORRUPTED_STALE' };
+  } else {
+    const diskCheck = readDiskStateSafely(resolvedRoot);
+    if (diskCheck.corrupted) {
+      return { reusable: false, reason: 'STATE_CORRUPTED_STALE', detail: diskCheck.error };
+    }
+  }
+
+  const planPath = path.join(resolvedRoot, '.antigravity', 'bridge', 'exchange', 'plan.md');
+  if (!fs.existsSync(planPath)) {
+    return { reusable: false, reason: 'PLAN_MISSING' };
+  }
+
+  let rawPlan = '';
+  try {
+    rawPlan = fs.readFileSync(planPath, 'utf8');
+  } catch (err) {
+    return { reusable: false, reason: 'PLAN_READ_ERROR', detail: err.message };
+  }
+
+  const strippedPlanBody = stripPlanMetadataHeader(rawPlan).trim();
+  if (!strippedPlanBody || Buffer.byteLength(strippedPlanBody, 'utf8') <= 200) {
+    return { reusable: false, reason: 'PLAN_TOO_SHORT' };
+  }
+
+  const planMeta = extractPlanMetadataHeader(rawPlan);
+  if (!planMeta.requestFingerprint || !planMeta.planFingerprint) {
+    return { reusable: false, reason: 'PLAN_META_MISSING' };
+  }
+
+  const computedPlanFp = computePlanFingerprint(rawPlan);
+  if (planMeta.planFingerprint !== computedPlanFp) {
+    return {
+      reusable: false,
+      reason: 'PLAN_FINGERPRINT_MISMATCH',
+      expectedPlanFingerprint: computedPlanFp,
+      foundPlanFingerprint: planMeta.planFingerprint
+    };
+  }
+
+  const normalizedCurrentReqFp = typeof currentRequestFingerprint === 'string' && SHA256_HEX_RE.test(currentRequestFingerprint.trim())
+    ? currentRequestFingerprint.trim().toLowerCase()
+    : '';
+  if (!normalizedCurrentReqFp || planMeta.requestFingerprint !== normalizedCurrentReqFp) {
+    return {
+      reusable: false,
+      reason: 'REQUEST_FINGERPRINT_MISMATCH',
+      expectedRequestFingerprint: normalizedCurrentReqFp,
+      foundRequestFingerprint: planMeta.requestFingerprint
+    };
+  }
+
+  if (!effectiveState || typeof effectiveState !== 'object') {
+    return {
+      reusable: false,
+      reason: 'STATE_MISSING'
+    };
+  }
+
+  if (!effectiveState.phase || !isResumablePlannedPhase(effectiveState.phase)) {
+    return {
+      reusable: false,
+      reason: 'PHASE_NOT_RESUMABLE:' + String(effectiveState.phase || 'MISSING')
+    };
+  }
+
+  if (!effectiveState.requestFingerprint || String(effectiveState.requestFingerprint).trim().toLowerCase() !== normalizedCurrentReqFp) {
+    return {
+      reusable: false,
+      reason: 'STATE_REQUEST_FINGERPRINT_MISMATCH'
+    };
+  }
+
+  if (!effectiveState.planFingerprint || String(effectiveState.planFingerprint).trim().toLowerCase() !== computedPlanFp) {
+    return {
+      reusable: false,
+      reason: 'STATE_PLAN_FINGERPRINT_MISMATCH'
+    };
+  }
+
+  return {
+    reusable: true,
+    reason: 'PLAN_CACHE_VALID',
+    planText: rawPlan,
+    planFingerprint: computedPlanFp,
+    requestFingerprint: planMeta.requestFingerprint
+  };
+}
+
+function invalidateStaleCycleArtifacts(cleanRoot, reason, currentRequestFingerprint, writeStateFn) {
+  const resolvedRoot = path.resolve(cleanRoot);
+  const bridgeDir = path.join(resolvedRoot, '.antigravity', 'bridge');
+  const exchangeDir = path.join(bridgeDir, 'exchange');
+  const artifactNames = [
+    'plan.md',
+    'code.md',
+    'review.md',
+    'build_test.log',
+    'last_error.txt',
+    'rev_ctx.txt',
+    'planning_context.txt'
+  ];
+
+  const removedFiles = [];
+  const ioErrors = [];
+
+  for (const name of artifactNames) {
+    const target = path.join(exchangeDir, name);
+    try {
+      fs.unlinkSync(target);
+      removedFiles.push(name);
+    } catch (err) {
+      if (err && err.code !== 'ENOENT') {
+        ioErrors.push({ file: name, message: err.message });
+      }
+    }
+  }
+
+  const normalizedReason = String(reason || 'STALE_CACHE');
+  const nextState = {
+    phase: 'IDLE',
+    retryCount: 0,
+    lastStatus: 'CACHE_INVALIDATED',
+    invalidationReason: normalizedReason,
+    lastInvalidationReason: normalizedReason,
+    requestFingerprint: typeof currentRequestFingerprint === 'string' && SHA256_HEX_RE.test(currentRequestFingerprint.trim())
+      ? currentRequestFingerprint.trim().toLowerCase()
+      : null,
+    planFingerprint: null,
+    verifiedBatches: {},
+    checkpoints: {},
+    updatedAt: new Date().toISOString()
+  };
+
+  if (ioErrors.length > 0) {
+    nextState.invalidationErrors = ioErrors;
+  }
+
+  const statePath = path.join(bridgeDir, 'state.json');
+  writeFileAtomic(statePath, JSON.stringify(nextState, null, 2));
+  if (typeof writeStateFn === 'function') {
+    try {
+      writeStateFn(resolvedRoot, nextState);
+    } catch (_) {}
+  }
+
+  console.error(
+    '[PLAN_CACHE_INVALIDATED] project=' + resolvedRoot +
+    ' reason=' + normalizedReason +
+    ' newRequestFp=' + String(nextState.requestFingerprint || 'none')
+  );
+
+  return {
+    invalidated: true,
+    reason: normalizedReason,
+    removedFiles: removedFiles,
+    ioErrors: ioErrors,
+    state: nextState
+  };
+}
+
+function buildCodePlanMetaHeader(planFingerprint) {
+  const fp = typeof planFingerprint === 'string' && SHA256_HEX_RE.test(planFingerprint.trim())
+    ? planFingerprint.trim().toLowerCase()
+    : '';
+  return '<!-- CODE_PLAN_META planFingerprint=' + fp + ' -->';
+}
+
+function buildBatchCheckpointHeader(meta) {
+  meta = meta || {};
+  const fp = typeof meta.planFingerprint === 'string' && SHA256_HEX_RE.test(meta.planFingerprint.trim())
+    ? meta.planFingerprint.trim().toLowerCase()
+    : '';
+  const batchIndex = Number.isInteger(meta.batchIndex) ? meta.batchIndex : Number(meta.batchIndex || 0);
+  const targetKeys = Array.isArray(meta.targetKeys)
+    ? meta.targetKeys.map(function(k) { return String(k || '').trim(); }).filter(Boolean).join(',')
+    : '';
+  return '<!-- CHECKPOINT_META planFingerprint=' + fp + ' batchIndex=' + batchIndex + ' targets=' + targetKeys + ' -->';
+}
+
+function extractCheckpointPlanFingerprint(codeMarkdown, batchTargets, batchIndex, projectRoot) {
+  if (typeof codeMarkdown !== 'string' || !codeMarkdown.trim()) return null;
+
+  const normalizedWanted = new Set(
+    (Array.isArray(batchTargets) ? batchTargets : [])
+      .map(function(t) { return normalizeTargetKey(t, projectRoot); })
+      .filter(Boolean)
+  );
+
+  const metaRe = /<!--\s*(?:CHECKPOINT_META|CHECKPOINT_FILE_VERIFIED)\b([\s\S]*?)-->/gi;
+  let match;
+  let lastMatchingFp = null;
+  let lastAnyFp = null;
+
+  while ((match = metaRe.exec(codeMarkdown)) !== null) {
+    const attrs = match[1] || '';
+    const fpMatch = attrs.match(/\bplanFingerprint=([a-f0-9]{64})\b/i);
+    if (!fpMatch) continue;
+    const fp = fpMatch[1].toLowerCase();
+    lastAnyFp = fp;
+
+    const idxMatch = attrs.match(/\bbatchIndex=(\d+)\b/i);
+    const targetsMatch = attrs.match(/\btargets=([^\s>]+)/i);
+    const targetMatch = attrs.match(/\btarget=([^\s>]+)/i);
+    const metaTargets = targetsMatch
+      ? targetsMatch[1].split(',').map(function(t) { return normalizeTargetKey(t, projectRoot); }).filter(Boolean)
+      : (targetMatch ? [normalizeTargetKey(targetMatch[1], projectRoot)].filter(Boolean) : []);
+
+    const indexMatches = batchIndex !== undefined && batchIndex !== null && idxMatch && Number(idxMatch[1]) === Number(batchIndex);
+    const targetsOverlap = normalizedWanted.size > 0 && metaTargets.some(function(t) { return normalizedWanted.has(t); });
+
+    if (indexMatches || targetsOverlap || (!idxMatch && !targetsMatch && !targetMatch)) {
+      lastMatchingFp = fp;
+    }
+  }
+
+  if (lastMatchingFp) return lastMatchingFp;
+
+  const globalMatch = codeMarkdown.match(/<!--\s*CODE_PLAN_META\b[^>]*\bplanFingerprint=([a-f0-9]{64})\b[^>]*-->/i);
+  if (globalMatch) return globalMatch[1].toLowerCase();
+
+  if (normalizedWanted.size === 0 && lastAnyFp) return lastAnyFp;
+  return null;
+}
+
+function verifyBatchCheckpoint(args) {
+  args = args || {};
+  const codeMarkdown = typeof args.codeMarkdown === 'string' ? args.codeMarkdown : '';
+  const state = args.state && typeof args.state === 'object' ? args.state : null;
+  const currentPlanFingerprint = typeof args.currentPlanFingerprint === 'string' ? args.currentPlanFingerprint.trim().toLowerCase() : '';
+  const batchIndex = args.batchIndex;
+  const batchTargets = Array.isArray(args.batchTargets) ? args.batchTargets : [];
+  const projectRoot = args.projectRoot;
+
+  if (!SHA256_HEX_RE.test(currentPlanFingerprint)) {
+    return {
+      verified: false,
+      reason: 'STALE_CHECKPOINT',
+      detail: 'INVALID_CURRENT_PLAN_FINGERPRINT',
+      foundPlanFingerprint: null
+    };
+  }
+
+  if (state && state.planFingerprint && String(state.planFingerprint).trim().toLowerCase() !== currentPlanFingerprint) {
+    return {
+      verified: false,
+      reason: 'STALE_CHECKPOINT',
+      detail: 'STATE_PLAN_FINGERPRINT_MISMATCH',
+      foundPlanFingerprint: String(state.planFingerprint).trim().toLowerCase()
+    };
+  }
+
+  const foundPlanFp = extractCheckpointPlanFingerprint(codeMarkdown, batchTargets, batchIndex, projectRoot);
+  if (!foundPlanFp) {
+    return {
+      verified: false,
+      reason: 'STALE_CHECKPOINT',
+      detail: 'CHECKPOINT_PLAN_FINGERPRINT_MISSING',
+      foundPlanFingerprint: null
+    };
+  }
+
+  if (foundPlanFp !== currentPlanFingerprint) {
+    return {
+      verified: false,
+      reason: 'STALE_CHECKPOINT',
+      detail: 'CHECKPOINT_PLAN_FINGERPRINT_MISMATCH',
+      foundPlanFingerprint: foundPlanFp
+    };
+  }
+
+  const normalizedTargets = batchTargets
+    .map(function(t) { return normalizeTargetKey(t, projectRoot); })
+    .filter(Boolean);
+
+  if (normalizedTargets.length === 0) {
+    return {
+      verified: false,
+      reason: 'STALE_CHECKPOINT',
+      detail: 'EMPTY_BATCH_TARGETS',
+      foundPlanFingerprint: foundPlanFp
+    };
+  }
+
+  const blockTargets = new Set();
+  try {
+    const rawParsedBlocks = parseCodeBlocksFromMarkdown(codeMarkdown);
+    const parsedBlocks = Array.isArray(rawParsedBlocks)
+      ? rawParsedBlocks
+      : (rawParsedBlocks && Array.isArray(rawParsedBlocks.files) ? rawParsedBlocks.files : []);
+    for (const blk of parsedBlocks) {
+      const p = blk && (blk.relPath || blk.path || blk.file);
+      const k = normalizeTargetKey(p, projectRoot);
+      if (k) blockTargets.add(k);
+    }
+  } catch (_) {}
+
+  const auditTargets = new Set();
+  try {
+    const auditIndex = parseCheckpointAudit(codeMarkdown);
+    if (auditIndex && auditIndex.fileReceipts instanceof Map) {
+      for (const [entry, rec] of auditIndex.fileReceipts.entries()) {
+        if (rec && rec.status === 'VERIFIED' && (!rec.planFingerprint || String(rec.planFingerprint).toLowerCase() === currentPlanFingerprint)) {
+          const k = normalizeTargetKey(entry, projectRoot);
+          if (k) auditTargets.add(k);
+        }
+      }
+    } else if (auditIndex instanceof Map) {
+      for (const entry of auditIndex.keys()) {
+        const k = normalizeTargetKey(entry, projectRoot);
+        if (k) auditTargets.add(k);
+      }
+    }
+  } catch (_) {}
+
+  const stateBatchTargets = new Set();
+  const batchKey = 'BATCH_' + (Number(batchIndex || 0) + 1);
+  if (state && state.verifiedBatches && typeof state.verifiedBatches === 'object') {
+    const rec = state.verifiedBatches[batchKey] || state.verifiedBatches[String(batchIndex)];
+    if (rec && String(rec.planFingerprint || '').toLowerCase() === currentPlanFingerprint && Array.isArray(rec.targets)) {
+      for (const t of rec.targets) {
+        const k = normalizeTargetKey(t, projectRoot);
+        if (k) stateBatchTargets.add(k);
+      }
+    }
+  }
+
+  const missingTargets = normalizedTargets.filter(function(key) {
+    return !blockTargets.has(key) && !auditTargets.has(key) && !stateBatchTargets.has(key);
+  });
+
+  if (missingTargets.length > 0) {
+    return {
+      verified: false,
+      reason: 'STALE_CHECKPOINT',
+      detail: 'MISSING_VERIFIED_TARGETS:' + missingTargets.join(','),
+      foundPlanFingerprint: foundPlanFp
+    };
+  }
+
+  return {
+    verified: true,
+    reason: 'CHECKPOINT_MATCHED',
+    planFingerprint: currentPlanFingerprint
+  };
 }
 
 function classifyAttachmentHandshakeStrict(text) {
@@ -62,19 +549,22 @@ function buildSearchAiCleanPrompt(mode) {
 
 function validatePlanOutput(text, opts) {
   opts = opts || {};
-  const clean = String(text || '').replace(/\n?PLANI_PERFUNDOI_100\s*$/i, '').trim();
+  const clean = stripPlanMetadataHeader(String(text || '')).replace(/\n?PLANI_PERFUNDOI_100\s*$/i, '').trim();
   if (clean.length < 250) return { ok: false, reason: 'TOO_SHORT', missing: ['minimum_length'] };
-  const targetRegex = /^\s*(?:[-*]\s*)?FILE_TARGET:\s*([^\r\n]+)\s*$/gmi;
-  const targets = [];
-  let tm;
-  while ((tm = targetRegex.exec(clean)) !== null) {
-    const v = tm[1].trim().replace(/["'`*]/g, '');
-    if (!targets.includes(v)) targets.push(v);
+  const extraction = extractPlanTargets(clean, opts.projectRoot);
+  const unsafeRejected = (extraction.rejected || []).some(function(item) {
+    return item.reason === 'PATH_TRAVERSAL_REJECTED' ||
+      item.reason === 'OUTSIDE_PROJECT_ROOT' ||
+      item.reason === 'ABSOLUTE_WITHOUT_ROOT';
+  });
+  if (unsafeRejected) {
+    return { ok: false, reason: 'UNSAFE_PATH', targets: extraction.targets };
   }
-  if (targets.some(function(x) { return /^(?:[a-z]:[\\/]|\\\\|\/)|(?:^|[\\/])\.\.(?:[\\/]|$)/i.test(x); })) {
-    return { ok: false, reason: 'UNSAFE_PATH', targets: targets };
-  }
-  return { ok: targets.length > 0, reason: targets.length > 0 ? '' : 'NO_TARGETS', targets: targets };
+  return {
+    ok: extraction.targets.length > 0,
+    reason: extraction.targets.length > 0 ? '' : 'NO_TARGETS',
+    targets: extraction.targets
+  };
 }
 
 async function defaultRunGeminiAttachmentIngestHandshake(args) {
@@ -136,6 +626,120 @@ const ADAPTIVE_HALVING_CODES = new Set([
   'BATCH_RESPONSE_BUDGET_EXCEEDED',
   'BATCH_PARSE_INCOMPLETE'
 ]);
+
+const BATCH_LIFECYCLE_PHASES = Object.freeze({
+  COMMITTED: 'BATCH_N_COMMITTED',
+  PREPARE: 'PREPARE_NEXT_BATCH_SESSION',
+  READY: 'NEXT_BATCH_SESSION_READY',
+  DISPATCH: 'BATCH_N+1_DISPATCH'
+});
+
+const LIFECYCLE_TRANSIENTS = Object.freeze(new Set([
+  'RATE_LIMIT',
+  'QUOTA_EXCEEDED',
+  'TIMEOUT',
+  'STREAM_STALL',
+  'NETWORK_ERROR',
+  'SERVICE_UNAVAILABLE',
+  'ENGINE_UNAVAILABLE',
+  'AUTH_EXPIRED',
+  'EMPTY_RESPONSE',
+  'MODEL_LOCK_FAILED',
+  'TRANSIENT_FAILURE'
+]));
+
+function createRecoveryBudgets(opts) {
+  opts = opts || {};
+  return {
+    lifecycleRecoveryBudget: Number.isFinite(opts.lifecycleRecoveryBudget) ? opts.lifecycleRecoveryBudget : 3,
+    codingRecoveryBudget: Number.isFinite(opts.codingRecoveryBudget) ? opts.codingRecoveryBudget : 3,
+    engineFailoverBudget: Number.isFinite(opts.engineFailoverBudget) ? opts.engineFailoverBudget : 3
+  };
+}
+
+function classifyBatchLifecycleError(err) {
+  const code = normalizeFailureCode(err);
+  const message = String((err && err.message) || err || '');
+  const combined = (code + ' ' + message).toUpperCase();
+
+  const isTransient = /TRANSIENT|TIMEOUT|RATE_LIMIT|QUOTA|STALL|ECONNRESET|ETIMEDOUT|503|429/.test(combined);
+  const isCoding = /PATCH|SYNTAX|QUICK_CHECK|PARSE|BATCH_TARGET_MISSING|BATCH_OUTPUT/.test(combined);
+  const isModelTimeout = combined.includes('MODEL_TRIGGER_TIMEOUT');
+
+  let budget = 'lifecycleRecoveryBudget';
+  if (isCoding) {
+    budget = 'codingRecoveryBudget';
+  }
+
+  return {
+    code: code,
+    message: message,
+    transient: isTransient,
+    fatal: isModelTimeout ? false : (!isTransient && !isCoding),
+    budget: budget
+  };
+}
+
+function consumeRecoveryBudget(budgets, classificationOrKey) {
+  if (!budgets || typeof budgets !== 'object') {
+    throw new Error('EXHAUSTED: Missing budgets');
+  }
+  const key = typeof classificationOrKey === 'string'
+    ? classificationOrKey
+    : ((classificationOrKey && classificationOrKey.budget) || 'lifecycleRecoveryBudget');
+
+  const current = Number(budgets[key] != null ? budgets[key] : 0);
+  if (!Number.isFinite(current) || current <= 0) {
+    throw new Error('EXHAUSTED: Budget ' + key + ' is exhausted');
+  }
+  return Object.assign({}, budgets, { [key]: current - 1 });
+}
+
+function firstUnverifiedBatch(batches, receipts) {
+  if (!Array.isArray(batches) || batches.length === 0) return null;
+  for (let i = 0; i < batches.length; i++) {
+    const batch = batches[i];
+    let verified = false;
+    if (typeof receipts === 'function') {
+      verified = Boolean(receipts(batch));
+    } else if (receipts && typeof receipts === 'object') {
+      const entry = receipts[batch.batchId];
+      verified = Boolean(entry && (entry.verified === true || entry === true));
+    }
+    if (!verified) return batch;
+  }
+  return null;
+}
+
+async function prepareNextBatchSession(args) {
+  if (args && typeof args === 'object' && args.engineAdapter) {
+    if (typeof args.persistCheckpoint === 'function') {
+      await args.persistCheckpoint();
+    }
+    if (args.engineAdapter && typeof args.engineAdapter.resetConversation === 'function') {
+      await args.engineAdapter.resetConversation();
+    }
+    if (args.engineAdapter && typeof args.engineAdapter.waitForSessionReady === 'function') {
+      await args.engineAdapter.waitForSessionReady();
+    }
+    if (args.engineAdapter && typeof args.engineAdapter.ensureGeminiNeonModel === 'function') {
+      await args.engineAdapter.ensureGeminiNeonModel();
+    }
+    return { status: 'READY' };
+  }
+  return {
+    batchId: (args && args.batchId) || 'BATCH_1',
+    targets: (args && Array.isArray(args.targets)) ? args.targets.slice() : [],
+    forceFreshChat: true,
+    resetPolicy: {
+      strategy: 'SOFT_FIRST',
+      preserveVerifiedModel: true,
+      requireFreshConversation: true,
+      allowRouteReopen: true,
+      allowHardReload: true
+    }
+  };
+}
 
 function inspectTextBuffer(buffer) {
   if (!Buffer.isBuffer(buffer)) buffer = Buffer.from(buffer || []);
@@ -340,7 +944,7 @@ function packWorkspace(projectRoot, mode, opts) {
   const plan = path.join(exchangeDir, 'plan.md'), err = path.join(exchangeDir, 'last_error.txt');
   if (fs.existsSync(plan)) {
     const txt = fs.readFileSync(plan, 'utf8');
-    targets = Array.from(txt.matchAll(/^\s*(?:[-*]\s*)?FILE_TARGET:\s*([^\r\n]+)$/gmi)).map(function(m) { return m[1].trim().replace(/["'`*]/g, ''); });
+    targets = extractPlanTargets(txt, cleanRoot).targets;
   }
   if (fs.existsSync(err)) {
     const t = fs.readFileSync(err, 'utf8');
@@ -396,8 +1000,40 @@ function getBundleAttachmentAndNote(projectRoot, targetEngine, opts) {
   return { path: txtPath, note: txtNote };
 }
 
-function normalizeBatchTarget(value) {
-  return String(value || '').replace(/\\/g, '/').replace(/^\.\//, '').trim();
+function resolveAndEmbedExternalFiles(userRequest) {
+  if (!userRequest || typeof userRequest !== 'string') return '';
+  let embedded = '';
+  const quotedRegex = /["']([A-Za-z]:\\[^"'\r\n*?<>|]+|\/[^"'\r\n]+)["']/g;
+  const extRegex = /(?:[A-Za-z]:\\[^"'\r\n\t*?<>|]+?\.(?:txt|md|yaml|yml|json|py|js|ts|sh|ps1|csv|xml|html|zip|diff|patch)|\/[^"'\s\r\n\t]+?\.(?:txt|md|yaml|yml|json|py|js|ts|sh|ps1|csv|xml|html|zip|diff|patch))\b/gi;
+
+  const candidatePaths = [];
+  let qMatch;
+  while ((qMatch = quotedRegex.exec(userRequest)) !== null) {
+    candidatePaths.push(qMatch[1]);
+  }
+  const extMatches = userRequest.match(extRegex) || [];
+  candidatePaths.push(...extMatches);
+
+  const readPaths = new Set();
+  for (const rawPath of candidatePaths) {
+    const clean = rawPath.trim().replace(/^["']|["']$/g, '').replace(/[.,;:]$/, '');
+    if (readPaths.has(clean)) continue;
+    try {
+      if (fs.existsSync(clean) && fs.statSync(clean).isFile()) {
+        readPaths.add(clean);
+        const content = fs.readFileSync(clean, 'utf8');
+        embedded += NL + NL + '=== DOKUMENTI I PLOTE I SPECIFIKIMEVE NGA PERDORUESI: ' + path.basename(clean) + ' ===' + NL +
+                    content + NL +
+                    '=== FUNDI I SPECIFIKIMEVE (ZBATIM 100% I DETYRUESHEM, ZERO-FAKE, ZERO-PLACEHOLDERS) ===';
+      }
+    } catch (_) {}
+  }
+  return embedded;
+}
+
+function normalizeBatchTarget(value, projectRoot) {
+  const sanitized = sanitizeTargetPath(value, projectRoot);
+  return sanitized.path || String(value || '').replace(/\\/g, '/').replace(/^\.\//, '').trim();
 }
 
 function inferRepositoryLanguage(rel) {
@@ -651,31 +1287,35 @@ function buildFinalPlanningContext(args) {
   const req = args.userRequest || '';
   const repoMap = args.repoMap ? args.repoMap.text : '';
   const critical = args.criticalWindows || '';
-  const text = ['=== FINAL PLANNING CONTEXT ===', 'USER REQUEST:', req, '', repoMap, '', critical].join(NL);
+  const summariesText = Array.isArray(args.summaries) && args.summaries.length > 0
+    ? ['=== CHUNK SUMMARIES ==='].concat(args.summaries.map(function(s) { return s.text || ''; })).join(NL + NL)
+    : '';
+  const parts = ['=== FINAL PLANNING CONTEXT ===', 'USER REQUEST:', req, '', repoMap];
+  if (summariesText) parts.push('', summariesText);
+  if (critical) parts.push('', critical);
+  const text = parts.join(NL);
   return {
     text: text,
     bytes: Buffer.byteLength(text)
   };
 }
 
-function parseAndValidatePlanBatches(planText, graph, scan) {
-  if (typeof planText !== 'string' || planText.trim().length === 0) {
-    throw new Error('PLANNING_FINAL_INVALID: Empty plan text');
+function parseAndValidatePlanBatches(planText, graph, scan, projectRoot) {
+  const resolvedRoot = projectRoot || (scan && scan.projectRoot) || undefined;
+  const extraction = extractPlanTargets(planText, resolvedRoot);
+
+  if (!extraction.targets || extraction.targets.length === 0) {
+    const rejectedCount = (extraction.rejected || []).length;
+    const summary = rejectedCount > 0
+      ? ' (rejectedCount=' + rejectedCount + ': ' + extraction.rejected.slice(0, 5).map(function(r) { return r.reason; }).join(', ') + ')'
+      : '';
+    const err = new Error('PLANNING_FINAL_INVALID: PLAN_NO_VALID_TARGETS: Plani arkitekturor nuk përmban asnjë FILE_TARGET ose skedar të vlefshëm në ALLOWED_FILES' + summary);
+    err.code = 'PLAN_NO_VALID_TARGETS';
+    err.rejected = extraction.rejected || [];
+    throw err;
   }
 
-  const targets = [];
-  const targetRegex = /^\s*(?:[-*]\s*)?FILE_TARGET:\s*([^\r\n]+)$/gmi;
-  let m;
-  while ((m = targetRegex.exec(planText)) !== null) {
-    const target = normalizeBatchTarget(m[1].trim().replace(/["'`*]/g, ''));
-    if (target) targets.push(target);
-  }
-
-  if (targets.length === 0) {
-    throw new Error('PLANNING_FINAL_INVALID: No valid targets found in plan');
-  }
-
-  return partitionCodingBatches(targets, graph, CHUNK_ENGINE_LIMITS);
+  return partitionCodingBatches(extraction.targets, graph, CHUNK_ENGINE_LIMITS);
 }
 
 function partitionCodingBatches(targets, graph, limits) {
@@ -722,347 +1362,460 @@ function partitionCodingBatches(targets, graph, limits) {
 }
 
 function buildBatchMiniMap(batch, state, limits) {
+  limits = limits || CHUNK_ENGINE_LIMITS;
+  const softLimit = limits.batchMiniMapSoft || CHUNK_ENGINE_LIMITS.batchMiniMapSoft;
   const targets = (batch && batch.targets) || [];
   const edges = (state && state.graph && state.graph.edges) || [];
   const targetEdges = edges.filter(function(e) { return targets.includes(e.from); });
   const importsText = targetEdges.length > 0
     ? 'DIRECT IMPORTS:' + NL + targetEdges.map(function(e) { return e.from + ' -> ' + e.to; }).join(NL)
     : 'DIRECT IMPORTS: None';
-  const text = '=== BATCH MINI MAP ===' + NL + 'BATCH: ' + (batch && batch.batchId) + NL + 'TARGETS: ' + targets.join(', ') + NL + importsText;
-  return {
-    text: text,
-    bytes: Buffer.byteLength(text)
-  };
+  const raw = ['=== BATCH MINI MAP ===', 'TARGETS: ' + targets.join(', '), importsText].join(NL);
+  const text = truncateUtf8(raw, softLimit);
+  return { text: text, bytes: Buffer.byteLength(text) };
 }
 
 function extractBatchPlanSlice(planText, batch) {
-  if (typeof planText !== 'string' || !planText.trim()) return '';
-  const targets = new Set(((batch && batch.targets) || []).map(normalizeBatchTarget));
-  if (targets.size === 0) return planText;
+  const full = stripPlanMetadataHeader(String(planText || '')).trim();
+  if (!full) return '';
+  const targets = (batch && Array.isArray(batch.targets)) ? batch.targets : [];
+  if (targets.length === 0 || full.length <= 16000) return full;
 
-  const sections = planText.split(/(?=\n#{1,4}\s+)/);
-  const relevantSections = [];
-  const preambleSections = [];
-
-  for (const sec of sections) {
-    const isTargetSpecific = /FILE_TARGET:|ALLOWED_FILES/i.test(sec);
-    const mentionsTarget = Array.from(targets).some(function(t) { return sec.includes(t); });
-
-    if (mentionsTarget) {
-      relevantSections.push(sec.trim());
-    } else if (!isTargetSpecific && relevantSections.length === 0) {
-      preambleSections.push(sec.trim());
-    }
-  }
-
-  if (relevantSections.length > 0) {
-    return [...preambleSections, ...relevantSections].join(NL + NL);
-  }
-
-  const lines = planText.split(/\r?\n/);
-  const slice = lines.filter(function(l) {
-    return Array.from(targets).some(function(t) { return l.includes(t); });
+  const sections = full.split(/\n(?=##\s)/);
+  const matched = sections.filter(function(sec, idx) {
+    if (idx === 0) return true;
+    const low = sec.toLowerCase();
+    return targets.some(function(t) {
+      const clean = String(t || '').toLowerCase();
+      return low.includes(clean) || low.includes(path.basename(clean));
+    });
   });
-  return slice.length > 0 ? slice.join(NL) : planText;
+  return matched.length > 0 ? matched.join(NL + NL) : truncateUtf8(full, 16000);
 }
 
 function buildMinimalBatchContext(batch, state, limits) {
   limits = limits || CHUNK_ENGINE_LIMITS;
+  const hardBudget = limits.batchHard || CHUNK_ENGINE_LIMITS.batchHard;
+  const maxTargetBytes = limits.maxBatchTargetSourceBytes || CHUNK_ENGINE_LIMITS.maxBatchTargetSourceBytes;
+  const targets = (batch && Array.isArray(batch.targets)) ? batch.targets : [];
+  const projectRoot = state && state.scan && state.scan.projectRoot ? state.scan.projectRoot : null;
+
   const miniMap = buildBatchMiniMap(batch, state, limits);
-  const planSlice = extractBatchPlanSlice(state.planSlice || '', batch);
-  const text = ['=== BATCH CONTEXT ===', 'BATCH: ' + batch.batchId, miniMap.text, 'PLAN SLICE:', planSlice].join(NL);
-  const bytes = Buffer.byteLength(text);
+  const planSlice = extractBatchPlanSlice(state && state.planSlice ? state.planSlice : '', batch);
+
+  const blocks = [
+    '=== CODING BATCH CONTEXT ===',
+    'BATCH_ID: ' + (batch && batch.batchId ? batch.batchId : 'BATCH_1'),
+    'TARGETS: ' + targets.join(', '),
+    '',
+    miniMap.text,
+    '',
+    '=== PLAN SLICE ===',
+    truncateUtf8(planSlice, 24 * 1024)
+  ];
+
+  if (state && state.contractMemory) {
+    blocks.push('', '=== CROSS-BATCH CONTRACTS ===', truncateUtf8(state.contractMemory, limits.contractCumulative || CHUNK_ENGINE_LIMITS.contractCumulative));
+  }
+  if (state && state.lastErrorReceipt) {
+    blocks.push('', '=== LAST ERROR RECEIPT ===', truncateUtf8(state.lastErrorReceipt, 12 * 1024));
+  }
+
+  for (const rel of targets) {
+    if (!projectRoot) continue;
+    const abs = path.join(projectRoot, rel);
+    if (fs.existsSync(abs)) {
+      try {
+        const raw = fs.readFileSync(abs);
+        const inspected = inspectTextBuffer(raw);
+        if (inspected.isText) {
+          blocks.push('', '--- FILE: ' + rel + ' ---', truncateUtf8(inspected.text, maxTargetBytes));
+        }
+      } catch (_) {}
+    }
+  }
+
+  const text = truncateUtf8(blocks.join(NL), hardBudget);
   return {
     text: text,
-    bytes: bytes,
-    miniMapBytes: miniMap.bytes,
-    planSliceBytes: Buffer.byteLength(planSlice)
+    bytes: Buffer.byteLength(text),
+    targets: targets.slice(),
+    miniMap: miniMap.text,
+    planSlice: planSlice
   };
-}
-
-function selectCodingTransport(context, limits) {
-  limits = limits || CHUNK_ENGINE_LIMITS;
-  const maxInlineBytes = limits.maxInlineBytes || 12 * 1024;
-  const bytes = context.bytes || Buffer.byteLength(context.text || '');
-  const transport = bytes <= maxInlineBytes ? 'INLINE' : 'ATTACHMENT';
-  return {
-    transport: transport,
-    twoStepIngest: transport === 'ATTACHMENT',
-    attachmentCount: transport === 'ATTACHMENT' ? 1 : 0
-  };
-}
-
-function selectAdaptiveReasoningLevel(opts) {
-  return 'high';
 }
 
 function buildBatchContext(batch, state, limits) {
   return buildMinimalBatchContext(batch, state, limits);
 }
 
-async function runCodingBatch(batch, context, engine, opts) {
+function selectCodingTransport(context, limits) {
+  limits = limits || CHUNK_ENGINE_LIMITS;
+  const text = typeof context === 'string' ? context : String((context && context.text) || '');
+  const bytes = context && Number.isFinite(context.bytes) ? context.bytes : Buffer.byteLength(text);
+  const maxChars = limits.maxInlineChars || CHUNK_ENGINE_LIMITS.maxInlineChars;
+  const maxBytes = limits.maxInlineBytes || CHUNK_ENGINE_LIMITS.maxInlineBytes;
+  const inline = text.length <= maxChars && bytes <= maxBytes;
   return {
-    batchId: batch.batchId,
-    targets: batch.targets,
-    output: 'MOCK_OUTPUT'
+    transport: inline ? 'INLINE' : 'ATTACHMENT',
+    inline: inline,
+    attachmentCount: inline ? 0 : 1,
+    twoStepIngest: !inline,
+    chars: text.length,
+    bytes: bytes
   };
 }
 
+function selectAdaptiveReasoningLevel(ctx) {
+  return 'high';
+}
+
+async function runCodingBatch(batch, context, engine, opts) {
+  opts = opts || {};
+  const dispatchFn = opts.dispatchChunkedEngineTurn || opts.dispatchFn;
+  if (typeof dispatchFn !== 'function') {
+    throw new Error('CODER_DISPATCH_UNAVAILABLE: Missing dispatchChunkedEngineTurn');
+  }
+  const projectRoot = opts.projectRoot || (opts.state && opts.state.scan && opts.state.scan.projectRoot) || process.cwd();
+  const prompt = opts.prompt || (typeof context === 'string' ? context : (context && context.text) || '');
+  const attachment = opts.attachment || null;
+  return await dispatchFn(engine, projectRoot, prompt, attachment, Object.assign({
+    forceFreshChat: true,
+    useProvidedBundle: Boolean(attachment),
+    reasoningLevel: selectAdaptiveReasoningLevel(opts),
+    modelTier: opts.modelTier || 'neon'
+  }, opts));
+}
+
 function halveBatchAdaptively(batch, costs, level) {
-  const targets = (batch && batch.targets) || [];
+  const targets = (batch && Array.isArray(batch.targets)) ? batch.targets.slice() : [];
   if (targets.length <= 1) return [batch];
 
-  const mid = Math.ceil(targets.length / 2);
-  const left = targets.slice(0, mid);
-  const right = targets.slice(mid);
+  const nextLevel = Number(level || 0) + 1;
+  let left = [];
+  let right = [];
+
+  if (costs && typeof costs === 'object') {
+    const sorted = targets.slice().sort(function(a, b) {
+      return Number(costs[b] || 0) - Number(costs[a] || 0) || a.localeCompare(b);
+    });
+    let leftCost = 0;
+    let rightCost = 0;
+    for (const t of sorted) {
+      const c = Number(costs[t] || 1);
+      if (leftCost <= rightCost) {
+        left.push(t);
+        leftCost += c;
+      } else {
+        right.push(t);
+        rightCost += c;
+      }
+    }
+    if (left.length === 0 || right.length === 0) {
+      const mid = Math.ceil(targets.length / 2);
+      left = targets.slice(0, mid);
+      right = targets.slice(mid);
+    }
+  } else {
+    const mid = Math.ceil(targets.length / 2);
+    left = targets.slice(0, mid);
+    right = targets.slice(mid);
+  }
 
   return [
-    { batchId: batch.batchId + '.a', targets: left, halvingLevel: (level || 0) + 1 },
-    { batchId: batch.batchId + '.b', targets: right, halvingLevel: (level || 0) + 1 }
+    Object.assign({}, batch, { batchId: (batch.batchId || 'BATCH') + '.a', targets: left, halvingLevel: nextLevel }),
+    Object.assign({}, batch, { batchId: (batch.batchId || 'BATCH') + '.b', targets: right, halvingLevel: nextLevel })
   ];
 }
 
 function normalizeFailureCode(err) {
   if (!err) return '';
   if (typeof err === 'object') {
-    if (err.code) return String(err.code);
-    if (err.failureCode) return String(err.failureCode);
+    if (err.failureCode && typeof err.failureCode === 'string') {
+      return err.failureCode.trim().toUpperCase();
+    }
+    if (err.code && typeof err.code === 'string') {
+      return err.code.trim().toUpperCase();
+    }
   }
-  const msg = String(err && err.message || err || '');
-  const tokens = [
-    'BATCH_OUTPUT_INCOMPLETE',
-    'BATCH_TARGET_MISSING',
-    'BATCH_SYNTAX_OR_QUICK_CHECK_FAILED',
-    'BATCH_RESPONSE_BUDGET_EXCEEDED',
-    'BATCH_PARSE_INCOMPLETE',
-    'BATCH_OUTPUT_TRUNCATED',
-    'GEMINI_HARD_CAP_TIMEOUT',
-    'FINAL_APPLY_AND_TEST_FAILED'
-  ];
-  for (const t of tokens) {
-    if (msg.includes(t)) return t;
-  }
-  return msg.slice(0, 40).replace(/[^A-Za-z0-9_]/g, '_');
+  const msg = String(typeof err === 'string' ? err : (err.message || err));
+  const codeMatch = msg.match(/\b([A-Z][A-Z0-9_]{3,})\b/);
+  return codeMatch ? codeMatch[1] : '';
 }
 
 function isAdaptiveHalvingFailure(err) {
   const code = normalizeFailureCode(err);
-  return ADAPTIVE_HALVING_CODES.has(code);
+  if (ADAPTIVE_HALVING_CODES.has(code)) return true;
+  const msg = String((err && err.message) || err || '');
+  for (const c of ADAPTIVE_HALVING_CODES) {
+    if (msg.includes(c)) return true;
+  }
+  return false;
 }
 
 function buildCrossBatchContractSummary(receipt, previous) {
-  const prev = typeof previous === 'string' ? previous : (previous && previous.text ? previous.text : '');
-  const added = 'BATCH: ' + (receipt.batchId || 'n/a') + ' WRITTEN: ' + (receipt.filesWritten || []).join(', ');
-  const combined = prev ? prev + NL + added : added;
-  return {
-    text: combined,
-    bytes: Buffer.byteLength(combined)
-  };
+  const prev = String(previous || '').trim();
+  const files = (receipt && Array.isArray(receipt.filesWritten)) ? receipt.filesWritten : [];
+  const hashes = (receipt && receipt.fileHashes && typeof receipt.fileHashes === 'object') ? receipt.fileHashes : {};
+  const entryLines = [
+    'BATCH: ' + ((receipt && receipt.batchId) || 'UNKNOWN'),
+    'FILES: ' + (files.length ? files.join(', ') : 'None')
+  ];
+  for (const f of files) {
+    if (hashes[f]) entryLines.push('  - ' + f + ' sha256=' + String(hashes[f]).slice(0, 12));
+  }
+  const entry = truncateUtf8(entryLines.join(NL), CHUNK_ENGINE_LIMITS.contractPerBatch);
+  const combined = prev ? (prev + NL + NL + entry) : entry;
+  const text = truncateUtf8(combined, CHUNK_ENGINE_LIMITS.contractCumulative);
+  return { text: text, bytes: Buffer.byteLength(text) };
 }
 
 function buildDiffFocusedReviewContext(args) {
-  const plan = args.plan || '';
-  const diff = args.diff || '';
-  const changed = (args.changedFiles || []).join(', ');
-  const text = ['=== REVIEW CONTEXT ===', 'PLAN:', plan, 'CHANGED: ' + changed, 'DIFF:', diff].join(NL);
+  args = args || {};
+  const plan = truncateUtf8(String(args.plan || ''), 32 * 1024);
+  const changedFiles = Array.isArray(args.changedFiles) ? args.changedFiles : [];
+  const diff = String(args.diff || '');
+  const finalTests = truncateUtf8(String(args.finalTests || ''), 16 * 1024);
+  const knownRisks = Array.isArray(args.knownRisks) ? args.knownRisks : [];
+
+  const header = [
+    '=== REVIEW CONTEXT ===',
+    'CHANGED_FILES: ' + (changedFiles.join(', ') || 'None'),
+    '',
+    '=== PLAN ===',
+    plan,
+    '',
+    '=== FINAL TESTS ===',
+    finalTests,
+    knownRisks.length ? (NL + '=== KNOWN RISKS ===' + NL + knownRisks.join(NL)) : '',
+    '',
+    '=== DIFF ==='
+  ].join(NL);
+
+  const hardLimit = CHUNK_ENGINE_LIMITS.reviewHard;
+  const fullText = header + NL + diff;
+  if (Buffer.byteLength(fullText) <= hardLimit) {
+    return {
+      text: fullText,
+      bytes: Buffer.byteLength(fullText),
+      chunks: [fullText]
+    };
+  }
+
+  const maxDiffPerChunk = Math.max(4096, hardLimit - Buffer.byteLength(header) - 512);
+  const diffLines = diff.split('\n');
+  const chunks = [];
+  let cur = '';
+  for (const line of diffLines) {
+    const next = cur ? (cur + '\n' + line) : line;
+    if (Buffer.byteLength(next) > maxDiffPerChunk && cur) {
+      chunks.push(header + NL + cur);
+      cur = line;
+    } else {
+      cur = next;
+    }
+  }
+  if (cur || chunks.length === 0) {
+    chunks.push(header + NL + cur);
+  }
+
+  const boundedText = truncateUtf8(chunks[0], hardLimit);
   return {
-    text: text,
-    bytes: Buffer.byteLength(text),
-    chunks: [text]
+    text: boundedText,
+    bytes: Buffer.byteLength(boundedText),
+    chunks: chunks
   };
 }
 
 function writeChunkContextFile(exchangeDir, chunk, scan, maxBytes) {
-  const p = path.join(exchangeDir, 'chunk_' + chunk.chunkId.toLowerCase() + '.txt');
-  const text = 'CHUNK ' + chunk.chunkId + NL + chunk.files.join(NL);
-  fs.writeFileSync(p, text, 'utf8');
+  const limit = Number(maxBytes || CHUNK_ENGINE_LIMITS.chunkHard);
+  if (!fs.existsSync(exchangeDir)) fs.mkdirSync(exchangeDir, { recursive: true });
+  const parts = ['=== ANALYSIS CHUNK: ' + chunk.chunkId + ' ==='];
+  const projectRoot = scan && scan.projectRoot ? scan.projectRoot : process.cwd();
+
+  for (const rel of (chunk.files || [])) {
+    const abs = path.join(projectRoot, rel);
+    if (!fs.existsSync(abs)) continue;
+    try {
+      const inspected = inspectTextBuffer(fs.readFileSync(abs));
+      if (!inspected.isText) continue;
+      const block = NL + '--- FILE: ' + rel + ' ---' + NL + inspected.text;
+      if (Buffer.byteLength(parts.join(NL) + block) > limit) break;
+      parts.push(block);
+    } catch (_) {}
+  }
+
+  const text = truncateUtf8(parts.join(NL), limit);
+  const outPath = path.join(exchangeDir, String(chunk.chunkId || 'CHUNK') + '_context.txt');
+  fs.writeFileSync(outPath, text, 'utf8');
   return {
-    path: p,
-    bytes: Buffer.byteLength(text)
+    path: outPath,
+    bytes: Buffer.byteLength(text),
+    chunkId: chunk.chunkId
   };
 }
 
-function extractTargetsFromError(errorText, knownTargets) {
-  const found = new Set();
-  const text = String(errorText || '');
-  for (const t of knownTargets) {
-    if (text.includes(t) || text.includes(path.basename(t))) {
-      found.add(t);
+function extractTargetsFromError(text, known) {
+  const raw = String(text || '');
+  const list = Array.isArray(known) ? known : [];
+  const matched = [];
+  const seen = new Set();
+
+  for (const target of list) {
+    const norm = String(target || '').replace(/\\/g, '/');
+    if (!norm) continue;
+    const base = path.posix.basename(norm);
+    if (raw.includes(norm) || raw.includes(norm.replace(/\//g, '\\')) || (base && raw.includes(base))) {
+      const key = normalizeTargetKey(norm);
+      if (key && !seen.has(key)) {
+        seen.add(key);
+        matched.push(norm);
+      }
     }
   }
-  return Array.from(found).sort();
+  return matched;
 }
 
-function getFailoverEngines(primaryEngine, excludedSet, context) {
-  const e = excludedSet instanceof Set ? excludedSet : new Set(excludedSet || []);
-  // ============================================================================
-  // RREGULL I PANEGOCIUESHËM DHE I KYÇUR (INVIOLABLE LOCK - HIGH PRIORITY)
-  // Renditja bazë e motorëve të failover-it. Në runtime, context.isEngineAvailable
-  // filtron dhe garanton EKSKLUZIVISHT motorët aktivë Gemini Neon High (gemini1 <-> gemini2).
-  // NDALOHET KATEGORIKISHT kalimi te Copilot apo te motorë fantazmë!
-  // ============================================================================
-  const orders = {
-    gemini2: ['gemini3', 'gemini1', 'web2'],
-    gemini3: ['gemini2', 'gemini1', 'web2'],
-    gemini1: ['gemini3', 'gemini2', 'web2'],
-    web2: ['web1'],
-    web1: ['web2'],
-    google_search_1: ['google_search_2', 'google_search_3', 'web1'],
-    google_search_2: ['google_search_3', 'google_search_1', 'web1'],
-    google_search_3: ['google_search_1', 'google_search_2', 'web1']
-  };
-  const list = orders[primaryEngine] || [];
-  return list.filter(function(engine) {
-    if (e.has(engine) || engine === primaryEngine) return false;
-    if (context && typeof context.isEngineAvailable === 'function') {
-      return context.isEngineAvailable(engine);
-    }
+function getFailoverEngines(primaryEngine, excludedSet, runtimeContext) {
+  const excluded = excludedSet instanceof Set ? excludedSet : new Set(Array.isArray(excludedSet) ? excludedSet : []);
+  const primary = String(primaryEngine || '').trim();
+  const isAvailable = runtimeContext && typeof runtimeContext.isEngineAvailable === 'function'
+    ? runtimeContext.isEngineAvailable
+    : null;
+
+  let pool = [];
+  if (primary === 'gemini2') {
+    pool = ['gemini3', 'gemini1', 'web2'];
+  } else if (primary === 'gemini1') {
+    pool = ['gemini2', 'gemini3', 'web2'];
+  } else if (primary === 'gemini3') {
+    pool = ['gemini1', 'gemini2', 'web2'];
+  } else if (primary === 'web1') {
+    pool = ['web2'];
+  } else if (primary === 'web2') {
+    pool = ['web1'];
+  } else {
+    pool = ['gemini1', 'gemini2', 'gemini3', 'web2'];
+  }
+
+  return pool.filter(function(eng) {
+    if (!eng || eng === primary) return false;
+    if (excluded.has(eng)) return false;
+    if (isAvailable && !isAvailable(eng)) return false;
     return true;
   });
 }
 
 function isEngineFailoverEligible(code) {
-  return /BATCH_RECOVERY_EXHAUSTED|GEMINI_CONVERSATION_RESET_AFTER_SEND|GEMINI_TURN_ROLLED_BACK_AFTER_SEND|GEMINI_SILENT_PREFLIGHT_TIMEOUT|GEMINI_THINKING_STALL|GEMINI_HARD_CAP_TIMEOUT|WEB_SERVICE_REFUSAL|SERVICE_REFUSAL|WEB_TRANSIENT_SERVICE_ERROR|WEB_PAYLOAD_REJECTED_OR_OVERSIZED|WEB_QUOTA_OR_LIMIT_ERROR|SEARCH_AI_RESPONSE_TIMEOUT|SEARCH_AI_CAPTCHA_REQUIRED|PLANNER_ESCALATION_FAILED|FORCED_CHAT_RESET_VERIFICATION_FAILED|CHAT_RESET_VERIFICATION_FAILED|MODEL_OPTION_NOT_FOUND|MODEL_TIER_NOT_FOUND|MODEL_MENU_TIMEOUT|MODEL_TRIGGER_TIMEOUT|MODEL_SELECTION_UNVERIFIED|FIRST_TOKEN_TIMEOUT|GEMINI_FIRST_TOKEN_TIMEOUT/.test(String(code || ''));
-}
-
-function resolveAndEmbedExternalFiles(userRequest) {
-  if (!userRequest || typeof userRequest !== 'string') return '';
-  let embedded = '';
-  const quotedRegex = /["']([A-Za-z]:\\[^"'\r\n*?<>|]+|\/[^"'\r\n]+)["']/g;
-  const extRegex = /(?:[A-Za-z]:\\[^"'\r\n\t*?<>|]+?\.(?:txt|md|yaml|yml|json|py|js|ts|sh|ps1|csv|xml|html|zip|diff|patch)|\/[^"'\s\r\n\t]+?\.(?:txt|md|yaml|yml|json|py|js|ts|sh|ps1|csv|xml|html|zip|diff|patch))\b/gi;
-
-  const candidatePaths = [];
-  let qMatch;
-  while ((qMatch = quotedRegex.exec(userRequest)) !== null) {
-    candidatePaths.push(qMatch[1]);
+  const text = String(code || '');
+  if (!text) return false;
+  if (/CYCLE_CANCELLED|PLAN_NO_VALID_TARGETS|BATCH_SYNTAX_OR_QUICK_CHECK_FAILED/i.test(text)) {
+    return false;
   }
-  const extMatches = userRequest.match(extRegex) || [];
-  candidatePaths.push(...extMatches);
+  return /RATE_LIMIT|QUOTA|TIMEOUT|STALL|AUTH_EXPIRED|MODEL_LOCK|CRITICAL_MODEL|SERVICE_ERROR|REFUSED|EMPTY_RESPONSE|UNAVAILABLE|DISPATCH|429|503|502|ECONNRESET|ETIMEDOUT|TARGET_CLOSED|BROWSER/i.test(text);
+}
 
-  const readPaths = new Set();
-  for (let rawPath of candidatePaths) {
-    let clean = rawPath.trim().replace(/^["']|["']$/g, '').replace(/[.,;:]$/, '');
-    if (readPaths.has(clean)) continue;
-    try {
-      if (fs.existsSync(clean) && fs.statSync(clean).isFile()) {
-        readPaths.add(clean);
-        const content = fs.readFileSync(clean, 'utf8');
-        embedded += NL + NL + '=== DOKUMENTI I PLOTE I SPECIFIKIMEVE NGA PERDORUESI: ' + path.basename(clean) + ' ===' + NL +
-                    content + NL +
-                    '=== FUNDI I SPECIFIKIMEVE (ZBATIM 100% I DETYRUESHEM, ZERO-FAKE, ZERO-PLACEHOLDERS) ===';
-      }
-    } catch (_) {}
+function createAutopilotEngine(deps) {
+  if (!deps || typeof deps !== 'object') {
+    throw new Error('Mandatory runtimeContext dependency is required for createAutopilotEngine');
   }
-  return embedded;
-}
-
-
-
-const BATCH_LIFECYCLE_PHASES = Object.freeze({
-  COMMITTED: 'BATCH_N_COMMITTED',
-  PREPARING: 'PREPARE_NEXT_BATCH_SESSION',
-  READY: 'NEXT_BATCH_SESSION_READY',
-  DISPATCH: 'BATCH_N+1_DISPATCH'
-});
-const LIFECYCLE_TRANSIENTS = Object.freeze(new Set([
-  'TRANSIENT_SESSION_JITTER',
-  'TRANSIENT_UI_HYDRATION',
-  'TRANSIENT_MODEL_CONTROL_NOT_READY',
-  'MODEL_TRIGGER_TIMEOUT'
-]));
-function createRecoveryBudgets(input) {
-  input = input || {};
-  return { lifecycleRecoveryBudget: Number(input.lifecycleRecoveryBudget || 3), codingRecoveryBudget: Number(input.codingRecoveryBudget || 2), engineFailoverBudget: Number(input.engineFailoverBudget || 1) };
-}
-function classifyBatchLifecycleError(error) {
-  const code = String(error && (error.code || error.message) || error || '').split(':')[0];
-  return LIFECYCLE_TRANSIENTS.has(code) ? { transient: true, code: code, budget: 'lifecycleRecoveryBudget', fatal: false } : { transient: false, code: code, budget: 'codingRecoveryBudget', fatal: true };
-}
-function consumeRecoveryBudget(budgets, classification) {
-  const next = Object.assign({}, budgets);
-  const key = classification.budget;
-  if (!Object.prototype.hasOwnProperty.call(next, key) || next[key] <= 0) throw new Error(key.toUpperCase() + '_EXHAUSTED');
-  next[key] -= 1;
-  return next;
-}
-function firstUnverifiedBatch(batches, receipts) {
-  receipts = receipts || {};
-  return (batches || []).find(function(batch) { return !(receipts[batch.batchId] && receipts[batch.batchId].verified === true); }) || null;
-}
-async function prepareNextBatchSession(args) {
-  if (!args || typeof args.persistCheckpoint !== 'function') throw new Error('CHECKPOINT_PERSISTOR_REQUIRED');
-  const transitions = [];
-  await args.persistCheckpoint(args.completedBatch);
-  transitions.push(BATCH_LIFECYCLE_PHASES.COMMITTED, BATCH_LIFECYCLE_PHASES.PREPARING);
-  let budgets = createRecoveryBudgets(args.budgets);
-  for (;;) {
-    try {
-      const session = await args.engineAdapter.resetConversation({ resetPolicy: args.resetPolicy, forceFreshChat: true, tabKey: args.tabKey, page: args.page, targetFrame: args.targetFrame });
-      await args.engineAdapter.waitForSessionReady({ tabKey: args.tabKey, page: args.page, targetFrame: args.targetFrame });
-      await args.engineAdapter.ensureGeminiNeonModel(args.targetFrame || args.page, args.tabKey, { forceVerify: session.documentChanged === true });
-      transitions.push(BATCH_LIFECYCLE_PHASES.READY, BATCH_LIFECYCLE_PHASES.DISPATCH);
-      return { status: 'READY', transitions: transitions, budgets: budgets, session: session };
-    } catch (error) {
-      const classified = classifyBatchLifecycleError(error);
-      if (!classified.transient) throw error;
-      budgets = consumeRecoveryBudget(budgets, classified);
-    }
-  }
-}
-
-function createAutopilotEngine(runtimeContext) {
-  if (!runtimeContext || typeof runtimeContext !== 'object') {
-    throw new Error('Mandatory runtimeContext dependency is required');
-  }
-
+  const runtimeContext = deps;
   const activeCycleJobs = runtimeContext.activeCycleJobs || {};
-  let executor = runtimeContext.localExecutor;
-  if (!executor) {
-    try {
-      executor = createLocalExecutor(runtimeContext);
-    } catch (_) {
-      executor = getDefaultLocalExecutor();
-    }
-  }
-
-  const ensureProjectSetup = runtimeContext.ensureProjectSetup || function() { return { roles: { planner: 'web1', coder: 'web2', reviewer: 'web1' } }; };
-  const readProjectState = runtimeContext.readProjectState || function() { return {}; };
-  const writeProjectState = runtimeContext.writeProjectState || function() {};
-  const validatePlanOutputFn = runtimeContext.validatePlanOutput || validatePlanOutput;
   const tabActiveModel = runtimeContext.tabActiveModel || {};
-  const pluginRoot = runtimeContext.pluginRoot || path.resolve(__dirname, '..');
-  const sleepFn = runtimeContext.sleepFn || (function(ms) { return new Promise(function(r) { setTimeout(r, ms); }); });
+  const pluginRoot = runtimeContext.pluginRoot || path.resolve(__dirname, '..', '..');
+  const sleepFn = runtimeContext.sleepFn || function(ms) { return new Promise(function(r) { setTimeout(r, ms); }); };
   const spawnSyncFn = runtimeContext.spawnSync || spawnSync;
+  const validatePlanOutputFn = runtimeContext.validatePlanOutput || validatePlanOutput;
+  const buildSearchAiCleanPromptFn = runtimeContext.buildSearchAiCleanPrompt || buildSearchAiCleanPrompt;
 
-  function getActiveJob(cleanRoot) {
-    const norm = path.resolve(cleanRoot);
-    return activeCycleJobs[norm] || null;
+  const ensureProjectSetup = runtimeContext.ensureProjectSetup || function(root) {
+    const cleanRoot = path.resolve(root);
+    const exchangeDir = path.join(cleanRoot, '.antigravity', 'bridge', 'exchange');
+    if (!fs.existsSync(exchangeDir)) fs.mkdirSync(exchangeDir, { recursive: true });
+    return {
+      projectRoot: cleanRoot,
+      roles: { planner: 'gemini1', coder: 'gemini2', reviewer: 'off' }
+    };
+  };
+
+  const readProjectState = runtimeContext.readProjectState || function(root) {
+    const disk = readDiskStateSafely(root);
+    if (disk.corrupted) return { __corrupted: true, phase: 'CORRUPTED' };
+    return disk.state || { phase: 'IDLE', retryCount: 0, lastStatus: 'READY' };
+  };
+
+  const writeProjectState = runtimeContext.writeProjectState || function(root, patch) {
+    const resolvedRoot = path.resolve(root);
+    const bridgeDir = path.join(resolvedRoot, '.antigravity', 'bridge');
+    const statePath = path.join(bridgeDir, 'state.json');
+    const disk = readDiskStateSafely(resolvedRoot);
+    const base = (!disk.corrupted && disk.state) ? disk.state : {};
+    const merged = Object.assign({}, base, patch || {}, { updatedAt: new Date().toISOString() });
+    writeFileAtomic(statePath, JSON.stringify(merged, null, 2));
+    return merged;
+  };
+
+  const executor = {
+    applyBatch: function(args) {
+      const fn = runtimeContext.applyBatch || (runtimeContext.localExecutor && runtimeContext.localExecutor.applyBatch) || applyBatch;
+      return fn(args);
+    },
+    runBatchQuickChecks: function(args) {
+      const fn = runtimeContext.runBatchQuickChecks || (runtimeContext.localExecutor && runtimeContext.localExecutor.runBatchQuickChecks) || runBatchQuickChecks;
+      return fn(args);
+    },
+    runFinalBuildAndTests: async function(projectRoot, timeoutMs) {
+      const fn = runtimeContext.runFinalBuildAndTests || (runtimeContext.localExecutor && runtimeContext.localExecutor.runFinalBuildAndTests) || runFinalBuildAndTests;
+      return await fn(projectRoot, timeoutMs);
+    },
+    persistCheckpointReceiptOnce: function(cp, r, pf, cr, id) {
+      const fn = runtimeContext.persistCheckpointReceiptOnce || (runtimeContext.localExecutor && runtimeContext.localExecutor.persistCheckpointReceiptOnce) || function(a, b, c, d, e) {
+        return getDefaultLocalExecutor().persistCheckpointReceiptOnce(a, b, c, d, e);
+      };
+      return fn(cp, r, pf, cr, id);
+    },
+    migrateLegacyCheckpointReceipts: function(cp, cr, id) {
+      const fn = runtimeContext.migrateLegacyCheckpointReceipts || (runtimeContext.localExecutor && runtimeContext.localExecutor.migrateLegacyCheckpointReceipts) || function(a, b, c) {
+        return getDefaultLocalExecutor().migrateLegacyCheckpointReceipts(a, b, c);
+      };
+      return fn(cp, cr, id);
+    }
+  };
+
+  const dispatchChunkedEngineTurn = async function(engine, root, prompt, attachment, opts) {
+    const fn = runtimeContext.dispatchChunkedEngineTurn;
+    if (typeof fn !== 'function') {
+      throw new Error('DISPATCH_TURN_NOT_CONFIGURED');
+    }
+    return await fn(engine, root, prompt, attachment, opts);
+  };
+
+  function isCycleActive(projectRoot) {
+    const key = path.resolve(projectRoot);
+    return Boolean(activeCycleJobs[key] && activeCycleJobs[key].running);
   }
 
-  function isCycleActive(cleanRoot) {
-    const norm = path.resolve(cleanRoot);
-    return Boolean(activeCycleJobs[norm] && activeCycleJobs[norm].running);
-  }
-
-  function cancelCycle(cleanRoot) {
-    const norm = path.resolve(cleanRoot);
-    const job = activeCycleJobs[norm];
-    if (job && job.running) {
-      job.running = false;
-      job.phase = 'CANCELLED';
-      job.cancelled = true;
-      job.error = 'CYCLE_CANCELLED';
+  function cancelCycle(projectRoot) {
+    const key = path.resolve(projectRoot);
+    if (activeCycleJobs[key]) {
+      activeCycleJobs[key].cancelled = true;
+      activeCycleJobs[key].running = false;
+      activeCycleJobs[key].phase = 'CANCELLED';
       return true;
     }
     return false;
   }
 
+  function getActiveJob(projectRoot) {
+    return activeCycleJobs[path.resolve(projectRoot)] || null;
+  }
+
   async function waitJobSlice(cleanRoot, maxSliceMs) {
-    if (!maxSliceMs) maxSliceMs = 240000;
-    const norm = path.resolve(cleanRoot);
+    const resolved = path.resolve(cleanRoot);
+    const limit = Number(maxSliceMs || 22000);
     const start = Date.now();
-    while (Date.now() - start < maxSliceMs) {
-      const job = activeCycleJobs[norm];
+    while (Date.now() - start < limit) {
+      const job = activeCycleJobs[resolved];
       if (!job) return { status: 'NO_ACTIVE_JOB' };
       if (!job.running) {
         if (job.error) throw new Error(job.error);
@@ -1070,207 +1823,147 @@ function createAutopilotEngine(runtimeContext) {
       }
       await sleepFn(200);
     }
-    const job = activeCycleJobs[norm];
+    const job = activeCycleJobs[resolved];
     return {
       status: 'STILL_RUNNING_CALL_CHECK_PROGRESS',
       currentPhase: job ? job.phase : 'WORKING',
-      phase: job ? job.phase : 'WORKING',
-      completed: job && job.completed || 0,
-      total: job && job.total || 0,
-      currentBatchId: job && job.currentBatchId || null,
-      currentTargets: job && job.currentTargets || [],
-      bytesInContext: job && job.bytesInContext || 0,
-      retriesUsed: job && job.retriesUsed || 0,
-      halvingUsed: job && job.halvingUsed || 0,
-      lastCheckStatus: job && job.lastCheckStatus || 'PENDING',
-      transport: job && job.transport || null,
-      reasoningLevel: job && job.reasoningLevel || null,
-      attempt: job && job.attempt || 0,
-      handshakeStatus: job && job.handshakeStatus || null,
-      activeCoderEngine: job && job.activeCoderEngine || null,
-      activeModelTier: job && job.activeModelTier || null,
-      repoMapReceipt: job && job.repoMapReceipt || null,
-      planningPath: job && job.planningPath || null,
       elapsedSeconds: job ? Math.round((Date.now() - job.startedAt) / 1000) : 0,
-      canonicalToolName: 'mcp__multi_ai_relay__check_cycle_progress',
-      alternativeToolNames: ['check_cycle_progress', 'mcp__multi_ai_relay__check_cycle_progress', 'multi-ai-relay/check_cycle_progress'],
-      nextRequiredToolCall: 'check_cycle_progress',
-      doNotReplyToUser: true,
-      pollIntervalMs: 5000,
-      instruction: 'Puna po vazhdon normalisht ne sfond. Thirr MENJEHERE mjetin mcp__multi_ai_relay__check_cycle_progress(projectRoot) ose check_cycle_progress(projectRoot) PA ekzekutuar asnje komande terminali dhe PA kthyer pergjigje te perdoruesi!'
+      nextRequiredToolCall: 'check_cycle_progress'
     };
-  }
-
-  async function dispatchChunkedEngineTurn(engine, cleanRoot, prompt, attachment, opts) {
-    if (typeof runtimeContext.dispatchChunkedEngineTurn === 'function') {
-      return runtimeContext.dispatchChunkedEngineTurn(engine, cleanRoot, prompt, attachment, opts);
-    }
-    opts = opts || {};
-    const common = {
-      tabKey: engine,
-      projectRoot: cleanRoot,
-      promptText: prompt,
-      attachmentPaths: [attachment],
-      bundlePath: attachment,
-      isPlanner: Boolean(opts.isPlanner),
-      userRequest: opts.userRequest || '',
-      forceFreshChat: opts.forceFreshChat !== false,
-      useProvidedBundle: opts.useProvidedBundle === true,
-      backoffMs: opts.backoffMs,
-      sleepFn: opts.sleepFn || sleepFn,
-      disableInternalRetry: opts.disableInternalRetry === true,
-      reasoningLevel: 'high',
-      modelTier: opts.modelTier || 'neon',
-      hardCapMs: opts.hardCapMs
-    };
-    if (typeof runtimeContext.dispatchToWebTab === 'function') {
-      return engine.startsWith('google_search_')
-        ? runtimeContext.dispatchToGoogleSearchAiTab(common)
-        : runtimeContext.dispatchToWebTab(common);
-    }
-    throw new Error('NO_DISPATCHER_CONFIGURED_FOR_ENGINE: ' + engine);
   }
 
   async function dispatchPlannerWithFailover(state, routing, cleanRoot, prompt, attachment, opts) {
     opts = opts || {};
+    if (typeof runtimeContext.dispatchPlannerWithFailover === 'function' && !opts._internalPlannerDispatch) {
+      return await runtimeContext.dispatchPlannerWithFailover(state, routing, cleanRoot, prompt, attachment, Object.assign({}, opts, { _internalPlannerDispatch: true }));
+    }
     state.failedEngines = state.failedEngines || new Set();
-    state.engineFailoverCount = 0;
-    state.totalEngineFailoverCount = state.totalEngineFailoverCount || 0;
-    state.activeGeminiModelTier = 'neon';
-    const batchLocalFailedEngines = new Set();
-    let engine = state.activePlannerEngine || routing.roles.planner;
-    while (true) {
+    let engine = state.activePlannerEngine || (routing && routing.roles && routing.roles.planner) || 'gemini1';
+    let attempts = 0;
+
+    while (attempts < 4) {
+      attempts++;
       try {
-        const result = await dispatchChunkedEngineTurn(engine, cleanRoot, prompt, attachment, Object.assign({}, opts, {
-          modelTier: engine.startsWith('gemini') ? state.activeGeminiModelTier : 'neon',
-          disableInternalRetry: engine.startsWith('gemini') ? true : Boolean(opts.disableInternalRetry)
-        }));
-        state.activePlannerEngine = engine;
-        return result;
+        return await dispatchChunkedEngineTurn(engine, cleanRoot, prompt, attachment, Object.assign({
+          isPlanner: true,
+          forceFreshChat: true,
+          reasoningLevel: 'high',
+          modelTier: state.activeGeminiModelTier || 'neon'
+        }, opts));
       } catch (err) {
-        const code = String(err && err.message || err);
-        if (!isEngineFailoverEligible(code) || state.engineFailoverCount >= 3) throw err;
-        batchLocalFailedEngines.add(engine);
-        const next = getFailoverEngines(engine, batchLocalFailedEngines, runtimeContext)[0];
+        const msg = String((err && err.message) || err);
+        if (!isEngineFailoverEligible(msg)) throw err;
+        state.failedEngines.add(engine);
+        const next = getFailoverEngines(engine, state.failedEngines, runtimeContext)[0];
         if (!next) throw err;
-        state.engineFailoverCount++;
-        state.totalEngineFailoverCount++;
-        engine = next;
+        state.engineFailoverCount = (state.engineFailoverCount || 0) + 1;
         state.activePlannerEngine = next;
+        engine = next;
       }
     }
+    throw new Error('PLANNER_FAILOVER_EXHAUSTED');
   }
 
   async function executeCodingLeaf(batch, state, routing, job, opts) {
     opts = opts || {};
-    batch.targets = batch.targets.map(normalizeBatchTarget);
-    state.routing = routing;
-    const coderEngine = opts.coderEngine || state.activeCoderEngine || routing.roles.coder;
-    state.activeCoderEngine = coderEngine;
-    job.activeCoderEngine = coderEngine;
-    state.activeGeminiModelTier = 'neon';
-    const modelTier = opts.modelTier || state.activeGeminiModelTier;
-    job.activeModelTier = modelTier;
-
-    const context = buildMinimalBatchContext(batch, state, CHUNK_ENGINE_LIMITS);
+    const engine = opts.coderEngine || state.activeCoderEngine || (routing && routing.roles && routing.roles.coder) || 'gemini2';
+    const context = buildBatchContext(batch, state, CHUNK_ENGINE_LIMITS);
     const transport = selectCodingTransport(context, CHUNK_ENGINE_LIMITS);
     const exchangeDir = path.join(state.scan.projectRoot, '.antigravity', 'bridge', 'exchange');
-    const codePath = path.join(exchangeDir, 'code.md');
-    const checkpointIdentity = computeCheckpointIdentity(state.scan.projectRoot, state.planSlice);
-    const contextPath = path.join(exchangeDir, 'b_' + batch.batchId.replace(/^BATCH-?/i, '').replace(/^INTEGRATION-REPAIR-?/i, 'r').replace(/[^A-Za-z0-9]/g, '').slice(0, 6) + '.txt');
-    const rulesPath = path.join(pluginRoot, 'rules', 'coder_rules.md');
-    const rules = fs.existsSync(rulesPath) ? fs.readFileSync(rulesPath, 'utf8') : '';
-    const instruction = rules + NL + NL + 'Implemento VETEM target-et (' + batch.targets.join(', ') + ').' + NL + NL +
-      'OUTPUT CONTRACT:' + NL +
-      '- For existing or new files: Return EITHER complete file in ### FILE: path code fence OR valid Git unified diff patch (diff --git a/... b/...).' + NL +
-      '- For new files: Return ### FILE: path followed by complete file code in code fence.' + NL +
-      '- Target 200-500 lines of diff (up to 800 lines max).' + NL +
-      '- Touch ONLY ALLOWED_FILES and SYMBOL_SCOPE. No prose.';
+    if (!fs.existsSync(exchangeDir)) fs.mkdirSync(exchangeDir, { recursive: true });
 
-    job.currentBatchId = batch.batchId;
-    job.currentTargets = batch.targets;
-    job.bytesInContext = context.bytes;
-    job.transport = transport.transport;
-    job.reasoningLevel = opts.reasoningLevel || 'high';
-    job.attempt = (opts.recoveryAttempt || 0) + 1;
-    job.handshakeStatus = transport.twoStepIngest ? 'PENDING' : 'NOT_REQUIRED';
+    const expectedTargets = batch.targets.map(normalizeCheckpointTarget);
+    const coderRulesPath = path.join(pluginRoot, 'rules', 'coder_rules.md');
+    const coderRules = fs.existsSync(coderRulesPath) ? fs.readFileSync(coderRulesPath, 'utf8') : '';
 
-    const dispatch = function(prompt, attachment, forceFreshChat) {
-      return dispatchAdmittedBatch(batch, function() {
-        return dispatchChunkedEngineTurn(coderEngine, state.scan.projectRoot, prompt, attachment, {
-        forceFreshChat: forceFreshChat,
-        disableInternalRetry: true,
-        reasoningLevel: 'high',
-        modelTier: modelTier,
-        backoffMs: opts.backoffMs,
-        sleepFn: opts.sleepFn || sleepFn,
-          useProvidedBundle: Boolean(attachment)
-        });
-      });
-    };
-
-    let output;
+    let attachmentPath = null;
+    let prompt = '';
     if (transport.transport === 'INLINE') {
-      job.handshakeStatus = 'NOT_REQUIRED';
-      output = await dispatch(instruction + NL + NL + context.text, null, true);
+      prompt = [coderRules, 'TARGETS: ' + expectedTargets.join(', '), context.text].filter(Boolean).join(NL + NL);
     } else {
-      fs.writeFileSync(contextPath, context.text, 'utf8');
-      if (coderEngine.startsWith('gemini')) {
-        const handshakeFn = runtimeContext.runGeminiAttachmentIngestHandshake || defaultRunGeminiAttachmentIngestHandshake;
-        await handshakeFn({
-          tabKey: coderEngine,
-          projectRoot: state.scan.projectRoot,
-          attachmentPath: contextPath,
-          batchId: batch.batchId,
-          reasoningLevel: 'high',
-          modelTier: modelTier,
-          forceFreshChat: true
-        });
-        job.handshakeStatus = 'VERIFIED';
-        output = await dispatch(instruction, null, false);
-      } else {
-        job.handshakeStatus = 'DIRECT_ATTACHMENT';
-        output = await dispatch(instruction, contextPath, true);
-      }
+      attachmentPath = path.join(exchangeDir, 'batch_' + String(batch.batchId || '1').replace(/[^a-zA-Z0-9_-]/g, '_') + '_ctx.txt');
+      fs.writeFileSync(attachmentPath, context.text, 'utf8');
+      prompt = [coderRules, 'Zbato vetem skedaret e kerkuar nga konteksti i bashkengjitur: ' + expectedTargets.join(', ')].filter(Boolean).join(NL + NL);
     }
 
-    const expected = new Set(batch.targets);
-    const parseExpected = function(text) {
-      const all = parseCodeBlocksFromMarkdown(text, batch.targets).map(function(x) {
-        return Object.assign({}, x, { relPath: normalizeBatchTarget(x.relPath) });
+    job.currentBatchId = batch.batchId;
+    job.currentTargets = expectedTargets.slice();
+    job.bytesInContext = context.bytes;
+
+    if (!transport.inline && engine.startsWith('gemini')) {
+      const handshakeFn = runtimeContext.runGeminiAttachmentIngestHandshake || defaultRunGeminiAttachmentIngestHandshake;
+      const hs = await handshakeFn({
+        tabKey: engine,
+        projectRoot: state.scan.projectRoot,
+        attachmentPath: attachmentPath,
+        batchId: batch.batchId,
+        reasoningLevel: 'high',
+        modelTier: state.activeGeminiModelTier || 'neon',
+        forceFreshChat: true
       });
-      const received = new Set(all.map(function(x) { return x.relPath; }));
-      const missing = batch.targets.filter(function(x) { return !received.has(x); });
-      return {
-        all: all,
-        parsed: missing.length === 0 ? all.filter(function(x) { return expected.has(x.relPath); }) : all,
-        missing: missing,
-        extra: all.map(function(x) { return x.relPath; }).filter(function(x) { return !expected.has(x); })
-      };
-    };
+      job.handshakeStatus = (hs && hs.status) || 'VERIFIED';
+    } else {
+      job.handshakeStatus = 'INLINE_SKIPPED';
+    }
 
-    let formatRepairUsed = Boolean(opts.formatRepairUsed);
-    const repairFormat = async function(failure) {
-      if (formatRepairUsed) throw new Error(failure);
-      formatRepairUsed = true;
-      const repairPrompt = 'KORRIGJIM I VETEM FORMATI/SINTAKSE. ' + failure + NL + 'Kthe VETEM target-et e autorizuara: ' + batch.targets.join(', ') + NL + 'Per skedaret e autorizuar kthe EITHER ### FILE: path me code fence te plote OR Git unified diff. Mos jep prose ose skedare ekstra.';
-      return dispatch(repairPrompt, null, false);
-    };
+    let output = await dispatchChunkedEngineTurn(engine, state.scan.projectRoot, prompt, transport.inline ? null : attachmentPath, {
+      forceFreshChat: transport.inline || !engine.startsWith('gemini'),
+      useProvidedBundle: !transport.inline,
+      disableInternalRetry: engine.startsWith('gemini'),
+      reasoningLevel: 'high',
+      modelTier: state.activeGeminiModelTier || 'neon'
+    });
 
-    let hasUnifiedDiff = /^diff --git a\/[^\r\n]+ b\/[^\r\n]+/m.test(output);
-    let parsedResult = parseExpected(output);
-    if (parsedResult.missing.length && !hasUnifiedDiff) {
-      const validParsed = parsedResult.parsed.filter(function(x) { return expected.has(x.relPath) && !parsedResult.missing.includes(x.relPath); });
-      if (validParsed.length > 0) {
-        try {
-          const appliedPartial = executor.applyBatch({ projectRoot: state.scan.projectRoot, batch: { targets: validParsed.map(function(x) { return x.relPath; }) }, parsedFiles: validParsed });
-          const quickPartial = executor.runBatchQuickChecks({ projectRoot: state.scan.projectRoot, writtenFiles: appliedPartial.filesWritten });
-          if (quickPartial.status === 'CHECK_PASSED') {
-            const partialReceipt = { batchId: batch.batchId + '.partial', filesWritten: appliedPartial.filesWritten, fileHashes: Object.fromEntries(appliedPartial.filesWritten.map(function(x) { return [x, crypto.createHash('sha256').update(fs.readFileSync(path.join(state.scan.projectRoot, x))).digest('hex')]; })), quickCheckResult: quickPartial, parsedFiles: validParsed };
-            executor.persistCheckpointReceiptOnce(codePath, partialReceipt, validParsed, state.scan.projectRoot, checkpointIdentity);
-          }
-        } catch (_) {}
+    const extractDiffTargetKeys = function(rawOutput) {
+      const keys = new Set();
+      const diffRe = /^diff --git a\/([^\r\n]+) b\/([^\r\n]+)$/gm;
+      let m;
+      while ((m = diffRe.exec(String(rawOutput || ''))) !== null) {
+        const oldKey = normalizeTargetKey(m[1], state.scan.projectRoot);
+        const newKey = normalizeTargetKey(m[2], state.scan.projectRoot);
+        if (oldKey && oldKey === newKey) keys.add(newKey);
       }
+      return keys;
+    };
+
+    const parseExpected = function(rawOutput) {
+      const rawParsed = parseCodeBlocksFromMarkdown(String(rawOutput || ''), expectedTargets);
+      const parsed = Array.isArray(rawParsed)
+        ? rawParsed
+        : (rawParsed && Array.isArray(rawParsed.files) ? rawParsed.files : []);
+      const foundKeys = new Set(parsed.map(function(p) { return normalizeTargetKey(p.relPath || p.path || p.file, state.scan.projectRoot); }).filter(Boolean));
+      const diffKeys = extractDiffTargetKeys(rawOutput);
+      for (const dk of diffKeys) foundKeys.add(dk);
+      const expectedKeyMap = new Map(expectedTargets.map(function(t) { return [normalizeTargetKey(t, state.scan.projectRoot), t]; }));
+      const missing = [];
+      for (const [k, orig] of expectedKeyMap.entries()) {
+        if (!foundKeys.has(k)) missing.push(orig);
+      }
+      const extra = [];
+      for (const k of foundKeys) {
+        if (!expectedKeyMap.has(k)) extra.push(k);
+      }
+      return { parsed: parsed, missing: missing, extra: extra };
+    };
+
+    const repairFormat = async function(detail) {
+      job.retriesUsed = (job.retriesUsed || 0) + 1;
+      const corrPrompt = [
+        'KORRIGJIM FORMATI I DETYRUESHEM: ' + detail,
+        'Kthe kodin 100% te plote me etiketen ### FILE: rruga/skedari.ext per keto objektiva: ' + expectedTargets.join(', ')
+      ].join(NL);
+      return await dispatchChunkedEngineTurn(engine, state.scan.projectRoot, corrPrompt, null, {
+        forceFreshChat: false,
+        useProvidedBundle: false,
+        disableInternalRetry: engine.startsWith('gemini'),
+        reasoningLevel: 'high',
+        modelTier: state.activeGeminiModelTier || 'neon'
+      });
+    };
+
+    let parsedResult = parseExpected(output);
+
+    if (parsedResult.missing.length) {
       const detail = 'BATCH_OUTPUT_INCOMPLETE: missing=[' + parsedResult.missing.join(',') + '] extra=[' + parsedResult.extra.join(',') + ']';
       state.lastErrorReceipt = detail;
       output = await repairFormat(detail);
@@ -1301,7 +1994,6 @@ function createAutopilotEngine(runtimeContext) {
       output = await repairFormat(detail);
       parsedResult = parseExpected(output);
       if (parsedResult.missing.length) throw new Error('BATCH_OUTPUT_INCOMPLETE: missing=[' + parsedResult.missing.join(',') + '] extra=[' + parsedResult.extra.join(',') + ']');
-      hasUnifiedDiff = /^diff --git a\/[^\r\n]+ b\/[^\r\n]+/m.test(output);
       applied = executor.applyBatch({ projectRoot: state.scan.projectRoot, batch: batch, parsedFiles: parsedResult.parsed, batchOutput: output });
       quick = executor.runBatchQuickChecks({ projectRoot: state.scan.projectRoot, writtenFiles: applied.filesWritten });
       if (quick.status !== 'CHECK_PASSED') {
@@ -1313,7 +2005,10 @@ function createAutopilotEngine(runtimeContext) {
     return {
       batchId: batch.batchId,
       filesWritten: applied.filesWritten,
-      fileHashes: Object.fromEntries(applied.filesWritten.map(function(x) { return [x, crypto.createHash('sha256').update(fs.readFileSync(path.join(state.scan.projectRoot, x))).digest('hex')]; })),
+      fileHashes: Object.fromEntries(applied.filesWritten.map(function(x) {
+        const abs = path.join(state.scan.projectRoot, x);
+        return [x, fs.existsSync(abs) ? crypto.createHash('sha256').update(fs.readFileSync(abs)).digest('hex') : ''];
+      })),
       quickCheckResult: quick,
       parsedFiles: parsedResult.parsed,
       contextBytes: context.bytes,
@@ -1332,9 +2027,19 @@ function createAutopilotEngine(runtimeContext) {
     const failoverScope = opts.failoverScope || { localFailoverCount: 0, batchLocalFailedEngines: new Set() };
     opts.failoverScope = failoverScope;
     const codePath = path.join(state.scan.projectRoot, '.antigravity', 'bridge', 'exchange', 'code.md');
-    const auditIndex = parseCheckpointAudit(fs.existsSync(codePath) ? fs.readFileSync(codePath, 'utf8') : '');
-    const checkpointIdentity = computeCheckpointIdentity(state.scan.projectRoot, state.planSlice);
+    const existingCodeMd = fs.existsSync(codePath) ? fs.readFileSync(codePath, 'utf8') : '';
+    const auditIndex = parseCheckpointAudit(existingCodeMd);
+    const baseCheckpointIdentity = computeCheckpointIdentity(state.scan.projectRoot, state.planSlice);
+    const checkpointIdentity = state.planFingerprint
+      ? Object.assign({}, baseCheckpointIdentity, { planFingerprint: String(state.planFingerprint).trim().toLowerCase() })
+      : baseCheckpointIdentity;
+
+    const checkpointPlanFpValid = !state.planFingerprint || (
+      extractCheckpointPlanFingerprint(existingCodeMd, batch.targets, opts.batchIndex, state.scan.projectRoot) === String(state.planFingerprint).toLowerCase()
+    );
+
     const unresolvedTargets = batch.targets.map(normalizeCheckpointTarget).filter(function(target) {
+      if (!checkpointPlanFpValid) return true;
       return !isTargetVerifiedForCheckpoint(auditIndex, target, state.scan.projectRoot, checkpointIdentity);
     });
 
@@ -1358,7 +2063,11 @@ function createAutopilotEngine(runtimeContext) {
     } catch (err) {
       const freshAuditText = fs.existsSync(codePath) ? fs.readFileSync(codePath, 'utf8') : '';
       const freshAuditIndex = parseCheckpointAudit(freshAuditText);
+      const freshFpValid = !state.planFingerprint || (
+        extractCheckpointPlanFingerprint(freshAuditText, activeBatch.targets, opts.batchIndex, state.scan.projectRoot) === String(state.planFingerprint).toLowerCase()
+      );
       const unresolvedTargetsAfterCatch = activeBatch.targets.filter(function(target) {
+        if (!freshFpValid) return true;
         return !isTargetVerifiedForCheckpoint(freshAuditIndex, target, state.scan.projectRoot, checkpointIdentity);
       });
       if (!unresolvedTargetsAfterCatch.length) {
@@ -1396,11 +2105,12 @@ function createAutopilotEngine(runtimeContext) {
       state.totalEngineFailoverCount++;
       state.activeCoderEngine = nextEngine;
       job.activeCoderEngine = nextEngine;
-      return executeBatchWithRecovery(batchToHalve, state, routing, job, { coderEngine: nextEngine, recoveryAttempt: 0, reasoningLevel: 'high', backoffMs: opts.backoffMs, sleepFn: opts.sleepFn || sleepFn, failoverScope: failoverScope, halvingLevel: level, batchCosts: opts.batchCosts });
+      return executeBatchWithRecovery(batchToHalve, state, routing, job, { coderEngine: nextEngine, recoveryAttempt: 0, reasoningLevel: 'high', backoffMs: opts.backoffMs, sleepFn: opts.sleepFn || sleepFn, failoverScope: failoverScope, halvingLevel: level, batchCosts: opts.batchCosts, batchIndex: opts.batchIndex });
     }
   }
 
   async function runAutonomousPipeline(cleanRoot, userRequest, opts) {
+    opts = opts || {};
     cleanRoot = path.resolve(cleanRoot);
     if (activeCycleJobs[cleanRoot] && activeCycleJobs[cleanRoot].running) {
       throw new Error('ACTION_REJECTED_CYCLE_IN_PROGRESS: Cikli autopilot eshte aktiv per [' + cleanRoot + '] ne fazen [' + activeCycleJobs[cleanRoot].phase + ']. Ndalohet kategorikisht thirrja e mjeteve anesore! Thirr vetem check_cycle_progress(projectRoot).');
@@ -1423,6 +2133,7 @@ function createAutopilotEngine(runtimeContext) {
     };
 
     try {
+      notifyWhatsApp('[HERMES /run-cycle] Nisja: Fillon cikli për ' + path.basename(cleanRoot));
       const routing = ensureProjectSetup(cleanRoot);
       if (!routing.roles) {
         routing.roles = {
@@ -1437,14 +2148,17 @@ function createAutopilotEngine(runtimeContext) {
       const codePath = path.join(exchangeDir, 'code.md');
       const reviewPath = path.join(exchangeDir, 'review.md');
       const logPath = path.join(exchangeDir, 'build_test.log');
+      const errorPath = path.join(exchangeDir, 'last_error.txt');
 
       const scan = scanRepositoryUniversal(cleanRoot);
       const graph = buildDependencyGraph(scan);
       const repoMap = buildCompactRepoMap(scan, CHUNK_ENGINE_LIMITS);
       const embeddedSpecs = resolveAndEmbedExternalFiles(userRequest);
+      const currentRequestFingerprint = computeRequestFingerprint(userRequest, embeddedSpecs);
       const totalRelevantSourceBytes = scan.files.filter(function(f) { return f.generatedScore === 0; }).reduce(function(n, f) { return n + f.bytes; }, 0) + Buffer.byteLength(embeddedSpecs);
 
       job.repoMapReceipt = { bytes: repoMap.bytes, sha256: repoMap.sha256, repoFingerprint: scan.repoFingerprint };
+      job.requestFingerprint = currentRequestFingerprint;
 
       const planningState = {
         activePlannerEngine: routing.roles.planner,
@@ -1453,27 +2167,45 @@ function createAutopilotEngine(runtimeContext) {
         activeGeminiModelTier: 'neon'
       };
 
-      let planText = '';
-      if (fs.existsSync(planPath) && fs.statSync(planPath).size > 200) {
-        planText = fs.readFileSync(planPath, 'utf8');
-      } else if (totalRelevantSourceBytes <= CHUNK_ENGINE_LIMITS.planningSafe) {
-        job.phase = 'PLANNING_SINGLE_PASS';
-        const relevant = [];
-        for (const f of scan.files.filter(function(x) { return x.generatedScore === 0; })) {
-          const inspected = inspectTextBuffer(fs.readFileSync(path.join(cleanRoot, f.path)));
-          if (inspected.isText) relevant.push('### FILE: ' + f.path + NL + inspected.text);
+      const persistedState = readProjectState(cleanRoot);
+      const cacheCheck = evaluatePlanCache(cleanRoot, currentRequestFingerprint, persistedState, {
+        forceReplan: opts.forceReplan === true
+      });
+
+      const generatePlanFromPlanner = async function(extraCorrectionDirective) {
+        const promptBase = buildSearchAiCleanPromptFn('plan');
+        const effectivePrompt = extraCorrectionDirective
+          ? (promptBase + NL + NL + extraCorrectionDirective)
+          : promptBase;
+
+        if (totalRelevantSourceBytes <= CHUNK_ENGINE_LIMITS.planningSafe) {
+          notifyWhatsApp('[HERMES /run-cycle] Faza PLANNER: Filloi (Single-pass)');
+          job.phase = 'PLANNING_SINGLE_PASS';
+          const relevant = [];
+          for (const f of scan.files.filter(function(x) { return x.generatedScore === 0; })) {
+            const absPath = path.join(cleanRoot, f.path);
+            if (!fs.existsSync(absPath)) continue;
+            const inspected = inspectTextBuffer(fs.readFileSync(absPath));
+            if (inspected.isText) relevant.push('### FILE: ' + f.path + NL + inspected.text);
+          }
+          const planning = buildFinalPlanningContext({
+            userRequest: userRequest,
+            repoMap: repoMap,
+            summaries: [],
+            criticalWindows: relevant.join(NL + NL) + NL + embeddedSpecs,
+            totalRelevantBytes: totalRelevantSourceBytes
+          });
+          const physical = path.join(exchangeDir, 'planning_context.txt');
+          writeFileAtomic(physical, planning.text);
+          return await dispatchPlannerWithFailover(planningState, routing, cleanRoot, effectivePrompt, physical, {
+            isPlanner: true,
+            useProvidedBundle: true,
+            userRequest: userRequest,
+            forceFreshChat: true,
+            requestFingerprint: currentRequestFingerprint
+          });
         }
-        const planning = buildFinalPlanningContext({
-          userRequest: userRequest,
-          repoMap: repoMap,
-          summaries: [],
-          criticalWindows: relevant.join(NL + NL) + NL + embeddedSpecs,
-          totalRelevantBytes: totalRelevantSourceBytes
-        });
-        const physical = path.join(exchangeDir, 'planning_context.txt');
-        fs.writeFileSync(physical, planning.text, 'utf8');
-        planText = await dispatchPlannerWithFailover(planningState, routing, cleanRoot, buildSearchAiCleanPrompt('plan'), physical, { isPlanner: true, useProvidedBundle: true, userRequest: userRequest, forceFreshChat: true });
-      } else {
+
         const chunks = partitionAnalysisChunks(scan, graph, CHUNK_ENGINE_LIMITS);
         const ranked = chunks.map(function(chunk, index) {
           return { chunk: chunk, index: index, score: scoreAnalysisChunkRelevance(chunk, scan, graph, userRequest) };
@@ -1512,30 +2244,146 @@ function createAutopilotEngine(runtimeContext) {
           totalRelevantBytes: totalRelevantSourceBytes
         });
         const planningPath = path.join(exchangeDir, 'planning_context.txt');
-        fs.writeFileSync(planningPath, finalContext.text, 'utf8');
-        planText = await dispatchPlannerWithFailover(planningState, routing, cleanRoot, buildSearchAiCleanPrompt('plan'), planningPath, { isPlanner: true, useProvidedBundle: true, userRequest: userRequest, forceFreshChat: true });
+        writeFileAtomic(planningPath, finalContext.text);
+        return await dispatchPlannerWithFailover(planningState, routing, cleanRoot, effectivePrompt, planningPath, {
+          isPlanner: true,
+          useProvidedBundle: true,
+          userRequest: userRequest,
+          forceFreshChat: true,
+          requestFingerprint: currentRequestFingerprint
+        });
+      };
+
+      let planText = '';
+      let currentPlanFingerprint = '';
+      let reusedCachedPlan = false;
+
+      if (cacheCheck.reusable) {
+        planText = cacheCheck.planText;
+        currentPlanFingerprint = cacheCheck.planFingerprint;
+        reusedCachedPlan = true;
+        notifyWhatsApp('[HERMES /run-cycle] Faza PLANNER: E KALUAR (Plan ekzistues i verifikuar me fingerprint)');
+      } else {
+        if (cacheCheck.reason !== 'PLAN_MISSING') {
+          invalidateStaleCycleArtifacts(cleanRoot, cacheCheck.reason, currentRequestFingerprint, writeProjectState);
+        } else {
+          for (const downstream of ['review.md', 'build_test.log', 'last_error.txt', 'rev_ctx.txt', 'planning_context.txt']) {
+            try { fs.unlinkSync(path.join(exchangeDir, downstream)); } catch (_) {}
+          }
+        }
+        planText = await generatePlanFromPlanner('');
       }
 
-      const validated = validatePlanOutputFn(planText, { requiresFiles: false });
-      if (!validated || !validated.ok) throw new Error('PLANNING_FINAL_INVALID');
-      fs.writeFileSync(planPath, planText, 'utf8');
+      const persistFreshPlan = function(rawPlanText) {
+        const planFp = computePlanFingerprint(rawPlanText);
+        const wrapped = embedPlanMetadataHeader(rawPlanText, {
+          requestFingerprint: currentRequestFingerprint,
+          planFingerprint: planFp,
+          generatedAt: new Date().toISOString()
+        });
+        writeFileAtomic(planPath, wrapped);
+        for (const staleDownstream of [reviewPath, logPath, errorPath]) {
+          try { fs.unlinkSync(staleDownstream); } catch (e) { if (e && e.code !== 'ENOENT') throw e; }
+        }
+        writeProjectState(cleanRoot, {
+          phase: 'PLANNED',
+          retryCount: 0,
+          lastStatus: 'PLAN_READY',
+          requestFingerprint: currentRequestFingerprint,
+          planFingerprint: planFp,
+          verifiedBatches: {},
+          checkpoints: {}
+        });
+        return { wrapped: wrapped, planFingerprint: planFp };
+      };
 
-      let batches;
-      try {
-        batches = parseAndValidatePlanBatches(planText, graph, scan);
-      } catch (_) {
-        const fallback = scan.files.filter(function(f) { return f.sourceScore > 0 && f.generatedScore === 0; }).slice(0, 1).map(function(f) { return f.path; });
-        if (!fallback.length) throw new Error('PLANNING_FINAL_INVALID');
-        batches = partitionCodingBatches(fallback, graph, {});
+      // Defekti II: Fail-closed target parsing with zero scan.files fallback and max 1 bounded planner regeneration
+      const maxPlanRegenAttempts = opts.allowPlanRegeneration === false
+        ? 0
+        : (Number.isInteger(opts.maxPlanRegenAttempts) ? opts.maxPlanRegenAttempts : 1);
+
+      let batches = null;
+      let planRegenAttempt = 0;
+
+      while (true) {
+        const validated = validatePlanOutputFn(planText, { requiresFiles: false, projectRoot: cleanRoot });
+        if (validated && !validated.ok && validated.reason && validated.reason !== 'NO_TARGETS' && validated.reason !== 'TOO_SHORT') {
+          writeProjectState(cleanRoot, {
+            phase: 'PLAN_FAILED',
+            lastStatus: 'PLANNING_FINAL_INVALID',
+            lastError: 'PLANNING_FINAL_INVALID: ' + validated.reason,
+            requestFingerprint: currentRequestFingerprint,
+            planFingerprint: null
+          });
+          throw new Error('PLANNING_FINAL_INVALID: ' + validated.reason);
+        }
+
+        try {
+          batches = parseAndValidatePlanBatches(planText, graph, scan, cleanRoot);
+          break;
+        } catch (parseErr) {
+          if (parseErr && parseErr.code === 'PLAN_NO_VALID_TARGETS' && planRegenAttempt < maxPlanRegenAttempts) {
+            planRegenAttempt++;
+            try { fs.unlinkSync(planPath); } catch (_) {}
+            reusedCachedPlan = false;
+            planText = await generatePlanFromPlanner(
+              'KORRIGJIM FORMATI I DETYRUESHEM: Plani i meparshem u refuzua me PLAN_NO_VALID_TARGETS. Shto te pakten nje rresht FILE_TARGET: <rruga/relative/e/skedarit> ose listen ### ALLOWED_FILES me rruge te vlefshme relative.'
+            );
+            continue;
+          }
+          if (parseErr && parseErr.code === 'PLAN_NO_VALID_TARGETS') {
+            try { fs.unlinkSync(planPath); } catch (_) {}
+            writeProjectState(cleanRoot, {
+              phase: 'PLAN_FAILED',
+              lastStatus: 'PLAN_NO_VALID_TARGETS',
+              lastError: parseErr.message,
+              requestFingerprint: currentRequestFingerprint,
+              planFingerprint: null
+            });
+          }
+          throw parseErr;
+        }
       }
 
+      if (!reusedCachedPlan) {
+        const saved = persistFreshPlan(planText);
+        planText = saved.wrapped;
+        currentPlanFingerprint = saved.planFingerprint;
+        if (job.phase.startsWith('PLANNING')) {
+          notifyWhatsApp('[HERMES /run-cycle] Faza PLANNER: SUKSES (Plan i vlefshëm)');
+        }
+      }
+
+      job.planFingerprint = currentPlanFingerprint;
       job.total = batches.length;
       job.completed = 0;
-      if (!fs.existsSync(codePath)) {
-        fs.writeFileSync(codePath, '# CHUNKED ENGINE BATCH AUDIT' + NL, 'utf8');
+
+      // Defekti III: Bind code.md checkpoints strictly to currentPlanFingerprint
+      const codeHeaderLine = buildCodePlanMetaHeader(currentPlanFingerprint);
+      let existingCodeContent = fs.existsSync(codePath) ? fs.readFileSync(codePath, 'utf8') : '';
+      const existingCodePlanFp = extractCheckpointPlanFingerprint(existingCodeContent, [], null, cleanRoot);
+
+      if (!existingCodeContent || existingCodePlanFp !== currentPlanFingerprint) {
+        if (existingCodeContent) {
+          console.error(
+            '[CHECKPOINT_STALE] batch=ALL expectedPlanFp=' + currentPlanFingerprint +
+            ' foundPlanFp=' + String(existingCodePlanFp || 'NONE')
+          );
+        }
+        writeFileAtomic(codePath, codeHeaderLine + NL + '# CHUNKED ENGINE BATCH AUDIT' + NL);
+        writeProjectState(cleanRoot, {
+          phase: 'PLANNED',
+          requestFingerprint: currentRequestFingerprint,
+          planFingerprint: currentPlanFingerprint,
+          verifiedBatches: {},
+          checkpoints: {}
+        });
       }
 
-      const checkpointIdentity = computeCheckpointIdentity(cleanRoot, planText);
+      const baseCheckpointIdentity = computeCheckpointIdentity(cleanRoot, planText);
+      const checkpointIdentity = Object.assign({}, baseCheckpointIdentity, {
+        planFingerprint: currentPlanFingerprint
+      });
       executor.migrateLegacyCheckpointReceipts(codePath, cleanRoot, checkpointIdentity);
 
       const state = {
@@ -1543,6 +2391,8 @@ function createAutopilotEngine(runtimeContext) {
         graph: graph,
         repoMap: repoMap,
         planSlice: planText,
+        planFingerprint: currentPlanFingerprint,
+        requestFingerprint: currentRequestFingerprint,
         contractMemory: '',
         changedFiles: [],
         activeCoderEngine: routing.roles.coder,
@@ -1558,36 +2408,99 @@ function createAutopilotEngine(runtimeContext) {
       for (let i = 0; i < batches.length; i++) {
         if (job.cancelled) throw new Error('CYCLE_CANCELLED');
         const existingAudit = fs.existsSync(codePath) ? fs.readFileSync(codePath, 'utf8') : '';
-        const auditIndex = parseCheckpointAudit(existingAudit);
+        const latestDiskState = readProjectState(cleanRoot);
         const normalizedTargets = batches[i].targets.map(normalizeCheckpointTarget);
+
+        const cpCheck = verifyBatchCheckpoint({
+          codeMarkdown: existingAudit,
+          state: latestDiskState,
+          currentPlanFingerprint: currentPlanFingerprint,
+          batchIndex: i,
+          batchTargets: normalizedTargets,
+          projectRoot: cleanRoot
+        });
+
+        const auditIndex = parseCheckpointAudit(existingAudit);
         const verifiedTargets = normalizedTargets.filter(function(t) {
           return isTargetVerifiedForCheckpoint(auditIndex, t, cleanRoot, checkpointIdentity);
         });
 
-        if (normalizedTargets.length > 0 && verifiedTargets.length === normalizedTargets.length) {
+        if (cpCheck.verified && normalizedTargets.length > 0 && verifiedTargets.length === normalizedTargets.length) {
           verifiedTargets.forEach(function(t) { allWrittenFilesSet.add(t); });
           job.completed = i + 1;
+          notifyWhatsApp('[HERMES /run-cycle] Faza CODER: Batch ' + (i + 1) + '/' + batches.length + ' I KALUAR (I verifikuar)');
           continue;
         }
 
+        if (!cpCheck.verified && existingAudit && cpCheck.foundPlanFingerprint && cpCheck.foundPlanFingerprint !== currentPlanFingerprint) {
+          console.error(
+            '[CHECKPOINT_STALE] batch=' + (i + 1) +
+            ' expectedPlanFp=' + currentPlanFingerprint +
+            ' foundPlanFp=' + String(cpCheck.foundPlanFingerprint || 'NONE') +
+            ' detail=' + String(cpCheck.detail || '')
+          );
+          writeFileAtomic(codePath, codeHeaderLine + NL + '# CHUNKED ENGINE BATCH AUDIT' + NL);
+        }
+
         job.phase = 'CODING_BATCH ' + (i + 1) + '/' + batches.length;
-        const receipts = await executeBatchWithRecovery(batches[i], state, routing, job, {});
+        notifyWhatsApp('[HERMES /run-cycle] Faza CODER: Filloi (Batch ' + (i + 1) + '/' + batches.length + ')');
+        const receipts = await executeBatchWithRecovery(batches[i], state, routing, job, { batchIndex: i });
         for (const receipt of receipts) {
           batchReceipts.push(receipt);
-          (receipt.filesWritten || []).map(normalizeCheckpointTarget).forEach(function(t) { allWrittenFilesSet.add(t); });
+          const writtenNorm = (receipt.filesWritten || []).map(normalizeCheckpointTarget);
+          writtenNorm.forEach(function(t) { allWrittenFilesSet.add(t); });
           if (!receipt.checkpointPersisted && receipt.parsedFiles && receipt.parsedFiles.length && !receipt.skippedFromCheckpoint) {
             executor.persistCheckpointReceiptOnce(codePath, receipt, receipt.parsedFiles, cleanRoot, checkpointIdentity);
           }
+          const cpHeader = buildBatchCheckpointHeader({
+            planFingerprint: currentPlanFingerprint,
+            batchIndex: i,
+            targetKeys: writtenNorm.map(function(t) { return normalizeTargetKey(t, cleanRoot); })
+          });
+          const curCode = fs.existsSync(codePath) ? fs.readFileSync(codePath, 'utf8') : (codeHeaderLine + NL);
+          const nextCode = (curCode.includes('CODE_PLAN_META') ? curCode : (codeHeaderLine + NL + curCode)) + NL + cpHeader + NL;
+          writeFileAtomic(codePath, nextCode);
+
+          const curState = readProjectState(cleanRoot);
+          const verifiedBatches = Object.assign({}, (curState && curState.verifiedBatches) || {});
+          const checkpoints = Object.assign({}, (curState && curState.checkpoints) || {});
+          const batchKey = batches[i].batchId || ('BATCH_' + (i + 1));
+          const prevRec = verifiedBatches[batchKey];
+          const prevTargets = (prevRec && String(prevRec.planFingerprint || '').toLowerCase() === currentPlanFingerprint && Array.isArray(prevRec.targets))
+            ? prevRec.targets
+            : [];
+          const mergedTargets = Array.from(new Set(prevTargets.concat(writtenNorm)));
+          const cpRecord = {
+            batchId: batchKey,
+            batchIndex: i,
+            planFingerprint: currentPlanFingerprint,
+            targets: mergedTargets,
+            verifiedAt: new Date().toISOString()
+          };
+          verifiedBatches[batchKey] = cpRecord;
+          checkpoints[batchKey] = cpRecord;
+          writeProjectState(cleanRoot, {
+            phase: 'CODED',
+            lastStatus: 'BATCH_VERIFIED',
+            requestFingerprint: currentRequestFingerprint,
+            planFingerprint: currentPlanFingerprint,
+            verifiedBatches: verifiedBatches,
+            checkpoints: checkpoints
+          });
+
           state.contractMemory = buildCrossBatchContractSummary(receipt, state.contractMemory).text;
           state.changedFiles.push(...(receipt.filesWritten || []));
         }
         job.completed = i + 1;
+        notifyWhatsApp('[HERMES /run-cycle] Faza CODER: Batch ' + (i + 1) + '/' + batches.length + ' SUKSES');
       }
+      notifyWhatsApp('[HERMES /run-cycle] Faza CODER: SUKSES (Të gjitha batch-et)');
 
       let allWrittenFiles = Array.from(allWrittenFilesSet).sort();
       job.phase = 'FINAL_APPLY_AND_TEST';
-      let finalChecks = executor.runFinalBuildAndTests(cleanRoot, 180000);
-      fs.writeFileSync(logPath, JSON.stringify(finalChecks, null, 2), 'utf8');
+      notifyWhatsApp('[HERMES /run-cycle] Faza APPLY: Filloi (Build dhe Quick Checks)');
+      let finalChecks = await executor.runFinalBuildAndTests(cleanRoot);
+      writeFileAtomic(logPath, JSON.stringify(finalChecks, null, 2));
 
       for (let repairRound = 1; repairRound <= 2 && finalChecks.status !== 'CHECK_PASSED'; repairRound++) {
         const errorText = JSON.stringify(finalChecks);
@@ -1595,6 +2508,7 @@ function createAutopilotEngine(runtimeContext) {
         const mentioned = extractTargetsFromError(errorText, knownTargets);
         if (!mentioned.length) break;
         job.phase = 'INTEGRATION_REPAIR';
+        notifyWhatsApp('[HERMES /run-cycle] Faza APPLY: Riparim integrimi (Raundi ' + repairRound + ')');
         state.lastErrorReceipt = 'FINAL_APPLY_AND_TEST_FAILED (round ' + repairRound + '):' + NL + truncateUtf8(errorText, 12000);
         const repairBatch = { batchId: 'INTEGRATION-REPAIR-' + repairRound, targets: mentioned.slice(0, 2), halvingLevel: 1 };
         const receipts = await executeBatchWithRecovery(repairBatch, state, routing, job, { compact: true, singleRetry: true });
@@ -1606,15 +2520,26 @@ function createAutopilotEngine(runtimeContext) {
           }
         }
         allWrittenFiles = Array.from(allWrittenFilesSet).sort();
-        finalChecks = executor.runFinalBuildAndTests(cleanRoot, 180000);
-        fs.writeFileSync(logPath, JSON.stringify(finalChecks, null, 2), 'utf8');
+        finalChecks = await executor.runFinalBuildAndTests(cleanRoot);
+        writeFileAtomic(logPath, JSON.stringify(finalChecks, null, 2));
         if (finalChecks.status === 'CHECK_PASSED') state.lastErrorReceipt = '';
       }
 
-      if (finalChecks.status !== 'CHECK_PASSED') throw new Error('FINAL_APPLY_AND_TEST_FAILED');
+      if (finalChecks.status !== 'CHECK_PASSED') {
+        notifyWhatsApp('[HERMES /run-cycle] Faza APPLY: DËSHTIM');
+        writeProjectState(cleanRoot, {
+          phase: 'BUILD_FAILED',
+          lastStatus: 'FINAL_APPLY_AND_TEST_FAILED',
+          requestFingerprint: currentRequestFingerprint,
+          planFingerprint: currentPlanFingerprint
+        });
+        throw new Error('FINAL_APPLY_AND_TEST_FAILED');
+      }
+      notifyWhatsApp('[HERMES /run-cycle] Faza APPLY: SUKSES');
 
       allWrittenFiles = Array.from(allWrittenFilesSet).sort();
       job.phase = 'REVIEWING';
+      notifyWhatsApp('[HERMES /run-cycle] Faza REVIEWER: Filloi');
       let diffStdout = '';
       try {
         const diffResult = spawnSyncFn('git', ['diff', '--', ...allWrittenFiles], { cwd: cleanRoot, encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
@@ -1643,7 +2568,7 @@ function createAutopilotEngine(runtimeContext) {
       });
 
       const reviewPathContext = path.join(exchangeDir, 'rev_ctx.txt');
-      fs.writeFileSync(reviewPathContext, review.chunks.join(NL + NL + '--- REVIEW CHUNK ---' + NL + NL), 'utf8');
+      writeFileAtomic(reviewPathContext, review.chunks.join(NL + NL + '--- REVIEW CHUNK ---' + NL + NL));
 
       let reviewText = 'STATUS: PASSED\nSKIPPED: reviewer off';
       let reviewerEngine = routing.roles.reviewer || 'off';
@@ -1706,7 +2631,7 @@ function createAutopilotEngine(runtimeContext) {
         }
       }
 
-      fs.writeFileSync(reviewPath, reviewText, 'utf8');
+      writeFileAtomic(reviewPath, reviewText);
       const reviewVerdicts = String(reviewText || '').split(/\r?\n/).map(function(line) {
         return line.replace(/[*#]/g, '').trim();
       }).map(function(line) {
@@ -1716,8 +2641,17 @@ function createAutopilotEngine(runtimeContext) {
       const approved = reviewVerdicts.some(function(verdict) { return verdict === 'APPROVED' || verdict === 'PASSED'; }) &&
                        !reviewVerdicts.some(function(verdict) { return verdict === 'CHANGES_REQUIRED' || verdict === 'FAILED' || verdict === 'REJECTED'; });
 
+      writeProjectState(cleanRoot, {
+        phase: approved ? 'COMPLETED' : 'REVIEW_FAILED',
+        lastStatus: approved ? 'CYCLE_COMPLETED' : 'REVIEW_FAILED',
+        requestFingerprint: currentRequestFingerprint,
+        planFingerprint: currentPlanFingerprint
+      });
+
       job.running = false;
       job.phase = approved ? 'COMPLETED' : 'FAILED_REVIEW';
+      notifyWhatsApp('[HERMES /run-cycle] Faza REVIEWER: ' + (approved ? 'SUKSES (PASSED)' : 'DËSHTIM (CHANGES_REQUIRED)'));
+      notifyWhatsApp('[HERMES /run-cycle] PËRFUNDOI: STATUS ' + (approved ? 'PASSED' : 'FAILED'));
       job.result = {
         status: approved ? 'CYCLE_COMPLETED' : 'REVIEW_FAILED',
         verdict: approved ? 'APPROVED' : 'CHANGES_REQUIRED',
@@ -1733,9 +2667,10 @@ function createAutopilotEngine(runtimeContext) {
       return job.result;
     } catch (err) {
       job.running = false;
-      job.phase = job.cancelled ? 'CANCELLED' : 'FAILED';
+      job.phase = job.cancelled ? 'CANCELLED' : (err && err.code === 'PLAN_NO_VALID_TARGETS' ? 'PLAN_FAILED' : 'FAILED');
       job.error = err.message || String(err);
       job.result = null;
+      notifyWhatsApp('[HERMES /run-cycle] DËSHTIM në fazën [' + job.phase + ']: ' + (err.message || String(err)));
       throw err;
     }
   }
@@ -1748,11 +2683,9 @@ function createAutopilotEngine(runtimeContext) {
       job = activeCycleJobs[cleanRoot];
       if (job) job.promise = p;
     }
-    // Only if client explicitly requested non-blocking legacy slice (e.g. web dashboard)
     if (opts && opts.blocking === false) {
       return await waitJobSlice(cleanRoot, opts.maxSliceMs || 22000);
     }
-    // Arkitekture e vertete Reaktive: Event-driven Promise await pa asnje kufi mekanik kohor!
     if (job && job.promise) {
       try {
         return await job.promise;
@@ -1832,8 +2765,17 @@ function createAutopilotEngine(runtimeContext) {
     isEngineFailoverEligible,
     parseCodeBlocksFromMarkdown,
     persistCheckpointReceiptOnce,
+    migrateLegacyCheckpointReceipts,
+    appendBatchAudit,
     classifyAttachmentHandshakeStrict,
-    dispatchAdmittedBatch
+    dispatchAdmittedBatch,
+    isResumablePlannedPhase,
+    evaluatePlanCache,
+    invalidateStaleCycleArtifacts,
+    buildBatchCheckpointHeader,
+    extractCheckpointPlanFingerprint,
+    verifyBatchCheckpoint,
+    writeFileAtomic
   };
 }
 
@@ -1868,6 +2810,7 @@ module.exports = {
   normalizeFailureCode,
   isAdaptiveHalvingFailure,
   getFailoverEngines,
+  isEngineFailoverEligible,
   analyzeRepositoryChunks,
   buildFinalPlanningContext,
   parseAndValidatePlanBatches,
@@ -1885,9 +2828,24 @@ module.exports = {
   classifyAttachmentHandshakeStrict,
   parseCodeBlocksFromMarkdown,
   persistCheckpointReceiptOnce,
+  migrateLegacyCheckpointReceipts,
+  appendBatchAudit,
   dispatchAdmittedBatch,
   packWorkspace,
   getBundleAttachmentAndNote,
   resolveAndEmbedExternalFiles,
-  buildBudgetedWorkspaceBundle
+  buildBudgetedWorkspaceBundle,
+  inferRepositoryLanguage,
+  extractRepositorySignals,
+  resolveDependencyPath,
+  ADAPTIVE_HALVING_CODES,
+  RESUMABLE_PLANNED_PHASES,
+  isResumablePlannedPhase,
+  evaluatePlanCache,
+  invalidateStaleCycleArtifacts,
+  buildCodePlanMetaHeader,
+  buildBatchCheckpointHeader,
+  extractCheckpointPlanFingerprint,
+  verifyBatchCheckpoint,
+  writeFileAtomic
 };
