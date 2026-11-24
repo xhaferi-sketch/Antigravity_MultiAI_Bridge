@@ -79,6 +79,8 @@ const {
 const COPILOT_REQUIRED_MODEL = copilotEngineModule.COPILOT_REQUIRED_MODEL;
 const COPILOT_OUTPUT_CONTRACT = copilotEngineModule.COPILOT_OUTPUT_CONTRACT;
 const M365_CHAT_URL = copilotEngineModule.M365_CHAT_URL;
+const ensureCopilotTemporaryChat = copilotEngineModule.ensureCopilotTemporaryChat;
+const inspectCopilotTemporaryChatDom = copilotEngineModule.inspectCopilotTemporaryChatDom;
 
 let copilotEngine = null;
 function getCopilotEngine() {
@@ -97,6 +99,7 @@ const createGeminiEngine = geminiEngineModule.createGeminiEngine;
 const GEMINI_APP_URL = geminiEngineModule.GEMINI_APP_URL;
 const GEMINI_REQUIRED_MODEL = geminiEngineModule.GEMINI_REQUIRED_MODEL;
 const geminiModelReceipts = geminiEngineModule.geminiModelReceipts;
+const ensureGeminiTemporaryChat = geminiEngineModule.ensureGeminiTemporaryChat;
 
 let geminiEngine = null;
 function getGeminiEngine() {
@@ -143,8 +146,8 @@ function getAutopilotEngine() {
       // NDALOHET KATEGORIKISHT gemini3 DHE NDALOHET COPILOT (web1, web2).
       // ============================================================================
       isEngineAvailable: function(engine) {
-        if (engine === 'web1' || engine === 'web2') return false;
-        if (engine === 'gemini1' || engine === 'gemini2') return true;
+        if (engine === 'web1' || engine === 'web2') return true;
+        if (engine === 'gemini1' || engine === 'gemini2' || engine === 'gemini3') return true;
         return false;
       }
     });
@@ -191,14 +194,65 @@ const tabDiscoveredModels = {
   google_search_3: '4 Hydrogen · Everyday help, 4 Carbon · Most complex work'
 };
 const activeProjectPerTab = {};
+const TAB_CONFIG_PATH = path.join(__dirname, '..', '.antigravity', 'bridge', 'tab_config.json');
+const tabTemporaryChatConfig = {
+  gemini1: false,
+  gemini2: false,
+  gemini3: false,
+  web1: false,
+  web2: false
+};
+const geminiTemporaryChatStatus = {
+  gemini1: null,
+  gemini2: null,
+  gemini3: null
+};
+const copilotTemporaryChatStatus = {
+  web1: null,
+  web2: null
+};
+
+function loadTabConfig() {
+  try {
+    if (fs.existsSync(TAB_CONFIG_PATH)) {
+      const parsed = JSON.parse(fs.readFileSync(TAB_CONFIG_PATH, 'utf8'));
+      if (parsed && typeof parsed.temporaryChat === 'object') {
+        for (const k of ['gemini1', 'gemini2', 'gemini3', 'web1', 'web2']) {
+          if (typeof parsed.temporaryChat[k] === 'boolean') {
+            tabTemporaryChatConfig[k] = parsed.temporaryChat[k];
+          }
+        }
+      }
+    }
+  } catch (_) {}
+}
+loadTabConfig();
+
+function persistTabConfig() {
+  try {
+    const dir = path.dirname(TAB_CONFIG_PATH);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const tmpPath = TAB_CONFIG_PATH + '.' + Date.now() + '.tmp';
+    fs.writeFileSync(tmpPath, JSON.stringify({ temporaryChat: tabTemporaryChatConfig }, null, 2), 'utf8');
+    fs.renameSync(tmpPath, TAB_CONFIG_PATH);
+  } catch (_) {}
+}
+
 function buildDashboardState(projects) {
   const tabStates = {};
   for (const k of Object.keys(tabs)) {
-    tabStates[k] = {
-      open: Boolean(tabs[k] && !tabs[k].isClosed()),
+    const isGemini = k.startsWith('gemini');
+    const isCopilot = k.startsWith('web');
+    const isOpen = Boolean(tabs[k] && !tabs[k].isClosed());
+    const isVerified = isGemini && Boolean(geminiModelReceipts[k] && geminiModelReceipts[k].verified === true);
+    const entry = {
+      open: isOpen,
       auth: tabAuthStatus[k],
-      model: tabActiveModel[k],
-      connectionLabel: (
+      model: isGemini ? (
+        process.env.ANTIGRAVITY_TEST_EXPORT === '1' ? tabActiveModel[k] :
+        (isVerified ? tabActiveModel[k] : (isOpen ? 'Duke u verifikuar...' : '-'))
+      ) : tabActiveModel[k],
+      connectionLabel: isGemini ? (isVerified ? 'E Lidhur (Neon)' : (isOpen ? 'Duke u lidhur...' : 'E Shkëputur')) : (
         geminiModelReceipts[k] &&
         geminiModelReceipts[k].verified === true &&
         geminiModelReceipts[k].family === 'neon'
@@ -207,6 +261,24 @@ function buildDashboardState(projects) {
       discoveredModels: tabDiscoveredModels[k] || '-',
       activeProject: activeProjectPerTab[k] ? path.basename(activeProjectPerTab[k]) : 'Asnje'
     };
+    if (isGemini) {
+      const tcRes = geminiTemporaryChatStatus[k] || {};
+      entry.temporaryChatRequested = Boolean(tabTemporaryChatConfig[k]);
+      entry.temporaryChatActive = Boolean(tcRes.active);
+      entry.temporaryChatVerified = Boolean(tcRes.verified);
+      entry.temporaryChatStatus = tcRes.status || (tabTemporaryChatConfig[k] ? 'REQUESTED_PENDING' : 'DISABLED');
+      entry.temporaryChatReason = tcRes.reason || null;
+      entry.temporaryChatCheckedAt = tcRes.checkedAt || null;
+    } else if (isCopilot) {
+      const tcRes = copilotTemporaryChatStatus[k] || {};
+      entry.temporaryChatRequested = Boolean(tabTemporaryChatConfig[k]);
+      entry.temporaryChatActive = Boolean(tcRes.active);
+      entry.temporaryChatVerified = Boolean(tcRes.verified);
+      entry.temporaryChatStatus = tcRes.status || (tabTemporaryChatConfig[k] ? 'REQUESTED_PENDING' : 'DISABLED');
+      entry.temporaryChatReason = tcRes.reason || null;
+      entry.temporaryChatCheckedAt = tcRes.checkedAt || null;
+    }
+    tabStates[k] = entry;
   }
   return { projects: projects || [], tabs: tabStates };
 }
@@ -1147,7 +1219,7 @@ async function probeWebChatState(targetFrame,isGemini,sendMeta){
     const visible=function(el){if(!el||!el.isConnected)return false;const st=getComputedStyle(el),r=el.getBoundingClientRect();return st.display!=='none'&&st.visibility!=='hidden'&&parseFloat(st.opacity||'1')>.05&&r.width>4&&r.height>4;},norm=function(v){return String(v||'').replace(/\s+/g,' ').trim();};
     const chatRoot=document.querySelector('main')||document.body,editor=document.querySelector('[data-antigravity-composer-token="'+(arg.meta.composerToken||'')+'"]')||Array.from(document.querySelectorAll('rich-textarea div.ql-editor[contenteditable="true"],div.ql-editor[contenteditable="true"],#m365-chat-editor-target-element,[contenteditable="true"][role="combobox"],[role="textbox"][contenteditable="true"],textarea')).find(visible)||null,composerRoot=editor?(editor.closest('form,input-area-v2,fieldset.input-area-fieldset,[class*="composer" i],.fai-BebopLiteChatInput')||chatRoot):chatRoot;
     const uniqueTurnNodes=function(selector){const nodes=Array.from(chatRoot.querySelectorAll(selector));return nodes.filter(function(node){return !nodes.some(function(other){return other!==node&&other.contains(node);});});};const users=arg.gem?Array.from(chatRoot.querySelectorAll('user-query,[data-message-author-role="user"]')):uniqueTurnNodes('[data-testid="chat-turn-user"],[data-message-author-role="user"],[data-content="user-message"],.user-message,[data-testid="chatQuestion"],.fai-UserMessage,[data-testid="m365-chat-llm-web-ui-chat-message"]');
-    let assistants=arg.gem?Array.from(chatRoot.querySelectorAll('response-container')):uniqueTurnNodes('[data-testid="chat-turn-assistant"],[data-testid="ai-message"],[data-message-author-role="assistant"],[data-content="ai-message"],.assistant-message,[data-testid="chatOutput"],[data-testid="copilot-message-div"],.fai-CopilotMessage,[data-testid="chat-response-message"]');if(arg.gem&&assistants.length===0)assistants=Array.from(chatRoot.querySelectorAll('model-response,[data-message-author-role="model"]'));
+    let assistants=arg.gem?Array.from(chatRoot.querySelectorAll('response-container')):uniqueTurnNodes('[data-testid="chat-turn-assistant"],[data-testid="ai-message"],[data-message-author-role="assistant"],[data-content="ai-message"],.assistant-message,[data-testid="chatOutput"],[data-testid="copilot-message-div"],.fai-CopilotMessage,[data-testid="chat-response-message"],[data-testid*="response" i],[class*="copilot-message" i],[class*="assistant-message" i],[class*="chat-turn" i],.fui-ChatMessage,[data-content="ai-message"]');if(arg.gem&&assistants.length===0)assistants=Array.from(chatRoot.querySelectorAll('model-response,[data-message-author-role="model"]'));if(!arg.gem&&assistants.length===0)assistants=uniqueTurnNodes('main div[role="region"], [data-testid*="turn" i], .fui-ChatMessageContent, [class*="response-message" i], [class*="agent-response" i]').filter(function(el){return (el.textContent||'').trim().length>10;});
     const latestAssistant=assistants[assistants.length-1]||null;if(latestAssistant&&!latestAssistant.dataset.antigravityTurnId)latestAssistant.dataset.antigravityTurnId='ag-turn-'+Array.from(chatRoot.querySelectorAll('*')).indexOf(latestAssistant);
     const latestAssistantText=latestAssistant?norm(latestAssistant.textContent||''):'',latestAssistantFingerprint=latestAssistantText.slice(0,160)+'|'+latestAssistantText.length,latestAssistantNodeSignature=latestAssistant?(latestAssistant.tagName.toLowerCase()+'|'+latestAssistant.dataset.antigravityTurnId):'';
     const latestTurnRoot=latestAssistant||chatRoot,thoughtNodes=Array.from(latestTurnRoot.querySelectorAll('model-thoughts,.thoughts-container,.thought-container,[data-test-id*="thought" i],[data-testid*="thought" i],ms-thought-chunk')),thoughtText=thoughtNodes.map(function(el){return norm(el.textContent||'');}).join('|'),thoughtLen=thoughtText.length,thoughtFingerprint=thoughtText.slice(0,160)+'|'+thoughtLen;
@@ -1287,8 +1359,13 @@ async function extractWebAssistantContent(targetFrame,isGemini){
         });
       });
     }
-    let containers=arg.gem?Array.from(document.querySelectorAll('response-container')):Array.from(document.querySelectorAll('[data-testid="copilot-message-div"],[data-message-author-role="assistant"],[data-testid="chat-turn-assistant"],[data-testid="ai-message"],[data-content="ai-message"],.assistant-message,.fai-CopilotMessage'));if(arg.gem&&containers.length===0)containers=Array.from(document.querySelectorAll('model-response,message-content,[data-message-author-role="model"]'));const liveNode=containers[containers.length-1];if(!liveNode)return {text:'',metadata:{liveNodeTag:'',contentNodeTag:'',contentCharsBeforeClean:0,thoughtNodesRemoved:0,contentCharsAfterClean:0,codeBlockCount:0,hasMessageContent:false}};
-    const nested=arg.gem?liveNode.querySelector('message-content,.markdown-main-panel,.md-content'):(Array.from(liveNode.querySelectorAll('[data-testid="markdown-reply"]')).find(function(el){return (el.textContent||'').trim().length>0;})||null),contentNode=nested||liveNode,hasMessageContent=Boolean(nested),before=(contentNode.textContent||'').length,clone=contentNode.cloneNode(true),codeExtractionReceipts=[],virtualizedErrors=[],thoughtNodes=Array.from(clone.querySelectorAll('model-thoughts,.thoughts-container,.thought-container,[data-test-id*="thought" i],[data-testid*="thought" i],ms-thought-chunk'));thoughtNodes.forEach(function(el){el.remove();});let codeBlockCount=0,virtualizedEditorsFound=0,virtualizedBlocksExtracted=0;
+    let containers=arg.gem?Array.from(document.querySelectorAll('response-container')):Array.from(document.querySelectorAll('[data-testid="chat-turn-assistant"],[data-testid="ai-message"],[data-message-author-role="assistant"],[data-content="ai-message"],.assistant-message,[data-testid="chatOutput"],[data-testid="copilot-message-div"],.fai-CopilotMessage,[data-testid="chat-response-message"],[data-testid*="response" i],[class*="copilot-message" i],[class*="assistant-message" i],[class*="chat-turn" i],.fui-ChatMessage'));
+    if(arg.gem&&containers.length===0)containers=Array.from(document.querySelectorAll('model-response,message-content,[data-message-author-role="model"]'));
+    if(!arg.gem&&containers.length===0)containers=Array.from(document.querySelectorAll('main div[role="region"], [data-testid*="turn" i], .fui-ChatMessageContent, [class*="response-message" i], [class*="agent-response" i]')).filter(function(el){return (el.textContent||'').trim().length>10;});
+    const substantiveContainers = containers.filter(function(el) { return (el.textContent || '').trim().length > 10; });
+    const liveNode = substantiveContainers.length > 0 ? substantiveContainers[substantiveContainers.length - 1] : (containers[containers.length - 1] || null);
+    if(!liveNode)return {text:'',metadata:{liveNodeTag:'',contentNodeTag:'',contentCharsBeforeClean:0,thoughtNodesRemoved:0,contentCharsAfterClean:0,codeBlockCount:0,hasMessageContent:false}};
+    const nested=arg.gem?liveNode.querySelector('message-content,.markdown-main-panel,.md-content'):(Array.from(liveNode.querySelectorAll('[data-testid="markdown-reply"],.fui-ChatMessageContent,[data-content="ai-message"],[class*="content" i],[class*="markdown" i]')).find(function(el){return (el.textContent||'').trim().length>10;})||null),contentNode=nested||liveNode,hasMessageContent=Boolean(nested),before=(contentNode.textContent||'').length,clone=contentNode.cloneNode(true),codeExtractionReceipts=[],virtualizedErrors=[],thoughtNodes=Array.from(clone.querySelectorAll('model-thoughts,.thoughts-container,.thought-container,[data-test-id*="thought" i],[data-testid*="thought" i],ms-thought-chunk'));thoughtNodes.forEach(function(el){el.remove();});let codeBlockCount=0,virtualizedEditorsFound=0,virtualizedBlocksExtracted=0;
     clone.querySelectorAll('pre').forEach(function(pre){codeBlockCount++;const code=pre.querySelector('code'),cls=((code&&code.className)||'')+' '+(pre.className||''),m=cls.match(/language-([a-zA-Z0-9_+-]+)/);let lang=(m&&m[1])?m[1]:'';if(!lang){const w=pre.closest('code-block,.code-block,.code-container'),h=w&&w.querySelector('.code-header span,.code-block-decoration span,.code-block-internal-header span'),c=h&&h.textContent?h.textContent.trim().toLowerCase():'';if(/^[a-z0-9_+-]{1,20}$/.test(c))lang=c;}const raw=(code?code.textContent:pre.textContent)||'';const fence=selectSafeMarkdownFence(raw,3);pre.replaceWith(document.createTextNode('\n\n'+fence+lang+'\n'+raw.replace(/\n+$/,'')+'\n'+fence+'\n\n'));codeExtractionReceipts.push({sourceKind:'PRE_CODE',language:lang,lineCount:raw.split('\n').length,completenessVerified:true});});
     const liveEditorRoots=collectCanonicalEditorRoots(contentNode);
     const editorRoots=collectCanonicalEditorRoots(clone);
@@ -1429,6 +1506,17 @@ async function runWebDispatchWithRetryPolicy(opts){const dispatchId=opts.dispatc
       else if(routing.autoNewChatOnProjectSwitch){await resetChatIfNeeded(page,tabKey,projectRoot,false);}
       const verifiedModel = await ensureMaxReasoningMode(targetFrame,tabKey,{reasoningLevel:'high',modelTier:opts.modelTier||'neon'});
       tabActiveModel[tabKey]=verifiedModel;appendDispatchDiag(projectRoot,diagId,'MODEL_VERIFIED',{model:verifiedModel});
+      if (tabKey.startsWith('gemini') && tabTemporaryChatConfig[tabKey] && typeof ensureGeminiTemporaryChat === 'function') {
+        try {
+          const tempRes = await ensureGeminiTemporaryChat(targetFrame, tabKey, true);
+          geminiTemporaryChatStatus[tabKey] = tempRes || { active: Boolean(tempRes && tempRes.active) };
+        } catch (_) {}
+      } else if (tabKey.startsWith('web') && tabTemporaryChatConfig[tabKey] && typeof ensureCopilotTemporaryChat === 'function') {
+        try {
+          const tempRes = await ensureCopilotTemporaryChat(targetFrame, tabKey, true);
+          copilotTemporaryChatStatus[tabKey] = tempRes || { active: Boolean(tempRes && tempRes.active) };
+        } catch (_) {}
+      }
       await page.keyboard.press('Escape').catch(function() {});
       await targetFrame.evaluate(function() {
         document.querySelectorAll('.cdk-overlay-backdrop').forEach(function(b) { b.click(); });
@@ -1436,7 +1524,7 @@ async function runWebDispatchWithRetryPolicy(opts){const dispatchId=opts.dispatc
       await page.waitForTimeout(200);
 
       // 1. Numërimi i saktë i përgjigjeve ekzistuese (1:1 me waitAndExtractCleanResponse)
-      const previousAssistant=await targetFrame.evaluate(function(isGem){const root=document.querySelector('main')||document.body,norm=function(v){return String(v||'').replace(/\s+/g,' ').trim();};let c=isGem?Array.from(root.querySelectorAll('response-container')):Array.from(root.querySelectorAll('[data-testid="copilot-message-div"],[data-message-author-role="assistant"],[data-testid="chat-turn-assistant"],[data-testid="ai-message"],[data-content="ai-message"],.assistant-message,.fai-CopilotMessage'));if(isGem&&c.length===0)c=Array.from(root.querySelectorAll('model-response,[data-message-author-role="model"]'));const n=c[c.length-1]||null;if(n&&!n.dataset.antigravityTurnId)n.dataset.antigravityTurnId='ag-turn-'+Array.from(root.querySelectorAll('*')).indexOf(n);const t=n?norm(n.textContent||''):'';return {count:c.length,fingerprint:t.slice(0,160)+'|'+t.length,nodeSignature:n?(n.tagName.toLowerCase()+'|'+n.dataset.antigravityTurnId):''};},isGemini);const previousCount=previousAssistant.count;
+      const previousAssistant=await targetFrame.evaluate(function(isGem){const root=document.querySelector('main')||document.body,norm=function(v){return String(v||'').replace(/\s+/g,' ').trim();};let c=isGem?Array.from(root.querySelectorAll('response-container')):Array.from(root.querySelectorAll('[data-testid="copilot-message-div"],[data-message-author-role="assistant"],[data-testid="chat-turn-assistant"],[data-testid="ai-message"],[data-content="ai-message"],.assistant-message,.fai-CopilotMessage,[data-testid*="response" i],[class*="copilot-message" i],[class*="assistant-message" i],[class*="chat-turn" i],.fui-ChatMessage,[data-content="ai-message"]'));if(isGem&&c.length===0)c=Array.from(root.querySelectorAll('model-response,[data-message-author-role="model"]'));if(!isGem&&c.length===0)c=Array.from(root.querySelectorAll('main div[role="region"], [data-testid*="turn" i], .fui-ChatMessageContent, [class*="response-message" i], [class*="agent-response" i]')).filter(function(el){return (el.textContent||'').trim().length>10;});const n=c[c.length-1]||null;if(n&&!n.dataset.antigravityTurnId)n.dataset.antigravityTurnId='ag-turn-'+Array.from(root.querySelectorAll('*')).indexOf(n);const t=n?norm(n.textContent||''):'';return {count:c.length,fingerprint:t.slice(0,160)+'|'+t.length,nodeSignature:n?(n.tagName.toLowerCase()+'|'+n.dataset.antigravityTurnId):''};},isGemini);const previousCount=previousAssistant.count;
       console.error('[DISPATCH_STEP] tabKey=' + tabKey + ' previousCount=' + previousCount);
 
       let combinedText = promptText;
@@ -1462,7 +1550,7 @@ async function runWebDispatchWithRetryPolicy(opts){const dispatchId=opts.dispatc
 
       for (const fp of attachmentPaths) {
         if (!fp || !fs.existsSync(fp)) continue;
-        if (attempt === 2 && isGemini) continue;
+        if (attempt === 2 && isGemini && !opts.isPlanner) continue;
         filesToUpload.push(fp);
       }
       const maxChars = 29500;
@@ -2245,6 +2333,29 @@ req.on('end', async function() {
 try {
 const data = body ? JSON.parse(body) : {};
 if (req.url === '/api/save-routing') {
+  if (data.action === 'set_temporary_chat') {
+    const tabId = data.tabId || data.tabKey;
+    if (!['gemini1', 'gemini2', 'gemini3', 'web1', 'web2'].includes(tabId)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: false, error: 'INVALID_TAB_ID' }));
+    }
+    const enabled = Boolean(data.enabled !== undefined ? data.enabled : data.temporaryChat);
+    tabTemporaryChatConfig[tabId] = enabled;
+    persistTabConfig();
+    if (tabs[tabId] && !tabs[tabId].isClosed()) {
+      if (tabId.startsWith('gemini') && typeof ensureGeminiTemporaryChat === 'function') {
+        ensureGeminiTemporaryChat(tabs[tabId], tabId, enabled).then(function(res) {
+          if (res) geminiTemporaryChatStatus[tabId] = res;
+        }).catch(function() {});
+      } else if (tabId.startsWith('web') && typeof ensureCopilotTemporaryChat === 'function') {
+        ensureCopilotTemporaryChat(tabs[tabId], tabId, enabled).then(function(res) {
+          if (res) copilotTemporaryChatStatus[tabId] = res;
+        }).catch(function() {});
+      }
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ ok: true, tabId: tabId, enabled: enabled }));
+  }
 ensureProjectSetup(data.projectRoot);
 const rPath = path.join(path.resolve(data.projectRoot), '.antigravity', 'bridge', 'routing.json');
 const current = JSON.parse(fs.readFileSync(rPath, 'utf8'));
@@ -2357,6 +2468,12 @@ if (err.code === 'EADDRINUSE') isPrimaryInstance = false;
 httpServer.listen(PORT, HOST, function() {
 isPrimaryInstance = true;
 console.error('[DASHBOARD READY] http://' + HOST + ':' + PORT);
+});
+process.on('unhandledRejection', function(reason, p) {
+  console.error('[UNHANDLED_REJECTION]', reason && reason.stack || reason);
+});
+process.on('uncaughtException', function(err) {
+  console.error('[UNCAUGHT_EXCEPTION]', err && err.stack || err);
 });
 }
 async function dispatchActionSingleton(action, payload) {

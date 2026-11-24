@@ -105,6 +105,12 @@
       { v: 'antigravity', l: '⚡ Antigravity (Local)' }
     ];
 
+    const GEMINI_TEMP_CHAT_TABS = new Set(['gemini1', 'gemini2', 'gemini3']);
+    const COPILOT_TEMP_CHAT_TABS = new Set(['web1', 'web2']);
+    const SUPPORTED_TEMP_CHAT_TABS = new Set(['gemini1', 'gemini2', 'gemini3', 'web1', 'web2']);
+    const inFlightTempChat = {};
+    const lastConfirmedTempChat = { gemini1: false, gemini2: false, gemini3: false, web1: false, web2: false };
+
     function buildSelect(id, selected, includeOff = false, isPlanner = false, onChangeCall = '') {
       let opts = includeOff ? `<option value="off" ${selected === 'off' ? 'selected' : ''}>🚫 Off (Skip)</option>` : '';
       const list = isPlanner ? PLANNER_ENGINES : ENGINES;
@@ -119,6 +125,13 @@
       return String(str || '').replace(/"/g, '&quot;');
     }
 
+    function formatTempChatBadge(t) {
+      const status = t.temporaryChatStatus || (t.temporaryChatActive ? 'ACTIVE_VERIFIED' : 'SAVED_WAITING_TAB');
+      const cls = status === 'ACTIVE_VERIFIED' ? 'ok' : (status === 'MISMATCH_OR_UNVERIFIED' ? 'err' : 'idle');
+      const checkedAt = t.temporaryChatCheckedAt ? ` (${new Date(t.temporaryChatCheckedAt).toLocaleTimeString()})` : '';
+      return { cls, text: status + checkedAt };
+    }
+
     let lastProjectsJson = '';
 
     async function loadState() {
@@ -128,6 +141,12 @@
       document.getElementById('tabsGrid').innerHTML = Object.entries(data.tabs).map(([k, t]) => {
         const isErr = t.auth === 'AUTH_EXPIRED' || t.auth === 'BROWSER_ERROR';
         const badgeCls = isErr ? 'err' : (t.open ? 'ok' : 'idle');
+        const isTempChatSupported = SUPPORTED_TEMP_CHAT_TABS.has(k);
+        if (isTempChatSupported && !inFlightTempChat[k]) {
+          lastConfirmedTempChat[k] = Boolean(t.temporaryChatRequested);
+        }
+        const tcChecked = isTempChatSupported ? (inFlightTempChat[k] ? Boolean(inFlightTempChat[k].pending) : Boolean(t.temporaryChatRequested)) : false;
+        const tcBadge = isTempChatSupported ? (inFlightTempChat[k] ? { cls: 'idle', text: 'Duke verifikuar DOM...' } : formatTempChatBadge(t)) : null;
         return `
           <div class="card">
             <div class="row">
@@ -141,6 +160,17 @@
               <button style="flex:1; background: #0284c7;" onclick="loginProfile('${k}')">👁️ Hap Dritaren</button>
               <button class="sec" style="flex:1;" onclick="resetTab('${k}')">🧹 Force New Chat</button>
             </div>
+            ${isTempChatSupported ? `
+            <div style="margin-top:10px; padding:6px 10px; background:rgba(255,255,255,0.03); border-radius:6px; border:1px solid rgba(255,255,255,0.08); display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap;">
+              <label style="display:flex; align-items:center; gap:8px; font-size:13px; cursor:pointer; color:#e2e8f0; margin:0;">
+                <input type="checkbox" id="temp-chat-${k}" data-temp-chat-toggle="${k}" onchange="toggleTemporaryChat('${k}', this.checked)" ${tcChecked ? 'checked' : ''} ${inFlightTempChat[k] ? 'disabled' : ''} style="cursor:pointer; width:16px; height:16px; accent-color:#3b82f6;">
+                <span>Aktivizo Temporary Chat</span>
+              </label>
+              <span class="badge ${tcBadge.cls}" data-temp-chat-badge="${k}" title="${escapeAttr(t.temporaryChatReason || '')}">
+                ${tcBadge.text}
+              </span>
+            </div>
+            ` : ''}
           </div>
         `;
       }).join('');
@@ -281,6 +311,54 @@
         body: JSON.stringify({ tabKey })
       });
       loadState();
+    }
+
+    async function toggleTemporaryChat(tabId, enabled) {
+      if (!SUPPORTED_TEMP_CHAT_TABS.has(tabId)) return;
+      const inputEl = document.querySelector(`[data-temp-chat-toggle="${tabId}"]`);
+      const badgeEl = document.querySelector(`[data-temp-chat-badge="${tabId}"]`);
+      const previous = Boolean(lastConfirmedTempChat[tabId]);
+      inFlightTempChat[tabId] = { pending: Boolean(enabled) };
+      if (inputEl) inputEl.disabled = true;
+      if (badgeEl) {
+        badgeEl.className = 'badge idle';
+        badgeEl.textContent = 'Duke verifikuar DOM...';
+      }
+      try {
+        const res = await fetch('/api/save-routing', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'set_temporary_chat', tabId: tabId, enabled: Boolean(enabled) })
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) {
+          throw new Error((data && data.error) || ('HTTP ' + res.status));
+        }
+        const st = data.state || {};
+        lastConfirmedTempChat[tabId] = Boolean(st.requested !== undefined ? st.requested : enabled);
+        if (inputEl) inputEl.checked = lastConfirmedTempChat[tabId];
+        if (badgeEl) {
+          const badge = formatTempChatBadge({
+            temporaryChatStatus: st.status,
+            temporaryChatActive: st.active,
+            temporaryChatCheckedAt: st.checkedAt
+          });
+          badgeEl.className = 'badge ' + badge.cls;
+          badgeEl.textContent = badge.text;
+          badgeEl.title = st.reason || '';
+        }
+      } catch (err) {
+        if (inputEl) inputEl.checked = previous;
+        if (badgeEl) {
+          badgeEl.className = 'badge err';
+          badgeEl.textContent = 'MISMATCH_OR_UNVERIFIED';
+          badgeEl.title = err && err.message ? err.message : 'Gabim rrjeti ose DOM';
+        }
+      } finally {
+        delete inFlightTempChat[tabId];
+        if (inputEl) inputEl.disabled = false;
+        loadState();
+      }
     }
 
     async function killAll() {

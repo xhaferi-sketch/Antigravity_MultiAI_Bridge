@@ -7,6 +7,7 @@ const GEMINI_APP_URL = 'https://' + 'gemini.' + 'google.com' + '/app';
 
 const DEFAULT_STANDARD_HARD_CAP_MS = 65000;
 const HIGH_REASONING_HARD_CAP_MS = 240000;
+const GEMINI_TEMP_CHAT_ALLOWLIST = Object.freeze(['gemini1', 'gemini2', 'gemini3']);
 
 // ============================================================================
 // RREGULL I PANEGOCIUESHËM DHE I KYÇUR (INVIOLABLE LOCK - HIGH PRIORITY)
@@ -84,7 +85,8 @@ function resolveGeminiHardCapMs(args) {
 
 const geminiModelReceipts = {
   gemini1: null,
-  gemini2: null
+  gemini2: null,
+  gemini3: null
 };
 
 function invalidateGeminiReceipt(tabKey) {
@@ -535,6 +537,210 @@ async function recoverGeminiSession(args) {
   }
 }
 
+async function inspectGeminiTemporaryChatDom(page) {
+  if (!page || typeof page.evaluate !== 'function') {
+    return {
+      controlFound: false,
+      active: false,
+      indicatorFound: false,
+      ariaPressed: null,
+      ariaChecked: null,
+      controlLabel: ''
+    };
+  }
+  try {
+    return await page.evaluate(function() {
+      const normalize = function(s) { return String(s || '').toLowerCase().replace(/\s+/g, ' ').trim(); };
+      const actionable = function(el) {
+        if (!el || !el.isConnected) return false;
+        const st = window.getComputedStyle(el);
+        const r = el.getBoundingClientRect();
+        return st.display !== 'none' && st.visibility !== 'hidden' && r.width > 3 && r.height > 3;
+      };
+
+      const toggleControl = Array.from(document.querySelectorAll('button, [role="button"], [role="switch"], a'))
+        .find(function(el) {
+          if (!actionable(el)) return false;
+          const label = normalize((el.getAttribute('aria-label') || '') + ' ' + (el.innerText || el.textContent || ''));
+          return /temporary chat|bisedë e përkohshme/i.test(label);
+        }) || null;
+
+      const ariaPressed = toggleControl ? toggleControl.getAttribute('aria-pressed') : null;
+      const ariaChecked = toggleControl ? toggleControl.getAttribute('aria-checked') : null;
+      const controlLabel = toggleControl
+        ? String(toggleControl.getAttribute('aria-label') || toggleControl.innerText || '').trim().slice(0, 120)
+        : '';
+
+      const controlActive = Boolean(
+        toggleControl && (
+          ariaPressed === 'true' ||
+          ariaChecked === 'true' ||
+          toggleControl.classList.contains('active') ||
+          toggleControl.classList.contains('is-active')
+        )
+      );
+
+      let indicatorFound = false;
+      const promptEl = document.querySelector('rich-textarea div.ql-editor, textarea, [contenteditable="true"]');
+      if (promptEl) {
+        const ph = promptEl.getAttribute('data-placeholder') || promptEl.getAttribute('placeholder') || '';
+        if (/temporary|përkohshme/i.test(ph)) indicatorFound = true;
+      }
+      if (!indicatorFound) {
+        const elements = Array.from(document.querySelectorAll('[role="region"], [role="status"], aside, header, div, span, p, mat-chip, .badge'))
+          .filter(actionable);
+        indicatorFound = elements.some(function(el) {
+          const t = normalize(el.innerText || el.textContent || '');
+          return (t.includes('temporary chat') || t.includes('bisedë e përkohshme')) &&
+            (t.includes("won't appear") || t.includes('won’t appear') || t.includes('nuk do të ruhet') || t.includes('is on') || t.includes('është aktive') || el.classList.contains('active'));
+        });
+      }
+
+      return {
+        controlFound: Boolean(toggleControl),
+        active: Boolean(controlActive || indicatorFound),
+        indicatorFound: Boolean(indicatorFound),
+        ariaPressed: ariaPressed,
+        ariaChecked: ariaChecked,
+        controlLabel: controlLabel
+      };
+    });
+  } catch (err) {
+    return {
+      controlFound: false,
+      active: false,
+      indicatorFound: false,
+      ariaPressed: null,
+      ariaChecked: null,
+      controlLabel: '',
+      error: String(err && err.message || err).slice(0, 160)
+    };
+  }
+}
+
+async function ensureGeminiTemporaryChat(page, tabId, desiredEnabled, opts) {
+  opts = opts || {};
+  const requested = Boolean(desiredEnabled);
+  const timeoutMs = Number.isFinite(opts.timeoutMs) ? Math.max(100, opts.timeoutMs) : 5000;
+  const pollMs = Number.isFinite(opts.pollMs) ? Math.max(20, opts.pollMs) : 150;
+  const nowIso = function() { return new Date().toISOString(); };
+
+  if (!GEMINI_TEMP_CHAT_ALLOWLIST.includes(tabId)) {
+    return {
+      tabId: tabId,
+      requested: requested,
+      active: false,
+      verified: false,
+      status: 'MISMATCH_OR_UNVERIFIED',
+      reason: 'INVALID_GEMINI_TAB_ID',
+      checkedAt: nowIso()
+    };
+  }
+
+  if (!page || typeof page.evaluate !== 'function') {
+    return {
+      tabId: tabId,
+      requested: requested,
+      active: false,
+      verified: false,
+      status: 'SAVED_WAITING_TAB',
+      reason: 'TAB_NOT_ACTIVE',
+      checkedAt: nowIso()
+    };
+  }
+
+  const initial = await inspectGeminiTemporaryChatDom(page);
+  if (initial.active === requested) {
+    return {
+      tabId: tabId,
+      requested: requested,
+      active: initial.active,
+      verified: true,
+      status: initial.active ? 'ACTIVE_VERIFIED' : 'OFF_VERIFIED',
+      reason: 'ALREADY_MATCHED',
+      checkedAt: nowIso()
+    };
+  }
+
+  const clickRes = await page.evaluate(function(arg) {
+    const normalize = function(s) { return String(s || '').toLowerCase().replace(/\s+/g, ' ').trim(); };
+    const actionable = function(el) {
+      if (!el || !el.isConnected) return false;
+      const st = window.getComputedStyle(el);
+      const r = el.getBoundingClientRect();
+      return st.display !== 'none' && st.visibility !== 'hidden' && r.width > 3 && r.height > 3;
+    };
+    const allButtons = Array.from(document.querySelectorAll('button, [role="button"], [role="switch"], a')).filter(actionable);
+    const tempBtn = allButtons.find(function(el) {
+      const label = normalize((el.getAttribute('aria-label') || '') + ' ' + (el.innerText || el.textContent || ''));
+      return /temporary chat|bisedë e përkohshme/i.test(label);
+    }) || null;
+
+    if (arg.requested) {
+      if (!tempBtn) return { clicked: false, reason: 'TEMPORARY_CHAT_CONTROL_NOT_FOUND' };
+      tempBtn.click();
+      return { clicked: true, reason: 'CLICKED_TEMPORARY_CHAT_TOGGLE' };
+    }
+
+    if (tempBtn && (tempBtn.getAttribute('aria-pressed') === 'true' || tempBtn.getAttribute('aria-checked') === 'true' || tempBtn.classList.contains('active'))) {
+      tempBtn.click();
+      return { clicked: true, reason: 'CLICKED_TEMPORARY_CHAT_TOGGLE_OFF' };
+    }
+
+    const newChatBtn = allButtons.find(function(el) {
+      const label = normalize((el.getAttribute('aria-label') || '') + ' ' + (el.innerText || el.textContent || ''));
+      return /new chat|bisedë e re/i.test(label) && !/temporary/i.test(label);
+    }) || null;
+    if (newChatBtn) {
+      newChatBtn.click();
+      return { clicked: true, reason: 'CLICKED_NEW_CHAT_TO_EXIT_TEMPORARY' };
+    }
+    return { clicked: false, reason: 'TEMPORARY_CHAT_CONTROL_NOT_FOUND' };
+  }, { requested: requested }).catch(function(err) {
+    return { clicked: false, reason: String(err && err.message || err).slice(0, 120) };
+  });
+
+  if (!clickRes || !clickRes.clicked) {
+    return {
+      tabId: tabId,
+      requested: requested,
+      active: Boolean(initial.active),
+      verified: false,
+      status: 'MISMATCH_OR_UNVERIFIED',
+      reason: (clickRes && clickRes.reason) || 'TEMPORARY_CHAT_CONTROL_NOT_FOUND',
+      checkedAt: nowIso()
+    };
+  }
+
+  const deadline = Date.now() + timeoutMs;
+  let lastObserved = initial;
+  while (Date.now() <= deadline) {
+    lastObserved = await inspectGeminiTemporaryChatDom(page);
+    if (lastObserved.active === requested) {
+      return {
+        tabId: tabId,
+        requested: requested,
+        active: lastObserved.active,
+        verified: true,
+        status: lastObserved.active ? 'ACTIVE_VERIFIED' : 'OFF_VERIFIED',
+        reason: 'DOM_VERIFIED',
+        checkedAt: nowIso()
+      };
+    }
+    await new Promise(function(resolve) { setTimeout(resolve, pollMs); });
+  }
+
+  return {
+    tabId: tabId,
+    requested: requested,
+    active: Boolean(lastObserved.active),
+    verified: false,
+    status: 'MISMATCH_OR_UNVERIFIED',
+    reason: 'DOM_VERIFICATION_TIMEOUT',
+    checkedAt: nowIso()
+  };
+}
+
 function createGeminiEngine(runtimeContext) {
   if (!runtimeContext || typeof runtimeContext !== 'object') {
     throw new Error('Mandatory runtimeContext dependency is required');
@@ -585,9 +791,10 @@ function createGeminiEngine(runtimeContext) {
         const combined = normalize(text + ' ' + aria);
         const isNeonHighAria = /currently\s*neon\s*high/i.test(aria);
         const isNeonHighText = /neon[\s\n]+high/i.test(text);
-        const isNeonLowAria = /currently\s*neon$/i.test(aria) || /currently\s*neon\s*(?:low|fast)/i.test(aria);
-        const isNeonLowText = /^neon$/i.test(text.replace(/\s+/g, ' ').trim());
-        const isStrictHigh = (isNeonHighAria || isNeonHighText || activeRe.test(combined)) && !isNeonLowAria && !isNeonLowText;
+        const isNeonLowAria = /currently\s*neon\s*(?:low|fast)/i.test(aria) || /currently\s*(?:flash|auto|quick)/i.test(aria);
+        const isNeonLowText = /neon\s*(?:low|fast)/i.test(text) || /^(?:flash|auto|quick)$/i.test(text.replace(/\s+/g, ' ').trim());
+        const isNeonIdentified = (isNeonHighAria || isNeonHighText || activeRe.test(combined) || /(?:4\s*neon|neon\s*\(high\)|currently\s*neon\b|deeper\s*analysis|\bneon\b)/i.test(combined));
+        const isStrictHigh = isNeonIdentified && !isNeonLowAria && !isNeonLowText;
         return {
           text: text,
           aria: aria,
@@ -608,17 +815,18 @@ function createGeminiEngine(runtimeContext) {
       let state = readTriggerState(trigger);
       if (!state.active) {
         trigger.click();
-        await sleep(400);
+        await sleep(600);
 
         const menus = Array.from(document.querySelectorAll('[role="menu"], [role="listbox"], mat-menu-content, .cdk-overlay-pane'));
         const options = menus.flatMap(function(m) {
           return Array.from(m.querySelectorAll('[role="menuitemradio"], [role="menuitem"], [role="option"]'));
         }).filter(actionable);
 
-        const neonOption = options.find(function(el) {
+        const neonMatches = options.filter(function(el) {
           const txt = normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || ''));
           return menuRe.test(txt);
         });
+        const neonOption = neonMatches.length > 0 ? neonMatches[neonMatches.length - 1] : null;
 
         if (!neonOption) {
           document.querySelectorAll('.cdk-overlay-backdrop').forEach(function(b) { b.click(); });
@@ -626,42 +834,33 @@ function createGeminiEngine(runtimeContext) {
         }
 
         neonOption.click();
-        await sleep(600);
+        await sleep(1000);
 
-        // Siguro përzgjedhjen e Thinking Level -> High Extra thorough (RREGULL I KYÇUR)
-        let thinkItem = Array.from(document.querySelectorAll('[role="menuitemradio"], [role="menuitem"], [role="option"], gem-menu-item')).find(function(el) {
+        // Nese ekziston Thinking Level menuitem ne overlay, kliko High
+        const highOption = Array.from(document.querySelectorAll('gem-menu-item, [role="menuitemradio"], [role="menuitem"], [role="option"]')).filter(actionable).find(function(el) {
           const txt = normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || ''));
-          return /thinking level/i.test(txt);
+          return /high.*thorough|extra thorough/i.test(txt);
         });
-        if (!thinkItem) {
-          trigger = findTrigger();
-          if (trigger) { trigger.click(); await sleep(400); }
-          thinkItem = Array.from(document.querySelectorAll('[role="menuitemradio"], [role="menuitem"], [role="option"], gem-menu-item')).find(function(el) {
-            const txt = normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || ''));
-            return /thinking level/i.test(txt);
-          });
-        }
-        if (thinkItem) {
-          thinkItem.click();
+        if (highOption) {
+          highOption.click();
           await sleep(500);
-          const subOptions = Array.from(document.querySelectorAll('gem-menu-item, [role="menuitemradio"], [role="menuitem"], [role="option"]'));
-          const highOption = subOptions.find(function(el) {
-            const txt = normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || ''));
-            return /high.*thorough|extra thorough/i.test(txt);
-          });
-          if (highOption) {
-            highOption.click();
-            await sleep(500);
-          }
         }
 
         document.querySelectorAll('.cdk-overlay-backdrop').forEach(function(b) { b.click(); });
-        await sleep(300);
+        try { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true })); } catch (_) {}
+        await sleep(600);
 
-        trigger = findTrigger();
-        if (!trigger) return { ok: false, code: 'MODEL_SELECTION_UNVERIFIED' };
-        state = readTriggerState(trigger);
-        if (!state.active) return { ok: false, code: 'MODEL_SELECTION_UNVERIFIED' };
+        let pollActiveStart = Date.now();
+        while (Date.now() - pollActiveStart < 8000) {
+          trigger = findTrigger();
+          if (trigger) {
+            state = readTriggerState(trigger);
+            if (state.active) break;
+          }
+          await sleep(400);
+        }
+        if (!trigger) return { ok: false, code: 'MODEL_SELECTION_UNVERIFIED', debug: 'NO_TRIGGER' };
+        if (!state.active) return { ok: false, code: 'MODEL_SELECTION_UNVERIFIED', debug: { text: state.text, aria: state.aria } };
       }
 
       let stablePolls = 0;
@@ -697,6 +896,9 @@ function createGeminiEngine(runtimeContext) {
     });
 
     if (!receipt || !receipt.ok) {
+      if (receipt && receipt.debug) {
+        console.error('[MODEL_SELECTION_DEBUG] tabKey=' + tabKey + ' debug=' + JSON.stringify(receipt.debug));
+      }
       throw new Error(receipt && receipt.code ? receipt.code : 'MODEL_SELECTION_UNVERIFIED');
     }
 
@@ -739,6 +941,8 @@ function createGeminiEngine(runtimeContext) {
 
   return {
     ensureGeminiNeonModel,
+    inspectGeminiTemporaryChatDom,
+    ensureGeminiTemporaryChat,
     resetConversation,
     observeSessionReadiness,
     waitForSessionReady,
@@ -760,6 +964,8 @@ function createGeminiEngine(runtimeContext) {
 
 module.exports = {
   createGeminiEngine,
+  inspectGeminiTemporaryChatDom,
+  ensureGeminiTemporaryChat,
   resetConversation,
   observeSessionReadiness,
   waitForSessionReady,

@@ -245,7 +245,8 @@ function sanitizeTargetPath(rawEntry, projectRoot) {
 
   // 4. Disk-First Check: If projectRoot is provided, test if the raw candidate exists on disk
   // Skip Disk-First Check for any explicit traversal segment (..) so traversal is always fail-closed.
-  if (projectRoot && !hasTraversalSegment && !/[<>"|?*]/.test(text)) {
+  const isSafeProjectRoot = typeof projectRoot === 'string' && projectRoot.trim().length > 0;
+  if (isSafeProjectRoot && !hasTraversalSegment && !/[<>"|?*]/.test(text)) {
     try {
       const directResolved = path.resolve(projectRoot, text);
       if (fs.existsSync(directResolved)) {
@@ -311,7 +312,7 @@ function sanitizeTargetPath(rawEntry, projectRoot) {
 
   // If absolute path provided, convert to relative to projectRoot if possible
   if (path.isAbsolute(normalized) || /^[A-Za-z]:\//.test(normalized)) {
-    if (projectRoot) {
+    if (isSafeProjectRoot) {
       const bothWinDrive = /^[A-Za-z]:\//.test(normalized) && /^[A-Za-z]:[\\/]/.test(projectRoot);
       const rel = (bothWinDrive
         ? path.win32.relative(projectRoot, normalized)

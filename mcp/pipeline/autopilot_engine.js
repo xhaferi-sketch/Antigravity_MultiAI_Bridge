@@ -1033,7 +1033,8 @@ function resolveAndEmbedExternalFiles(userRequest) {
 }
 
 function normalizeBatchTarget(value, projectRoot) {
-  const sanitized = sanitizeTargetPath(value, projectRoot);
+  const safeRoot = typeof projectRoot === 'string' && projectRoot.trim() ? projectRoot : null;
+  const sanitized = sanitizeTargetPath(value, safeRoot);
   return sanitized.path || String(value || '').replace(/\\/g, '/').replace(/^\.\//, '').trim();
 }
 
@@ -1324,7 +1325,7 @@ function partitionCodingBatches(targets, graph, limits) {
   const maxFiles = limits.maxBatchFiles || 2;
   const testMax = limits.testMaxFiles || 1;
 
-  const normTargets = Array.from(new Set(targets.map(normalizeBatchTarget)));
+  const normTargets = Array.from(new Set(targets.map(function(t) { return normalizeBatchTarget(t); })));
   const tests = [];
   const sources = [];
 
@@ -2682,7 +2683,16 @@ function createAutopilotEngine(deps) {
     if (!job || !job.running) {
       const p = runAutonomousPipeline(cleanRoot, userRequest || '', opts);
       job = activeCycleJobs[cleanRoot];
-      if (job) job.promise = p;
+      if (job) {
+        job.promise = p;
+        p.catch(function(err) {
+          if (job) {
+            job.running = false;
+            job.error = err.message || String(err);
+            job.result = { status: 'FAILED', error: job.error };
+          }
+        });
+      }
     }
     if (opts && opts.blocking === false) {
       return await waitJobSlice(cleanRoot, opts.maxSliceMs || 22000);
