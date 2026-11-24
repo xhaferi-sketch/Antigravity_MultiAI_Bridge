@@ -717,7 +717,7 @@ function createLocalExecutor(runtimeContext) {
       let timedOut = false;
       let proc;
       try {
-        proc = nodeSpawn(command, { cwd: cwd, shell: true });
+        proc = nodeSpawn(command, { cwd: cwd, shell: true, windowsHide: true });
       } catch (err) {
         return resolve({
           status: 1, signal: null, stdout: '', stderr: String(err && err.message), timedOut: false

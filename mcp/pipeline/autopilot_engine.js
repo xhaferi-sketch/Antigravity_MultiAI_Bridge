@@ -7,6 +7,9 @@ const { spawn, spawnSync } = require('node:child_process');
 
 function notifyWhatsApp(msg) {
   try {
+    if (process.env.NODE_ENV === 'test' || process.execArgv.includes('--test') || process.argv.some(a => String(a).includes('test'))) {
+      return;
+    }
     const text = String(msg || '')
       .replace(/["'\\&|;<>^%$`!()\r\n]/g, ' ')
       .replace(/\s+/g, ' ')
@@ -15,7 +18,8 @@ function notifyWhatsApp(msg) {
     const child = spawn('hermes', ['send', '--to', 'whatsapp', text], {
       stdio: 'ignore',
       detached: true,
-      shell: true
+      shell: true,
+      windowsHide: true
     });
     child.unref();
   } catch (_) {}
