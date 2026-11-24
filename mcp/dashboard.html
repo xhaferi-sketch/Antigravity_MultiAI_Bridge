@@ -108,6 +108,12 @@
     const GEMINI_TEMP_CHAT_TABS = new Set(['gemini1', 'gemini2', 'gemini3']);
     const COPILOT_TEMP_CHAT_TABS = new Set(['web1', 'web2']);
     const SUPPORTED_TEMP_CHAT_TABS = new Set(['gemini1', 'gemini2', 'gemini3', 'web1', 'web2']);
+    const TEMP_CHAT_ERROR_STATUSES = new Set([
+      'MISMATCH_OR_UNVERIFIED',
+      'CONTROL_NOT_FOUND',
+      'CONTROL_CLICK_FAILED',
+      'TIMEOUT_WAITING_VERIFICATION'
+    ]);
     const inFlightTempChat = {};
     const lastConfirmedTempChat = { gemini1: false, gemini2: false, gemini3: false, web1: false, web2: false };
 
@@ -127,7 +133,7 @@
 
     function formatTempChatBadge(t) {
       const status = t.temporaryChatStatus || (t.temporaryChatActive ? 'ACTIVE_VERIFIED' : 'SAVED_WAITING_TAB');
-      const cls = status === 'ACTIVE_VERIFIED' ? 'ok' : (status === 'MISMATCH_OR_UNVERIFIED' ? 'err' : 'idle');
+      const cls = status === 'ACTIVE_VERIFIED' ? 'ok' : (TEMP_CHAT_ERROR_STATUSES.has(status) ? 'err' : 'idle');
       const checkedAt = t.temporaryChatCheckedAt ? ` (${new Date(t.temporaryChatCheckedAt).toLocaleTimeString()})` : '';
       return { cls, text: status + checkedAt };
     }

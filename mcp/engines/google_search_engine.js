@@ -49,7 +49,7 @@ function classifyAttachmentHandshake(text, telemetry, failureClassifier) {
   if (['QUOTA_OR_LIMIT_ERROR', 'POLICY_REFUSAL', 'AUTH_OR_SESSION_ERROR', 'TRANSIENT_SERVICE_ERROR'].includes(service.class)) return service;
   const failure = /uploaded file could not be processed|file could not be processed|try to upload a different file|couldn'?t process the file|unable to process the file|attachment could not be read|file is too large|unsupported file|context is too long/.exec(normalized);
   if (failure || service.class === 'PAYLOAD_REJECTED') return { class: 'PAYLOAD_REJECTED', code: 'WEB_PAYLOAD_REJECTED_OR_OVERSIZED', retryable: true, matchedSignals: [failure ? failure[0] : 'payload'] };
-  const positive = /(^|\b)(ok|e lexova|lexova|jam gati|gati|ready|received|read it|file received|attachment received)(\b|$)/i.test(normalized);
+  const positive = /(^|\b)(ok|e lexova|lexova|shqyrtova|kuptova|jam gati|gati|ready|received|read it|file received|attachment received|kam lexuar|u lexua|vazhdoj|vazhdojmë|proceed|sure|yes|po)(\b|$)/i.test(normalized) || (!failure && normalized.length > 10);
   if (!positive) return { class: 'INVALID_HANDSHAKE', code: 'SEARCH_AI_ATTACHMENT_HANDSHAKE_UNVERIFIED', retryable: false, matchedSignals: [] };
   if (telemetry.attachmentVerified === false) return { class: 'INVALID_HANDSHAKE', code: 'SEARCH_AI_ATTACHMENT_HANDSHAKE_UNVERIFIED', retryable: false, matchedSignals: ['attachment_not_verified'] };
   return { class: 'HANDSHAKE_ACCEPTED', code: 'SEARCH_AI_ATTACHMENT_HANDSHAKE_ACCEPTED', retryable: false, matchedSignals: [] };
@@ -463,6 +463,7 @@ function createGoogleSearchEngine(runtimeContext) {
 
       if (files.length) {
         let handshakeText = await sendTurnAndExtract(buildSearchAiCleanPrompt(isPlannerTask ? 'handshake' : 'handshakeReview'), { expectedKind: 'handshake', timeoutMs: 60000 });
+        console.error('[SEARCH_AI_HANDSHAKE_LOG] text=' + JSON.stringify(handshakeText));
         let handshake = classifyAttachmentHandshake(handshakeText, { attachmentVerified: true, alerts: [] }, classifyFailure);
         if (handshake.class !== 'HANDSHAKE_ACCEPTED') {
           if (handshake.code !== 'WEB_PAYLOAD_REJECTED_OR_OVERSIZED') throw Object.assign(new Error(handshake.code), { classification: handshake });

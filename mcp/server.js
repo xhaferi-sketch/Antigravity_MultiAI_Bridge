@@ -266,7 +266,7 @@ function buildDashboardState(projects) {
       entry.temporaryChatRequested = Boolean(tabTemporaryChatConfig[k]);
       entry.temporaryChatActive = Boolean(tcRes.active);
       entry.temporaryChatVerified = Boolean(tcRes.verified);
-      entry.temporaryChatStatus = tcRes.status || (tabTemporaryChatConfig[k] ? 'REQUESTED_PENDING' : 'DISABLED');
+      entry.temporaryChatStatus = tcRes.status || (tabTemporaryChatConfig[k] ? 'SAVED_WAITING_TAB' : 'OFF_VERIFIED');
       entry.temporaryChatReason = tcRes.reason || null;
       entry.temporaryChatCheckedAt = tcRes.checkedAt || null;
     } else if (isCopilot) {
@@ -274,7 +274,7 @@ function buildDashboardState(projects) {
       entry.temporaryChatRequested = Boolean(tabTemporaryChatConfig[k]);
       entry.temporaryChatActive = Boolean(tcRes.active);
       entry.temporaryChatVerified = Boolean(tcRes.verified);
-      entry.temporaryChatStatus = tcRes.status || (tabTemporaryChatConfig[k] ? 'REQUESTED_PENDING' : 'DISABLED');
+      entry.temporaryChatStatus = tcRes.status || (tabTemporaryChatConfig[k] ? 'SAVED_WAITING_TAB' : 'OFF_VERIFIED');
       entry.temporaryChatReason = tcRes.reason || null;
       entry.temporaryChatCheckedAt = tcRes.checkedAt || null;
     }
@@ -287,6 +287,7 @@ const tabLocks = {
   web2: Promise.resolve(),
   gemini1: Promise.resolve(),
   gemini2: Promise.resolve(),
+  gemini3: Promise.resolve(),
   google_search_1: Promise.resolve(),
   google_search_2: Promise.resolve(),
   google_search_3: Promise.resolve()
@@ -2340,21 +2341,67 @@ if (req.url === '/api/save-routing') {
       return res.end(JSON.stringify({ ok: false, error: 'INVALID_TAB_ID' }));
     }
     const enabled = Boolean(data.enabled !== undefined ? data.enabled : data.temporaryChat);
-    tabTemporaryChatConfig[tabId] = enabled;
-    persistTabConfig();
-    if (tabs[tabId] && !tabs[tabId].isClosed()) {
-      if (tabId.startsWith('gemini') && typeof ensureGeminiTemporaryChat === 'function') {
-        ensureGeminiTemporaryChat(tabs[tabId], tabId, enabled).then(function(res) {
-          if (res) geminiTemporaryChatStatus[tabId] = res;
-        }).catch(function() {});
-      } else if (tabId.startsWith('web') && typeof ensureCopilotTemporaryChat === 'function') {
-        ensureCopilotTemporaryChat(tabs[tabId], tabId, enabled).then(function(res) {
-          if (res) copilotTemporaryChatStatus[tabId] = res;
-        }).catch(function() {});
+    const tcState = await withTabLock(tabId, async function() {
+      tabTemporaryChatConfig[tabId] = enabled;
+      persistTabConfig();
+      const nowIso = new Date().toISOString();
+      if (!tabs[tabId] || tabs[tabId].isClosed()) {
+        const waitingState = {
+          tabId: tabId,
+          requested: enabled,
+          active: false,
+          verified: false,
+          status: 'SAVED_WAITING_TAB',
+          reason: 'TAB_NOT_ACTIVE',
+          checkedAt: nowIso
+        };
+        if (tabId.startsWith('gemini')) geminiTemporaryChatStatus[tabId] = waitingState;
+        else if (tabId.startsWith('web')) copilotTemporaryChatStatus[tabId] = waitingState;
+        return waitingState;
       }
-    }
+      if (tabId.startsWith('gemini') && typeof ensureGeminiTemporaryChat === 'function') {
+        const domRes = await ensureGeminiTemporaryChat(tabs[tabId], tabId, enabled).catch(function(err) {
+          return {
+            tabId: tabId,
+            requested: enabled,
+            active: false,
+            verified: false,
+            status: 'MISMATCH_OR_UNVERIFIED',
+            reason: String(err && err.message || err).slice(0, 120),
+            checkedAt: new Date().toISOString()
+          };
+        });
+        geminiTemporaryChatStatus[tabId] = domRes;
+        return domRes;
+      }
+      if (tabId.startsWith('web') && typeof ensureCopilotTemporaryChat === 'function') {
+        const targetFrame = findChatFrameOrPage(tabs[tabId]);
+        const domRes = await ensureCopilotTemporaryChat(targetFrame, tabId, enabled).catch(function(err) {
+          return {
+            tabId: tabId,
+            requested: enabled,
+            active: false,
+            verified: false,
+            status: 'MISMATCH_OR_UNVERIFIED',
+            reason: String(err && err.message || err).slice(0, 120),
+            checkedAt: new Date().toISOString()
+          };
+        });
+        copilotTemporaryChatStatus[tabId] = domRes;
+        return domRes;
+      }
+      return {
+        tabId: tabId,
+        requested: enabled,
+        active: false,
+        verified: false,
+        status: 'SAVED_WAITING_TAB',
+        reason: 'ENGINE_UNAVAILABLE',
+        checkedAt: nowIso
+      };
+    });
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ ok: true, tabId: tabId, enabled: enabled }));
+    return res.end(JSON.stringify({ ok: true, tabId: tabId, enabled: enabled, state: tcState }));
   }
 ensureProjectSetup(data.projectRoot);
 const rPath = path.join(path.resolve(data.projectRoot), '.antigravity', 'bridge', 'routing.json');
