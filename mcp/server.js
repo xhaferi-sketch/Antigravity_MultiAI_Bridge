@@ -82,12 +82,28 @@ const M365_CHAT_URL = copilotEngineModule.M365_CHAT_URL;
 const ensureCopilotTemporaryChat = copilotEngineModule.ensureCopilotTemporaryChat;
 const inspectCopilotTemporaryChatDom = copilotEngineModule.inspectCopilotTemporaryChatDom;
 
+const copilotModelReceipts = {
+  web1: null,
+  web2: null
+};
+const googleSearchModelReceipts = {
+  google_search_1: null,
+  google_search_2: null,
+  google_search_3: null
+};
+function invalidateCopilotReceipt(tabKey) {
+  if (tabKey && Object.prototype.hasOwnProperty.call(copilotModelReceipts, tabKey)) {
+    copilotModelReceipts[tabKey] = null;
+  }
+}
 let copilotEngine = null;
 function getCopilotEngine() {
   if (!copilotEngine) {
     copilotEngine = createCopilotEngine({
       tabAuthStatus,
       tabActiveModel,
+      tabDiscoveredModels,
+      copilotModelReceipts,
       captureSupportEvidence
     });
   }
@@ -239,42 +255,52 @@ function persistTabConfig() {
 }
 
 function buildDashboardState(projects) {
+  const isTestExport = process.env.ANTIGRAVITY_TEST_EXPORT === '1' && process.env.ANTIGRAVITY_TRUTHFUL_TEST !== '1';
   const tabStates = {};
   for (const k of Object.keys(tabs)) {
     const isGemini = k.startsWith('gemini');
     const isCopilot = k.startsWith('web');
+    const isSearch = k.startsWith('google_search_');
     const isOpen = Boolean(tabs[k] && !tabs[k].isClosed());
-    const isVerified = isGemini && Boolean(geminiModelReceipts[k] && geminiModelReceipts[k].verified === true);
+    const isVerified = isGemini
+      ? Boolean(geminiModelReceipts[k] && geminiModelReceipts[k].verified === true)
+      : (isCopilot
+        ? Boolean(copilotModelReceipts[k] && copilotModelReceipts[k].verified === true)
+        : Boolean(googleSearchModelReceipts[k] && googleSearchModelReceipts[k].verified === true));
     const entry = {
       open: isOpen,
-      auth: tabAuthStatus[k],
-      model: isGemini ? (
-        process.env.ANTIGRAVITY_TEST_EXPORT === '1' ? tabActiveModel[k] :
-        (isVerified ? tabActiveModel[k] : (isOpen ? 'Duke u verifikuar...' : '-'))
-      ) : tabActiveModel[k],
-      connectionLabel: isGemini ? (isVerified ? 'E Lidhur (Neon)' : (isOpen ? 'Duke u lidhur...' : 'E Shkëputur')) : (
-        geminiModelReceipts[k] &&
-        geminiModelReceipts[k].verified === true &&
-        geminiModelReceipts[k].family === 'neon'
-      ) ? 'E Lidhur (Neon)' : 'E Lidhur',
+      auth: isOpen ? tabAuthStatus[k] : 'UNKNOWN',
+      model: isTestExport
+        ? tabActiveModel[k]
+        : (isVerified ? tabActiveModel[k] : (isOpen ? 'Duke u verifikuar...' : '-')),
+      connectionLabel: isTestExport
+        ? (isGemini ? (isVerified ? 'E Lidhur (Neon)' : (isOpen ? 'Duke u lidhur...' : 'E Shkëputur')) : 'E Lidhur')
+        : (isVerified
+          ? (isGemini ? 'E Lidhur (Neon)' : (isCopilot ? 'E Lidhur (GPT-5.6)' : 'E Lidhur (Search AI)'))
+          : (isOpen ? 'Duke u lidhur...' : 'E Shkëputur')),
       geminiReceipt: geminiModelReceipts[k] || null,
-      discoveredModels: tabDiscoveredModels[k] || '-',
+      copilotReceipt: isCopilot ? (copilotModelReceipts[k] || null) : undefined,
+      discoveredModels: (isTestExport || isOpen || isSearch) ? (tabDiscoveredModels[k] || '-') : '-',
       activeProject: activeProjectPerTab[k] ? path.basename(activeProjectPerTab[k]) : 'Asnje'
     };
     if (isGemini) {
       const tcRes = geminiTemporaryChatStatus[k] || {};
       entry.temporaryChatRequested = Boolean(tabTemporaryChatConfig[k]);
-      entry.temporaryChatActive = Boolean(tcRes.active);
-      entry.temporaryChatVerified = Boolean(tcRes.verified);
-      entry.temporaryChatStatus = tcRes.status || (tabTemporaryChatConfig[k] ? 'SAVED_WAITING_TAB' : 'OFF_VERIFIED');
+      entry.temporaryChatActive = isOpen ? Boolean(tcRes.active) : false;
+      entry.temporaryChatVerified = isOpen ? Boolean(tcRes.verified) : false;
+      entry.temporaryChatStatus = isOpen
+        ? (tcRes.status || (tabTemporaryChatConfig[k] ? 'SAVED_WAITING_TAB' : 'OFF_UNVERIFIED'))
+        : (tabTemporaryChatConfig[k] ? 'SAVED_WAITING_TAB' : 'OFF (NË GJUMË)');
       entry.temporaryChatReason = tcRes.reason || null;
       entry.temporaryChatCheckedAt = tcRes.checkedAt || null;
     } else if (isCopilot) {
       const tcRes = copilotTemporaryChatStatus[k] || {};
       entry.temporaryChatRequested = Boolean(tabTemporaryChatConfig[k]);
-      entry.temporaryChatActive = Boolean(tcRes.active);
-      entry.temporaryChatVerified = Boolean(tcRes.verified);
-      entry.temporaryChatStatus = tcRes.status || (tabTemporaryChatConfig[k] ? 'SAVED_WAITING_TAB' : 'OFF_VERIFIED');
+      entry.temporaryChatActive = isOpen ? Boolean(tcRes.active) : false;
+      entry.temporaryChatVerified = isOpen ? Boolean(tcRes.verified) : false;
+      entry.temporaryChatStatus = isOpen
+        ? (tcRes.status || (tabTemporaryChatConfig[k] ? 'SAVED_WAITING_TAB' : 'OFF_UNVERIFIED'))
+        : (tabTemporaryChatConfig[k] ? 'SAVED_WAITING_TAB' : 'OFF (NË GJUMË)');
       entry.temporaryChatReason = tcRes.reason || null;
       entry.temporaryChatCheckedAt = tcRes.checkedAt || null;
     }
@@ -1044,6 +1070,9 @@ async function resetChatVerified(args){
   if (args && args.tabKey && String(args.tabKey).startsWith('gemini')) {
     invalidateGeminiReceipt(args.tabKey);
   }
+  if (args && args.tabKey && String(args.tabKey).startsWith('web')) {
+    invalidateCopilotReceipt(args.tabKey);
+  }
   let page=args.page,targetFrame=args.targetFrame||findChatFrameOrPage(page);const tabKey=args.tabKey,projectRoot=args.projectRoot,timeoutMs=args.timeoutMs||30000,started=Date.now(),adapter=getEngineAdapter(tabKey),oldRoute=normalizeChatRoute(page.url()),oldConversationId=conversationIdFromUrl(page.url());
   if(args.forceReload===true){let state=null,stable=0;try{await page.goto(adapter.canonicalUrl,{waitUntil:'domcontentloaded',timeout:Math.min(timeoutMs,45000)});targetFrame=findChatFrameOrPage(page);if(await checkAuthExpired(page,tabKey))throw new Error('AUTH_EXPIRED');const deadline=Date.now()+Math.min(timeoutMs,30000);while(Date.now()<deadline&&stable<2){state=await probeChatCleanState(targetFrame,tabKey,oldConversationId);stable=state.clean?stable+1:0;if(stable<2)await page.waitForTimeout(250);}if(stable<2)throw new Error('clean_state_unverified: '+JSON.stringify(state||{}));activeProjectPerTab[tabKey]=projectRoot;return {status:'CHAT_RESET_VERIFIED',method:'FORCED_NAV',oldRoute:oldRoute,newRoute:state.route,oldConversationId:oldConversationId,newConversationId:state.conversationId,users:0,assistants:0,composerEmpty:true,attachmentChips:0,stablePolls:2,documentChanged:true,elapsedMs:Date.now()-started};}catch(err){throw new Error('FORCED_CHAT_RESET_VERIFICATION_FAILED: '+err.message);}}
   console.error('[CHAT_RESET_STARTED] tabKey='+tabKey+' reason='+(args.reason||'requested'));
@@ -1506,19 +1535,24 @@ async function runWebDispatchWithRetryPolicy(opts){const dispatchId=opts.dispatc
       if(attempt===2){const backoff=Number.isFinite(opts.backoffMs)?opts.backoffMs:8000+(parseInt(crypto.createHash('sha256').update(diagId).digest('hex').slice(0,8),16)%4001);await (typeof opts.sleepFn==='function'?opts.sleepFn(backoff):new Promise(function(resolve){setTimeout(resolve,backoff);}));await resetChatVerified({page:page,targetFrame:targetFrame,tabKey:tabKey,projectRoot:projectRoot,resetPolicy:normalizeConversationResetPolicy({forceFreshChat:true}),reason:'COMPACT_RECOVERY'});targetFrame=findChatFrameOrPage(page);}
       else if(attempt===1&&opts.forceFreshChat===true){await resetChatVerified({page:page,targetFrame:targetFrame,tabKey:tabKey,projectRoot:projectRoot,resetPolicy:normalizeConversationResetPolicy({forceFreshChat:true}),reason:'CODING_BATCH_FRESH_CHAT'});targetFrame=findChatFrameOrPage(page);}
       else if(routing.autoNewChatOnProjectSwitch){await resetChatIfNeeded(page,tabKey,projectRoot,false);}
+      const desiredTemp = Boolean(tabTemporaryChatConfig[tabKey]);
+      if (tabKey.startsWith('gemini') && typeof ensureGeminiTemporaryChat === 'function') {
+        const tempRes = await ensureGeminiTemporaryChat(targetFrame, tabKey, desiredTemp);
+        geminiTemporaryChatStatus[tabKey] = tempRes || { active: Boolean(tempRes && tempRes.active), verified: false, status: 'MISMATCH_OR_UNVERIFIED' };
+        if (desiredTemp && (!tempRes || !tempRes.verified || !tempRes.active)) {
+          await captureSupportEvidence(page, projectRoot, tabKey, 'TEMPORARY_CHAT_UNVERIFIED', 'Temporary Chat u kerkua ON por deshtoi verifikimi ne DOM: ' + JSON.stringify(tempRes || {}));
+        }
+        targetFrame = findChatFrameOrPage(page);
+      } else if (tabKey.startsWith('web') && typeof ensureCopilotTemporaryChat === 'function') {
+        const tempRes = await ensureCopilotTemporaryChat(targetFrame, tabKey, desiredTemp);
+        copilotTemporaryChatStatus[tabKey] = tempRes || { active: Boolean(tempRes && tempRes.active), verified: false, status: 'MISMATCH_OR_UNVERIFIED' };
+        if (desiredTemp && (!tempRes || !tempRes.verified || !tempRes.active)) {
+          await captureSupportEvidence(page, projectRoot, tabKey, 'TEMPORARY_CHAT_UNVERIFIED', 'Copilot Temporary Chat u kerkua ON por deshtoi verifikimi ne DOM: ' + JSON.stringify(tempRes || {}));
+        }
+        targetFrame = findChatFrameOrPage(page);
+      }
       const verifiedModel = await ensureMaxReasoningMode(targetFrame,tabKey,{reasoningLevel:'high',modelTier:opts.modelTier||'neon'});
       tabActiveModel[tabKey]=verifiedModel;appendDispatchDiag(projectRoot,diagId,'MODEL_VERIFIED',{model:verifiedModel});
-      if (tabKey.startsWith('gemini') && tabTemporaryChatConfig[tabKey] && typeof ensureGeminiTemporaryChat === 'function') {
-        try {
-          const tempRes = await ensureGeminiTemporaryChat(targetFrame, tabKey, true);
-          geminiTemporaryChatStatus[tabKey] = tempRes || { active: Boolean(tempRes && tempRes.active) };
-        } catch (_) {}
-      } else if (tabKey.startsWith('web') && tabTemporaryChatConfig[tabKey] && typeof ensureCopilotTemporaryChat === 'function') {
-        try {
-          const tempRes = await ensureCopilotTemporaryChat(targetFrame, tabKey, true);
-          copilotTemporaryChatStatus[tabKey] = tempRes || { active: Boolean(tempRes && tempRes.active) };
-        } catch (_) {}
-      }
       await page.keyboard.press('Escape').catch(function() {});
       await targetFrame.evaluate(function() {
         document.querySelectorAll('.cdk-overlay-backdrop').forEach(function(b) { b.click(); });
@@ -1639,10 +1673,14 @@ async function runWebDispatchWithRetryPolicy(opts){const dispatchId=opts.dispatc
 }
 
 async function selectGoogleSearchAiModel(page, targetKeyword, tabKey) {
-  return getGoogleSearchEngine().selectGoogleSearchAiModel(page, targetKeyword, tabKey);
+  const res = await getGoogleSearchEngine().selectGoogleSearchAiModel(page, targetKeyword, tabKey);
+  if (tabKey && Object.prototype.hasOwnProperty.call(googleSearchModelReceipts, tabKey)) googleSearchModelReceipts[tabKey] = { verified: true };
+  return res;
 }
 async function ensureGoogleSearchAi4CarbonMode(page, tabKey) {
-  return getGoogleSearchEngine().ensureGoogleSearchAi4CarbonMode(page, tabKey);
+  const res = await getGoogleSearchEngine().ensureGoogleSearchAi4CarbonMode(page, tabKey);
+  if (tabKey && Object.prototype.hasOwnProperty.call(googleSearchModelReceipts, tabKey)) googleSearchModelReceipts[tabKey] = { verified: true };
+  return res;
 }
 
 function generateSmartArchitectureMap(projectRoot) {
@@ -2669,7 +2707,12 @@ try { await ctx.close(); } catch (_) {}
 delete contexts[k];
 delete contextModes[k];
 }
-for (const k of Object.keys(tabs)) tabs[k] = null;
+for (const k of Object.keys(tabs)) {
+  tabs[k] = null;
+  invalidateGeminiReceipt(k);
+  invalidateCopilotReceipt(k);
+  if (Object.prototype.hasOwnProperty.call(googleSearchModelReceipts, k)) googleSearchModelReceipts[k] = null;
+}
 }
 process.on('SIGINT', async function() { await closeAllContexts(); process.exit(0); });
 process.on('SIGTERM', async function() { await closeAllContexts(); process.exit(0); });

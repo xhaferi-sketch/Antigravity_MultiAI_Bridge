@@ -11,16 +11,17 @@ function notifyWhatsApp(msg) {
       return;
     }
     const text = String(msg || '')
-      .replace(/["'\\&|;<>^%$`!()\r\n]/g, ' ')
+      .replace(/[\r\n]+/g, ' ')
       .replace(/\s+/g, ' ')
       .trim();
     if (!text) return;
     const child = spawn('hermes', ['send', '--to', 'whatsapp', text], {
       stdio: 'ignore',
-      detached: true,
-      shell: true,
+      detached: false,
+      shell: false,
       windowsHide: true
     });
+    child.on('error', function() {});
     child.unref();
   } catch (_) {}
 }
@@ -2548,7 +2549,7 @@ function createAutopilotEngine(deps) {
       notifyWhatsApp('[HERMES /run-cycle] Faza REVIEWER: Filloi');
       let diffStdout = '';
       try {
-        const diffResult = spawnSyncFn('git', ['diff', '--', ...allWrittenFiles], { cwd: cleanRoot, encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
+        const diffResult = spawnSyncFn('git', ['diff', '--', ...allWrittenFiles], { cwd: cleanRoot, encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true });
         diffStdout = (diffResult && diffResult.stdout) || '';
       } catch (_) {}
 

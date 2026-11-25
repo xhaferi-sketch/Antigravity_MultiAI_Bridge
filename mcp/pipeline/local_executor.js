@@ -103,8 +103,8 @@ function computeRepositoryFingerprint(cleanRoot, execSyncFn) {
   const execSync = execSyncFn || nodeExecSync;
   const canonicalRoot = nodePath.resolve(cleanRoot).toLowerCase();
   let gitHead = null, branch = null;
-  try { gitHead = execSync('git -C "' + cleanRoot + '" rev-parse HEAD', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch (_) {}
-  try { branch = execSync('git -C "' + cleanRoot + '" rev-parse --abbrev-ref HEAD', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch (_) {}
+  try { gitHead = execSync('git -C "' + cleanRoot + '" rev-parse HEAD', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true }).trim(); } catch (_) {}
+  try { branch = execSync('git -C "' + cleanRoot + '" rev-parse --abbrev-ref HEAD', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true }).trim(); } catch (_) {}
   return nodeCrypto.createHash('sha256').update(JSON.stringify({ canonicalRoot: canonicalRoot, gitHead: gitHead, branch: branch })).digest('hex');
 }
 
@@ -172,11 +172,11 @@ function checkpointSyntaxQuickCheck(targetAbs, spawnSyncFn, fsModule) {
   const spawnSync = spawnSyncFn || nodeSpawnSync;
   const extension = nodePath.extname(targetAbs).toLowerCase();
   if (extension === '.js' || extension === '.cjs' || extension === '.mjs') {
-    const syntaxResult = spawnSync(process.execPath, ['--check', targetAbs], { encoding: 'utf8' });
+    const syntaxResult = spawnSync(process.execPath, ['--check', targetAbs], { encoding: 'utf8', windowsHide: true });
     return !syntaxResult.error && syntaxResult.status === 0;
   }
   if (extension === '.py') {
-    const pyResult = spawnSync(process.env.PYTHON || 'python', ['-m', 'py_compile', targetAbs], { encoding: 'utf8' });
+    const pyResult = spawnSync(process.env.PYTHON || 'python', ['-m', 'py_compile', targetAbs], { encoding: 'utf8', windowsHide: true });
     return !pyResult.error && pyResult.status === 0;
   }
   return fs.statSync(targetAbs).size > 0;
@@ -586,21 +586,21 @@ function createLocalExecutor(runtimeContext) {
         const patchFile = path.join(root, '.antigravity-patch-' + process.pid + '-' + crypto.randomBytes(6).toString('hex') + '.patch');
         temporaryFiles.push(patchFile);
         fs.writeFileSync(patchFile, patchText, 'utf8');
-        let check = spawnSync('git', ['apply', '--check', '--recount', '--whitespace=error-all', patchFile], { cwd: root, encoding: 'utf8' });
+        let check = spawnSync('git', ['apply', '--check', '--recount', '--whitespace=error-all', patchFile], { cwd: root, encoding: 'utf8', windowsHide: true });
         let applyArgs = ['apply', '--recount', '--whitespace=error-all', patchFile];
         if (check.error || check.status !== 0) {
-          const gitDirResult = spawnSync('git', ['rev-parse', '--git-dir'], { cwd: root, encoding: 'utf8' });
+          const gitDirResult = spawnSync('git', ['rev-parse', '--git-dir'], { cwd: root, encoding: 'utf8', windowsHide: true });
           if (gitDirResult.error || gitDirResult.status !== 0) throw new Error('GIT_THREE_WAY_REQUIRES_REPOSITORY');
           gitIndexPath = path.join(path.resolve(root, String(gitDirResult.stdout || '').trim()), 'index');
           gitIndexBackup = fs.existsSync(gitIndexPath) ? fs.readFileSync(gitIndexPath) : null;
           for (const rel of patchPaths) {
-            const identity = spawnSync('git', ['ls-files', '--stage', '--', rel], { cwd: root, encoding: 'utf8' });
+            const identity = spawnSync('git', ['ls-files', '--stage', '--', rel], { cwd: root, encoding: 'utf8', windowsHide: true });
             const rows = String(identity.stdout || '').trim().split(/\r?\n/).filter(Boolean);
             if (identity.error || identity.status !== 0 || rows.length !== 1 || !/^100[0-7]{3} [0-9a-f]{40,64} 0\t/.test(rows[0])) {
               throw new Error('GIT_THREE_WAY_BLOB_IDENTITY_MISSING: ' + rel);
             }
           }
-          check = spawnSync('git', ['apply', '--check', '--3way', '--recount', '--whitespace=error-all', patchFile], { cwd: root, encoding: 'utf8' });
+          check = spawnSync('git', ['apply', '--check', '--3way', '--recount', '--whitespace=error-all', patchFile], { cwd: root, encoding: 'utf8', windowsHide: true });
           applyArgs = ['apply', '--3way', '--recount', '--whitespace=error-all', patchFile];
         }
         let gitApplySuccess = false;
@@ -642,12 +642,12 @@ function createLocalExecutor(runtimeContext) {
           }
         }
         if (!gitApplySuccess) {
-          const applied = spawnSync('git', applyArgs, { cwd: root, encoding: 'utf8' });
+          const applied = spawnSync('git', applyArgs, { cwd: root, encoding: 'utf8', windowsHide: true });
           if (applied.error || applied.status !== 0) {
             throw new Error('GIT_APPLY_FAILED: ' + truncateUtf8((applied.stderr || '') + (applied.stdout || ''), 4000));
           }
           if (applyArgs.includes('--3way')) {
-            const unmerged = spawnSync('git', ['ls-files', '--unmerged'], { cwd: root, encoding: 'utf8' });
+            const unmerged = spawnSync('git', ['ls-files', '--unmerged'], { cwd: root, encoding: 'utf8', windowsHide: true });
             if (unmerged.error || unmerged.status !== 0 || String(unmerged.stdout || '').trim()) throw new Error('GIT_APPLY_THREE_WAY_CONFLICT');
           }
         }
@@ -692,9 +692,9 @@ function createLocalExecutor(runtimeContext) {
       const ext = path.extname(rel).toLowerCase();
       let run = { status: 0, stdout: '', stderr: '' };
       if (['.js', '.mjs', '.cjs'].includes(ext)) {
-        run = spawnSync(process.execPath, ['--check', full], { encoding: 'utf8' });
+        run = spawnSync(process.execPath, ['--check', full], { encoding: 'utf8', windowsHide: true });
       } else if (ext === '.py') {
-        run = spawnSync(process.env.PYTHON || 'python', ['-m', 'py_compile', full], { encoding: 'utf8' });
+        run = spawnSync(process.env.PYTHON || 'python', ['-m', 'py_compile', full], { encoding: 'utf8', windowsHide: true });
       } else if (ext === '.json') {
         try {
           JSON.parse(fs.readFileSync(full, 'utf8'));
@@ -746,7 +746,7 @@ function createLocalExecutor(runtimeContext) {
           clearInterval(interval);
           try {
             if (process.platform === 'win32' && proc.pid) {
-              nodeSpawnSync('taskkill', ['/PID', String(proc.pid), '/T', '/F'], { stdio: 'ignore' });
+              nodeSpawnSync('taskkill', ['/PID', String(proc.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
             } else if (proc.pid) {
               process.kill(-proc.pid, 'SIGKILL');
             }
@@ -854,7 +854,7 @@ function createLocalExecutor(runtimeContext) {
 
         let gitDirArg = [];
         try {
-          const revParse = spawnSync('git', ['rev-parse', '--show-toplevel'], { cwd: cleanRoot, encoding: 'utf8' });
+          const revParse = spawnSync('git', ['rev-parse', '--show-toplevel'], { cwd: cleanRoot, encoding: 'utf8', windowsHide: true });
           if (revParse.status === 0 && revParse.stdout) {
             const gitTop = path.resolve(revParse.stdout.trim());
             const absClean = path.resolve(cleanRoot);
@@ -866,7 +866,7 @@ function createLocalExecutor(runtimeContext) {
         } catch (_) {}
 
         let gitArgs = ['apply', '--3way', '--recount', '--whitespace=nowarn'].concat(gitDirArg).concat([patchFile]);
-        let applyResult = spawnSync('git', gitArgs, { cwd: cleanRoot, encoding: 'utf8' });
+        let applyResult = spawnSync('git', gitArgs, { cwd: cleanRoot, encoding: 'utf8', windowsHide: true });
         try { fs.unlinkSync(patchFile); } catch (_) {}
 
         const outText = (applyResult.stdout || '') + (applyResult.stderr || '');

@@ -587,12 +587,14 @@ async function inspectGeminiTemporaryChatDom(page) {
         if (/temporary|përkohshme/i.test(ph)) indicatorFound = true;
       }
       if (!indicatorFound) {
-        const elements = Array.from(document.querySelectorAll('[role="region"], [role="status"], aside, header, div, span, p, mat-chip, .badge'))
+        const elements = Array.from(document.querySelectorAll('[role="region"], [role="status"], aside, header, main, div, span, p, h1, h2, mat-chip, .badge'))
           .filter(actionable);
         indicatorFound = elements.some(function(el) {
           const t = normalize(el.innerText || el.textContent || '');
-          return (t.includes('temporary chat') || t.includes('bisedë e përkohshme')) &&
-            (t.includes("won't appear") || t.includes('won’t appear') || t.includes('nuk do të ruhet') || t.includes('is on') || t.includes('është aktive') || el.classList.contains('active'));
+          return (
+            (t.includes('temporary chat') || t.includes('bisedë e përkohshme')) &&
+            (t.includes("won't appear") || t.includes("won’t appear") || t.includes("don't appear") || t.includes("don’t appear") || t.includes("aren't used") || t.includes('recent chats') || t.includes('72 hours') || t.includes('nuk do të ruhet') || t.includes('is on') || t.includes('është aktive') || el.classList.contains('active'))
+          ) || t === 'just stopping by?';
         });
       }
 
@@ -662,7 +664,7 @@ async function ensureGeminiTemporaryChat(page, tabId, desiredEnabled, opts) {
     };
   }
 
-  const clickRes = await page.evaluate(function(arg) {
+  let clickRes = await page.evaluate(function(arg) {
     const normalize = function(s) { return String(s || '').toLowerCase().replace(/\s+/g, ' ').trim(); };
     const actionable = function(el) {
       if (!el || !el.isConnected) return false;
@@ -677,7 +679,17 @@ async function ensureGeminiTemporaryChat(page, tabId, desiredEnabled, opts) {
     }) || null;
 
     if (arg.requested) {
-      if (!tempBtn) return { clicked: false, reason: 'TEMPORARY_CHAT_CONTROL_NOT_FOUND' };
+      if (!tempBtn) {
+        const drawerToggle = allButtons.find(function(el) {
+          const label = normalize((el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('data-test-id') || ''));
+          return /main menu|menu kryesore|open sidebar|expand|side-nav/i.test(label);
+        });
+        if (drawerToggle) {
+          drawerToggle.click();
+          return { clicked: false, retryAfterDrawer: true, reason: 'OPENED_DRAWER_FOR_TEMPORARY_CHAT' };
+        }
+        return { clicked: false, reason: 'TEMPORARY_CHAT_CONTROL_NOT_FOUND' };
+      }
       tempBtn.click();
       return { clicked: true, reason: 'CLICKED_TEMPORARY_CHAT_TOGGLE' };
     }
@@ -699,6 +711,28 @@ async function ensureGeminiTemporaryChat(page, tabId, desiredEnabled, opts) {
   }, { requested: requested }).catch(function(err) {
     return { clicked: false, reason: String(err && err.message || err).slice(0, 120) };
   });
+
+  if (clickRes && clickRes.retryAfterDrawer && requested) {
+    await new Promise(function(resolve) { setTimeout(resolve, 400); });
+    clickRes = await page.evaluate(function() {
+      const normalize = function(s) { return String(s || '').toLowerCase().replace(/\s+/g, ' ').trim(); };
+      const actionable = function(el) {
+        if (!el || !el.isConnected) return false;
+        const st = window.getComputedStyle(el);
+        const r = el.getBoundingClientRect();
+        return st.display !== 'none' && st.visibility !== 'hidden' && r.width > 3 && r.height > 3;
+      };
+      const tempBtn = Array.from(document.querySelectorAll('button, [role="button"], [role="switch"], a')).filter(actionable).find(function(el) {
+        const label = normalize((el.getAttribute('aria-label') || '') + ' ' + (el.innerText || el.textContent || ''));
+        return /temporary chat|bisedë e përkohshme/i.test(label);
+      }) || null;
+      if (!tempBtn) return { clicked: false, reason: 'TEMPORARY_CHAT_CONTROL_NOT_FOUND' };
+      tempBtn.click();
+      return { clicked: true, reason: 'CLICKED_TEMPORARY_CHAT_TOGGLE' };
+    }).catch(function(err) {
+      return { clicked: false, reason: String(err && err.message || err).slice(0, 120) };
+    });
+  }
 
   if (!clickRes || !clickRes.clicked) {
     return {
@@ -770,11 +804,13 @@ function createGeminiEngine(runtimeContext) {
       const activeRe = new RegExp(required.activePattern, 'i');
 
       const findTrigger = function() {
-        const candidates = Array.from(document.querySelectorAll('button, [role="button"], [role="combobox"]'))
-          .filter(actionable);
+        const candidates = Array.from(document.querySelectorAll('button[data-test-id*="model"], bard-mode-switcher button, button[aria-haspopup="menu"], button[aria-haspopup="true"], button, [role="button"], [role="combobox"]'))
+          .filter(function(el) {
+            return actionable(el) && !el.closest('[role="menu"], [role="listbox"], .cdk-overlay-pane');
+          });
         return candidates.find(function(el) {
-          const txt = normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || ''));
-          return /currently neon|open mode picker|neon|4 neon|mode picker|deeper analysis/i.test(txt);
+          const txt = normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('data-test-id') || ''));
+          return /currently neon|open mode picker|mode picker|model selector|zgjidh modelin|deeper analysis|4 neon|\bneon\b|currently\s*(?:fast|flash|auto|pro|thinking)/i.test(txt);
         }) || null;
       };
 
@@ -791,10 +827,10 @@ function createGeminiEngine(runtimeContext) {
         const combined = normalize(text + ' ' + aria);
         const isNeonHighAria = /currently\s*neon\s*high/i.test(aria);
         const isNeonHighText = /neon[\s\n]+high/i.test(text);
-        const isNeonLowAria = /currently\s*neon\s*(?:low|fast)/i.test(aria) || /currently\s*(?:flash|auto|quick)/i.test(aria);
-        const isNeonLowText = /neon\s*(?:low|fast)/i.test(text) || /^(?:flash|auto|quick)$/i.test(text.replace(/\s+/g, ' ').trim());
-        const isNeonIdentified = (isNeonHighAria || isNeonHighText || activeRe.test(combined) || /(?:4\s*neon|neon\s*\(high\)|currently\s*neon\b|deeper\s*analysis|\bneon\b)/i.test(combined));
-        const isStrictHigh = isNeonIdentified && !isNeonLowAria && !isNeonLowText;
+        const isNeonLowAria = /currently\s*neon$/i.test(aria) || /currently\s*neon\s*(?:low|fast)/i.test(aria) || /currently\s*(?:flash|auto|quick|low|fast)/i.test(aria);
+        const isNeonLowText = /^neon$/i.test(text.replace(/\s+/g, ' ').trim()) || /\b(?:low|fast|flash|auto|quick)\b/i.test(text);
+        const hasExplicitHigh = isNeonHighAria || isNeonHighText || activeRe.test(combined) || (/\bneon\b/i.test(combined) && /\b(?:high|extra\s+thorough)\b/i.test(combined));
+        const isStrictHigh = hasExplicitHigh && !isNeonLowAria && !isNeonLowText;
         return {
           text: text,
           aria: aria,
@@ -834,16 +870,46 @@ function createGeminiEngine(runtimeContext) {
         }
 
         neonOption.click();
-        await sleep(1000);
+        await sleep(800);
 
-        // Nese ekziston Thinking Level menuitem ne overlay, kliko High
-        const highOption = Array.from(document.querySelectorAll('gem-menu-item, [role="menuitemradio"], [role="menuitem"], [role="option"]')).filter(actionable).find(function(el) {
-          const txt = normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || ''));
-          return /high.*thorough|extra thorough/i.test(txt);
-        });
-        if (highOption) {
-          highOption.click();
+        // Siguro përzgjedhjen e Thinking Level -> High Extra thorough (RREGULL I KYÇUR)
+        const findThinkItem = function() {
+          return Array.from(document.querySelectorAll('[role="menuitemradio"], [role="menuitem"], [role="option"], gem-menu-item, button'))
+            .filter(actionable)
+            .find(function(el) {
+              const txt = normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || ''));
+              return /thinking level|reasoning level|niveli i mendimit/i.test(txt);
+            }) || null;
+        };
+        let thinkItem = findThinkItem();
+        if (!thinkItem) {
+          const directHigh = Array.from(document.querySelectorAll('gem-menu-item, [role="menuitemradio"], [role="menuitem"], [role="option"]'))
+            .filter(actionable)
+            .find(function(el) {
+              const txt = normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || ''));
+              return /high.*thorough|extra\s*thorough/i.test(txt) && !/\b(?:low|fast)\b/i.test(txt);
+            });
+          if (!directHigh) {
+            trigger = findTrigger();
+            if (trigger) { trigger.click(); await sleep(500); }
+            thinkItem = findThinkItem();
+          } else {
+            directHigh.click();
+            await sleep(500);
+          }
+        }
+        if (thinkItem) {
+          thinkItem.click();
           await sleep(500);
+          const subOptions = Array.from(document.querySelectorAll('gem-menu-item, [role="menuitemradio"], [role="menuitem"], [role="option"]')).filter(actionable);
+          const highOption = subOptions.find(function(el) {
+            const txt = normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || ''));
+            return (/high.*thorough|extra\s*thorough|(^|\s)high(\s|$)/i.test(txt)) && !/\b(?:low|fast)\b/i.test(txt);
+          });
+          if (highOption) {
+            highOption.click();
+            await sleep(500);
+          }
         }
 
         document.querySelectorAll('.cdk-overlay-backdrop').forEach(function(b) { b.click(); });

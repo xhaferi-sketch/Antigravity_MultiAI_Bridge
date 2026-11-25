@@ -83,6 +83,8 @@ function createCopilotEngine(runtimeContext) {
 
   const tabAuthStatus = runtimeContext.tabAuthStatus || {};
   const tabActiveModel = runtimeContext.tabActiveModel || {};
+  const tabDiscoveredModels = runtimeContext.tabDiscoveredModels || {};
+  const copilotModelReceipts = runtimeContext.copilotModelReceipts || {};
   const captureSupportEvidence = runtimeContext.captureSupportEvidence || (async function() {});
 
   async function checkAuth(page, tabKey) {
@@ -92,6 +94,7 @@ function createCopilotEngine(runtimeContext) {
   async function ensureCopilotGpt56Model(targetFrame, tabKey, opts) {
     opts = opts || {};
     const contract = opts.contract || COPILOT_REQUIRED_MODEL;
+    if (tabKey && copilotModelReceipts) copilotModelReceipts[tabKey] = null;
     const result = await targetFrame.evaluate(async function(req) {
       const visible = function(el) {
         if (!el) return false;
@@ -99,26 +102,38 @@ function createCopilotEngine(runtimeContext) {
         return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 4 && r.height > 4;
       };
       const text = function(el) {
-        return ((el && el.innerText) || '') + ' ' + ((el && el.getAttribute('aria-label')) || '');
+        return (((el && el.innerText) || '') + ' ' + ((el && el.getAttribute('aria-label')) || '')).replace(/\s+/g, ' ').trim();
       };
       const selectors = 'button[aria-label*="model" i],button[aria-label*="mode" i],[data-testid*="model-switcher" i],[data-testid*="mode-selector" i],.fui-Dropdown';
       let button = Array.from(document.querySelectorAll(selectors)).find(visible) || null;
+      const isForbiddenWeakModel = function(val) {
+        const lower = String(val || '').toLowerCase();
+        return /\b(auto|quick\s*response|fast|flash|lite|mini|basic|standard)\b/i.test(lower);
+      };
       const requiredModelVisible = function(val) {
         const lower = String(val || '').toLowerCase();
-        return lower.includes('gpt-5.6') || lower.includes('5.6 sol think') || lower.includes('sol think');
+        return (lower.includes('gpt-5.6') || lower.includes('5.6 sol think') || lower.includes('sol think')) && !isForbiddenWeakModel(lower);
       };
-      if (button && requiredModelVisible(text(button))) {
-        const reasoningLocked = text(button).toLowerCase().includes(req.reasoningLabel.toLowerCase());
-        return { ok: true, active: text(button).trim(), reasoningLocked: reasoningLocked };
+      const hasDeepReasoningSignal = function(val) {
+        const lower = String(val || '').toLowerCase();
+        if (lower.includes(req.reasoningLabel.toLowerCase()) || /\bdeep\b|think\s*deeper|extra\s*thorough|\bhigh\b/i.test(lower)) return true;
+        return Array.from(document.querySelectorAll('button,[role="switch"],[role="menuitemradio"],[role="option"]')).filter(visible).some(function(el) {
+          const t = text(el).toLowerCase();
+          const active = el.getAttribute('aria-pressed') === 'true' || el.getAttribute('aria-checked') === 'true' || el.classList.contains('active') || el.classList.contains('is-active');
+          return active && /think\s*deeper|deep|high/i.test(t);
+        });
+      };
+      if (button && requiredModelVisible(text(button)) && hasDeepReasoningSignal(text(button))) {
+        return { ok: true, active: text(button), reasoningLocked: true };
       }
       if (!button) {
         const opener = Array.from(document.querySelectorAll('button')).filter(visible).find(function(el) {
-          return /model|gpt|think/i.test(text(el));
+          return /model|gpt|think|auto|quick/i.test(text(el));
         });
         if (opener) {
           opener.click();
           await new Promise(function(resolve) { setTimeout(resolve, 350); });
-          button = Array.from(document.querySelectorAll(selectors)).find(visible) || button;
+          button = Array.from(document.querySelectorAll(selectors)).find(visible) || opener;
         }
       }
       if (button) {
@@ -128,25 +143,26 @@ function createCopilotEngine(runtimeContext) {
         const searchScope = menuContainer || document;
         const options = Array.from(searchScope.querySelectorAll('[role="option"],[role="menuitemradio"],[role="menuitem"],[role="menuitemcheckbox"],.fui-MenuItem,.fui-Option,button,div')).filter(function(el) {
           if (!visible(el)) return false;
-          const t = text(el).trim();
+          const t = text(el);
           return t.length > 2 && t.length < 100;
         });
-        const available = options.map(function(o) { return text(o).trim(); }).filter(Boolean).slice(0, 25);
+        const available = options.map(function(o) { return text(o); }).filter(Boolean).slice(0, 25);
         const model = options.find(function(el) {
           const value = text(el).toLowerCase();
+          if (isForbiddenWeakModel(value)) return false;
           return (value.includes('gpt-5.6') && (value.includes('sol think') || value.includes('think deeper'))) || value.includes(req.modelLabel.toLowerCase()) || value.includes('5.6 sol think') || value.includes('sol think') || value.includes('think deeper');
         });
         if (model) {
           model.click();
           await new Promise(function(resolve) { setTimeout(resolve, 500); });
           button = Array.from(document.querySelectorAll(selectors)).find(visible) || button;
-        } else if (text(button).toLowerCase().includes('auto') || text(button).toLowerCase().includes('model')) {
-          return { ok: true, active: text(button).trim(), reasoningLocked: false };
         } else {
-          return { ok: false, reason: 'COPILOT_REQUIRED_MODEL_UNAVAILABLE', active: text(button).trim(), available: available, hasMenu: Boolean(menuContainer) };
+          return { ok: false, reason: 'COPILOT_REQUIRED_MODEL_UNAVAILABLE', active: text(button), available: available, hasMenu: Boolean(menuContainer) };
         }
       }
-      if (!button || (!requiredModelVisible(text(button)) && !text(button).toLowerCase().includes('auto'))) return { ok: false, reason: 'COPILOT_REQUIRED_MODEL_NOT_ACTIVE', active: button ? text(button).trim() : 'missing' };
+      if (!button || !requiredModelVisible(text(button))) {
+        return { ok: false, reason: 'COPILOT_REQUIRED_MODEL_NOT_ACTIVE', active: button ? text(button) : 'missing' };
+      }
       const reasoningControls = Array.from(document.querySelectorAll('button,[role="option"],[role="menuitemradio"],[role="menuitem"]')).filter(visible);
       let reasoning = reasoningControls.find(function(el) {
         return String(text(el)).toLowerCase().includes(req.reasoningLabel.toLowerCase());
@@ -163,18 +179,26 @@ function createCopilotEngine(runtimeContext) {
       }
       if (reasoning && typeof reasoning.click === 'function') {
         reasoning.click();
-        await new Promise(function(resolve) { setTimeout(resolve, 300); });
+        await new Promise(function(resolve) { setTimeout(resolve, 350); });
       }
       const finalButton = Array.from(document.querySelectorAll(selectors)).find(visible) || button;
-      const finalActive = text(finalButton).trim();
-      return { ok: requiredModelVisible(finalActive), active: finalActive, reasoningLocked: finalActive.toLowerCase().includes(req.reasoningLabel.toLowerCase()) };
+      const finalActive = text(finalButton);
+      const reasoningLocked = hasDeepReasoningSignal(finalActive);
+      return { ok: requiredModelVisible(finalActive) && reasoningLocked, reason: !reasoningLocked ? 'COPILOT_REASONING_NOT_DEEP' : undefined, active: finalActive, reasoningLocked: reasoningLocked };
     }, contract);
 
-    if (!result.ok) {
-      const availInfo = Array.isArray(result.available) && result.available.length ? (', available: [' + result.available.join(' | ') + ']') : '';
-      throw new Error('COPILOT_MODEL_LOCK_FAILED: ' + result.reason + ' (active: ' + result.active + availInfo + ')');
+    if (!result || !result.ok || result.reasoningLocked === false) {
+      const availInfo = Array.isArray(result && result.available) && result.available.length ? (', available: [' + result.available.join(' | ') + ']') : '';
+      const reason = (result && result.reason) || (result && result.reasoningLocked === false ? 'COPILOT_REASONING_NOT_DEEP' : 'COPILOT_REQUIRED_MODEL_NOT_ACTIVE');
+      throw new Error('COPILOT_MODEL_LOCK_FAILED: ' + reason + ' (active: ' + ((result && result.active) || 'unknown') + availInfo + ')');
     }
-    if (tabKey) tabActiveModel[tabKey] = contract.displayLabel;
+    if (tabKey) {
+      tabActiveModel[tabKey] = contract.displayLabel;
+      tabDiscoveredModels[tabKey] = result.active || contract.displayLabel;
+      if (copilotModelReceipts) {
+        copilotModelReceipts[tabKey] = { verified: true, family: contract.family, observedLabel: result.active || contract.displayLabel, reasoningLocked: true };
+      }
+    }
     return contract.displayLabel;
   }
 
