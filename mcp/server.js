@@ -1565,7 +1565,12 @@ async function runWebDispatchWithRetryPolicy(opts){const dispatchId=opts.dispatc
         const tempRes = await ensureCopilotTemporaryChat(targetFrame, tabKey, desiredTemp);
         copilotTemporaryChatStatus[tabKey] = tempRes || { active: Boolean(tempRes && tempRes.active), verified: false, status: 'MISMATCH_OR_UNVERIFIED' };
         if ((desiredTemp && (!tempRes || !tempRes.verified || !tempRes.active)) || (!desiredTemp && (!tempRes || !tempRes.verified || tempRes.active !== false))) {
-          await captureSupportEvidence(page, projectRoot, tabKey, 'TEMPORARY_CHAT_UNVERIFIED', 'Copilot Temporary Chat u kerkua ' + (desiredTemp ? 'ON' : 'OFF') + ' por deshtoi verifikimi ne DOM: ' + JSON.stringify(tempRes || {}));
+          if (desiredTemp && tempRes && tempRes.status === 'CONTROL_NOT_FOUND') {
+            copilotTemporaryChatStatus[tabKey] = Object.assign({}, tempRes, { status: 'UNSUPPORTED_IN_TENANT' });
+            console.error('[TEMP_CHAT_UNSUPPORTED] tabKey=' + tabKey + ' reason=' + (tempRes.reason || 'COPILOT_TOGGLE_NOT_FOUND'));
+          } else {
+            await captureSupportEvidence(page, projectRoot, tabKey, 'TEMPORARY_CHAT_UNVERIFIED', 'Copilot Temporary Chat u kerkua ' + (desiredTemp ? 'ON' : 'OFF') + ' por deshtoi verifikimi ne DOM: ' + JSON.stringify(tempRes || {}));
+          }
         }
         targetFrame = findChatFrameOrPage(page);
       }
@@ -2082,18 +2087,20 @@ function resolveTargetProjectAndRequest(payload) {
   payload = payload || {};
   let rawRoot = String(payload.projectRoot || payload.project_root || '').trim();
   let req = String(payload.userRequest || payload.user_request || payload.prompt || '').trim();
+  let hasExplicitRoot = Boolean(rawRoot && path.resolve(rawRoot).toLowerCase() !== PLUGIN_ROOT.toLowerCase());
 
   const parsedDirective = parseRootDirectiveAndRequest(req);
   if (parsedDirective.extractedRoot) {
     if (!rawRoot || path.resolve(rawRoot).toLowerCase() === PLUGIN_ROOT.toLowerCase()) {
       rawRoot = parsedDirective.extractedRoot;
+      hasExplicitRoot = true;
     }
     req = parsedDirective.cleanedRequest;
   }
 
   let cleanRoot = rawRoot ? path.resolve(rawRoot) : '';
 
-  if (!cleanRoot || cleanRoot.toLowerCase() === PLUGIN_ROOT.toLowerCase() || !fs.existsSync(cleanRoot)) {
+  if (!cleanRoot || !fs.existsSync(cleanRoot) || (!hasExplicitRoot && cleanRoot.toLowerCase() === PLUGIN_ROOT.toLowerCase())) {
     const activeRoots = Object.keys(activeCycleJobs).filter(function(k) { return activeCycleJobs[k] && activeCycleJobs[k].running; });
     if (activeRoots.length > 0) {
       cleanRoot = activeRoots[0];
@@ -2160,12 +2167,13 @@ if (action !== 'run_full_cycle' && action !== 'check_cycle_progress' && !payload
 }
 if (action === 'run_full_cycle') {
   return await getAutopilotEngine().runFullCycle(cleanRoot, userRequest, {
-    blocking: payload.blocking !== false,
+    blocking: payload.blocking === true,
+    maxSliceMs: Number(payload.waitMs || payload.maxSliceMs) || 22000,
     forceReplan: payload.forceReplan === true
   });
 }
 if (action === 'check_cycle_progress') {
-  return await getAutopilotEngine().checkCycleProgress(cleanRoot, payload.waitMs || payload.maxSliceMs);
+  return await getAutopilotEngine().checkCycleProgress(cleanRoot, Number(payload.waitMs || payload.maxSliceMs) || 45000);
 }
 if (action === 'pack_workspace') {
   const info = getAutopilotEngine().packWorkspace(cleanRoot, payload.mode || PACK_MODES.PLANNING_FULL);
@@ -2681,22 +2689,27 @@ return {
 tools: [
 {
 name: 'run_full_cycle',
-description: 'MJETI KRYESOR AUTOPILOT: Ekzekuton ciklin autonom (pack -> planner -> coder -> apply -> reviewer) mbi projektin aktiv te Dashboard-it ose mbi rrugen e dhene pas `root <path>`. Nese projectRoot lihet bosh, perdor automatikisht projektin aktiv ne Dashboard (4321). Nese userRequest permban nje rruge skedari .md/.txt ose tekst, lexohet automatikisht.',
+description: 'MJETI KRYESOR AUTOPILOT: Nis ciklin autonom (pack -> planner -> coder -> apply -> reviewer) mbi projektin aktiv te Dashboard-it ose mbi rrugen e dhene pas `root <path>`, duke kthyer STILL_RUNNING_CALL_CHECK_PROGRESS brenda ~22s per punet e gjata (zero timeout MCP). Nese projectRoot lihet bosh, perdor automatikisht projektin aktiv ne Dashboard (4321).',
 inputSchema: {
 type: 'object',
 properties: {
 projectRoot: { type: 'string', description: 'Opsionale: rruga e projektit (nese lihet bosh, merret projekti aktiv i konfiguruar ne Dashboard)' },
-userRequest: { type: 'string', description: 'Kerkesa e punes (tekst i lire, rruge skedari .md/.txt, ose `root <path> <kerkesa>`)' }
+userRequest: { type: 'string', description: 'Kerkesa e punes (tekst i lire, rruge skedari .md/.txt, ose `root <path> <kerkesa>`)' },
+blocking: { type: 'boolean', description: 'Opsionale: default false (ekzekutim me feta asinkrone per te shmangur timeout MCP).' },
+waitMs: { type: 'number', description: 'Opsionale: gjatesia e fetes se pare ne ms (default 22000).' }
 },
 required: []
 }
 },
 {
 name: 'check_cycle_progress',
-description: 'Pret ecurine e ciklit aktiv ne menyre deterministe derisa te ktheje CYCLE_COMPLETED. Thirre ne zinxhir nese merr STILL_RUNNING. Mos perdor kurre terminal!',
+description: 'Pret ecurine e ciklit aktiv ne feta ~45s derisa te ktheje CYCLE_COMPLETED / PASSED / FAILED. Thirre ne zinxhir nese merr STILL_RUNNING_CALL_CHECK_PROGRESS. Mos perdor kurre terminal!',
 inputSchema: {
 type: 'object',
-properties: { projectRoot: { type: 'string', description: 'Rruga e projektit (opsionale)' } },
+properties: {
+projectRoot: { type: 'string', description: 'Rruga e projektit (opsionale)' },
+waitMs: { type: 'number', description: 'Opsionale: gjatesia e fetes ne ms (default 45000).' }
+},
 required: []
 }
 },

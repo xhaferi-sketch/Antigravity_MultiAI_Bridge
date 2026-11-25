@@ -2809,15 +2809,7 @@ function createAutopilotEngine(deps) {
       if (job.error) throw new Error(job.error);
       return job.result;
     }
-    if (!maxSliceMs && job.promise) {
-      try {
-        return await job.promise;
-      } catch (err) {
-        if (job.result) return job.result;
-        throw err;
-      }
-    }
-    return await waitJobSlice(cleanRoot, maxSliceMs || 180000);
+    return await waitJobSlice(cleanRoot, maxSliceMs || 45000);
   }
 
   return {

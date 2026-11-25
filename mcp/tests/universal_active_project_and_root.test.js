@@ -54,3 +54,25 @@ test('setActiveRegistryProject and pickDefaultActiveProjectRoot prioritize expli
   assert.equal(reg.activeProject, path.resolve(projA));
   assert.equal(pickDefaultActiveProjectRoot(reg, bridgeRoot), path.resolve(projA));
 });
+
+test('checkCycleProgress returns STILL_RUNNING_CALL_CHECK_PROGRESS in bounded slice without hanging forever', async () => {
+  const { createAutopilotEngine } = require('../pipeline/autopilot_engine.js');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-slice-test-'));
+  const engine = createAutopilotEngine({
+    sleepFn: (ms) => new Promise((r) => setTimeout(r, Math.min(ms, 20)))
+  });
+
+  engine.activeCycleJobs[path.resolve(tmp)] = {
+    running: true,
+    phase: 'PLANNING_SINGLE_PASS',
+    startedAt: Date.now(),
+    promise: new Promise(() => {})
+  };
+
+  const t0 = Date.now();
+  const res = await engine.checkCycleProgress(tmp, 60);
+  const elapsed = Date.now() - t0;
+  assert.equal(res.status, 'STILL_RUNNING_CALL_CHECK_PROGRESS');
+  assert.equal(res.nextRequiredToolCall, 'check_cycle_progress');
+  assert.ok(elapsed < 1000);
+});
