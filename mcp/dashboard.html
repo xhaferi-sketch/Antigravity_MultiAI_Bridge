@@ -57,16 +57,17 @@
 
       <!-- Grupi 3: Copilot M365 & RAM Control -->
       <div>
-        <div style="font-size: 12px; font-weight: bold; color: #c4b5fd; margin-bottom: 6px;">🟣 MICROSOFT 365 COPILOT & KONTROLLI I RAM-IT:</div>
+        <div style="font-size: 12px; font-weight: bold; color: #c4b5fd; margin-bottom: 6px;">🟣 MICROSOFT 365 COPILOT (Profile të Izoluara Web 1 / Web 2) & RAM:</div>
         <div style="display:flex; gap:10px; flex-wrap:wrap;">
-          <button style="background: #6d28d9;" onclick="loginProfile('m365')">🔑 Login M365 (Web 1 & Web 2)</button>
+          <button style="background: #6d28d9;" onclick="loginProfile('m365_web1')">🔑 Login Copilot Web 1 (m365_web1)</button>
+          <button style="background: #7c3aed;" onclick="loginProfile('m365_web2')">🔑 Login Copilot Web 2 (m365_web2)</button>
           <button class="warn" onclick="killAll()">💀 Mbyll Të Gjitha Dritaret (Liro RAM)</button>
         </div>
       </div>
     </div>
   </div>
 
-  <h2>📡 Statusi Live i 5 Fletëve (Mutex Serialized Pool)</h2>
+  <h2>📡 Statusi Live i Fletëve & Profileve të Izoluara (Mutex Pool)</h2>
   <div id="tabsGrid" class="grid"></div>
 
   <div class="card" style="margin-bottom: 20px;">
@@ -128,7 +129,11 @@
     }
 
     function escapeAttr(str) {
-      return String(str || '').replace(/"/g, '&quot;');
+      return String(str || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    function escapeHtml(str) {
+      return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     }
 
     function formatTempChatBadge(t) {
@@ -141,12 +146,19 @@
     let lastProjectsJson = '';
 
     async function loadState() {
-      const res = await fetch('/api/state');
-      const data = await res.json();
+      let data = null;
+      try {
+        const res = await fetch('/api/state');
+        if (!res.ok) return;
+        data = await res.json();
+      } catch (_) {
+        return;
+      }
 
       document.getElementById('tabsGrid').innerHTML = Object.entries(data.tabs).map(([k, t]) => {
         const isErr = t.auth === 'AUTH_EXPIRED' || t.auth === 'BROWSER_ERROR';
         const badgeCls = isErr ? 'err' : (t.open ? 'ok' : 'idle');
+        const profileName = t.profileName || k;
         const isTempChatSupported = SUPPORTED_TEMP_CHAT_TABS.has(k);
         if (isTempChatSupported && !inFlightTempChat[k]) {
           lastConfirmedTempChat[k] = Boolean(t.temporaryChatRequested);
@@ -156,15 +168,16 @@
         return `
           <div class="card">
             <div class="row">
-              <strong>${k.toUpperCase()}</strong>
-              <span class="badge ${badgeCls}">${t.open ? 'HAPUR' : 'NË GJUMË'} | ${t.auth}</span>
+              <strong>${escapeHtml(k.toUpperCase())}</strong>
+              <span class="badge ${badgeCls}">${t.open ? 'HAPUR' : 'NË GJUMË'} | ${escapeHtml(t.auth)}</span>
             </div>
-            <div style="font-size:13px; margin:4px 0;">Modeli aktiv: <b>${t.model || '-'}</b></div>
-            <div style="font-size:11px; color:#94a3b8; margin:4px 0; word-break:break-word;">Modelet në ueb: <i>${t.discoveredModels && t.discoveredModels !== '-' ? t.discoveredModels : 'Ende pa zbuluar'}</i></div>
-            <div style="font-size:13px;">Projekti aktiv: <b>${t.activeProject}</b></div>
+            <div style="font-size:11px; color:#93c5fd; margin:2px 0;">Profili i izoluar: <code>.profiles/${escapeHtml(profileName)}</code> • ${escapeHtml(t.connectionLabel || (t.open ? 'E Lidhur' : 'E Shkëputur'))}</div>
+            <div style="font-size:13px; margin:4px 0;">Modeli aktiv: <b>${escapeHtml(t.model || '-')}</b></div>
+            <div style="font-size:11px; color:#94a3b8; margin:4px 0; word-break:break-word;">Modelet në ueb: <i>${escapeHtml(t.discoveredModels && t.discoveredModels !== '-' ? t.discoveredModels : 'Ende pa zbuluar')}</i></div>
+            <div style="font-size:13px;">Projekti aktiv: <b>${escapeHtml(t.activeProject)}</b></div>
             <div style="margin-top:10px; display:flex; gap:8px;">
-              <button style="flex:1; background: #0284c7;" onclick="loginProfile('${k}')">👁️ Hap Dritaren</button>
-              <button class="sec" style="flex:1;" onclick="resetTab('${k}')">🧹 Force New Chat</button>
+              <button style="flex:1; background: #0284c7;" onclick="loginProfile('${escapeAttr(k)}')">👁️ Hap / Login (${escapeHtml(profileName)})</button>
+              <button class="sec" style="flex:1;" onclick="resetTab('${escapeAttr(k)}')">🧹 Force New Chat</button>
             </div>
             ${isTempChatSupported ? `
             <div style="margin-top:10px; padding:6px 10px; background:rgba(255,255,255,0.03); border-radius:6px; border:1px solid rgba(255,255,255,0.08); display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap;">
@@ -173,7 +186,7 @@
                 <span>Aktivizo Temporary Chat</span>
               </label>
               <span class="badge ${tcBadge.cls}" data-temp-chat-badge="${k}" title="${escapeAttr(t.temporaryChatReason || '')}">
-                ${tcBadge.text}
+                ${escapeHtml(tcBadge.text)}
               </span>
             </div>
             ` : ''}
@@ -191,11 +204,17 @@
             : (st.lastStatus === 'ERROR' || st.lastStatus === 'FAILED_REVIEW' ? 'err' : 'idle');
           const saveCall = `saveRouting('${p.projectRoot.replace(/\\/g, '/')}', ${i})`;
 
+          const isActiveProject = Boolean(p.isActive || (data.activeProject && p.projectRoot && data.activeProject.toLowerCase() === p.projectRoot.toLowerCase()));
+          const activeCall = `setActiveProject('${p.projectRoot.replace(/\\/g, '/')}')`;
+
           return `
-            <div class="card">
+            <div class="card" style="${isActiveProject ? 'border-color:#22c55e; box-shadow:0 0 0 1px rgba(34,197,94,0.35);' : ''}">
               <div class="row">
                 <h3 style="margin:0;">📁 ${p.projectName}</h3>
-                <span class="badge ${stBadge}">${st.phase || 'IDLE'} (Retry: ${st.retryCount || 0}/2)</span>
+                <div style="display:flex; gap:6px; align-items:center;">
+                  ${isActiveProject ? '<span class="badge ok">⭐ PROJEKTI AKTIV</span>' : ''}
+                  <span class="badge ${stBadge}">${st.phase || 'IDLE'} (Retry: ${st.retryCount || 0}/2)</span>
+                </div>
               </div>
               <small style="color:#94a3b8; word-break:break-all;">${p.projectRoot}</small>
 
@@ -216,6 +235,7 @@
               <input class="full" id="tst_${i}" value="${escapeAttr(p.testCmd)}" onchange="${saveCall}" placeholder="p.sh. npm test" />
 
               <button id="btn_save_${i}" style="width:100%; margin-top:12px;" onclick="${saveCall}">💾 Ruaj Konfigurimin</button>
+              ${!isActiveProject ? `<button style="width:100%; margin-top:6px; background:#0f766e;" onclick="${activeCall}">⭐ Vendos si Projekt Aktiv</button>` : ''}
               <button style="width:100%; margin-top:6px; background:#475569; border-color:#64748b;" onclick="purgeExchange('${p.projectRoot.replace(/\\/g, '/')}')">🧹 Pastro Mbetjet e Shkëmbimit</button>
               <button style="width:100%; margin-top:6px; background:#b91c1c; border-color:#ef4444;" onclick="deleteProject('${p.projectRoot.replace(/\\/g, '/')}', '${escapeAttr(p.projectName)}')">🗑️ Fshi Projektin</button>
             </div>
@@ -249,6 +269,16 @@
         b.innerText = "✅ U Ruajt me Sukses!";
         setTimeout(() => { b.style.background = ""; b.innerText = t; }, 2000);
       }
+      loadState();
+    }
+
+    async function setActiveProject(projectRoot) {
+      await fetch('/api/set-active-project', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectRoot })
+      });
+      lastProjectsJson = '';
       loadState();
     }
 
@@ -373,7 +403,7 @@
     }
 
     loadState();
-    setInterval(()=>{const a=document.activeElement;if(!a||(a.tagName!=="SELECT"&&a.tagName!=="INPUT"))loadState();},5000);
+    setInterval(()=>{const a=document.activeElement;if(!a||(a.tagName!=="SELECT"&&a.tagName!=="INPUT"&&a.tagName!=="TEXTAREA"))loadState();},5000);
   </script>
 </body>
 </html>

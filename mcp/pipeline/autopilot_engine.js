@@ -7,6 +7,9 @@ const { spawn, spawnSync } = require('node:child_process');
 
 function notifyWhatsApp(msg) {
   try {
+    if (process.env.ANTIGRAVITY_RUN_CYCLE_NOTIFY !== '1') {
+      return;
+    }
     if (process.env.NODE_ENV === 'test' || process.execArgv.includes('--test') || process.argv.some(a => String(a).includes('test'))) {
       return;
     }
@@ -1009,8 +1012,8 @@ function getBundleAttachmentAndNote(projectRoot, targetEngine, opts) {
 function resolveAndEmbedExternalFiles(userRequest) {
   if (!userRequest || typeof userRequest !== 'string') return '';
   let embedded = '';
-  const quotedRegex = /["']([A-Za-z]:\\[^"'\r\n*?<>|]+|\/[^"'\r\n]+)["']/g;
-  const extRegex = /(?:[A-Za-z]:\\[^"'\r\n\t*?<>|]+?\.(?:txt|md|yaml|yml|json|py|js|ts|sh|ps1|csv|xml|html|zip|diff|patch)|\/[^"'\s\r\n\t]+?\.(?:txt|md|yaml|yml|json|py|js|ts|sh|ps1|csv|xml|html|zip|diff|patch))\b/gi;
+  const quotedRegex = /["']([A-Za-z]:[\\/][^"'\r\n*?<>|]+|\/[^"'\r\n]+)["']/g;
+  const extRegex = /(?:[A-Za-z]:[\\/][^"'\r\n\t*?<>|]+?\.(?:txt|md|yaml|yml|json|py|js|ts|sh|ps1|csv|xml|html|zip|diff|patch)|\/[^"'\s\r\n\t]+?\.(?:txt|md|yaml|yml|json|py|js|ts|sh|ps1|csv|xml|html|zip|diff|patch))\b/gi;
 
   const candidatePaths = [];
   let qMatch;
@@ -2208,7 +2211,6 @@ function createAutopilotEngine(deps) {
     };
 
     try {
-      notifyWhatsApp('[HERMES /run-cycle] Nisja: Fillon cikli për ' + path.basename(cleanRoot));
       const routing = ensureProjectSetup(cleanRoot);
       if (!routing.roles) {
         routing.roles = {
@@ -2254,7 +2256,6 @@ function createAutopilotEngine(deps) {
           : promptBase;
 
         if (totalRelevantSourceBytes <= CHUNK_ENGINE_LIMITS.planningSafe) {
-          notifyWhatsApp('[HERMES /run-cycle] Faza PLANNER: Filloi (Single-pass)');
           job.phase = 'PLANNING_SINGLE_PASS';
           const relevant = [];
           for (const f of scan.files.filter(function(x) { return x.generatedScore === 0; })) {
@@ -2337,7 +2338,6 @@ function createAutopilotEngine(deps) {
         planText = cacheCheck.planText;
         currentPlanFingerprint = cacheCheck.planFingerprint;
         reusedCachedPlan = true;
-        notifyWhatsApp('[HERMES /run-cycle] Faza PLANNER: E KALUAR (Plan ekzistues i verifikuar me fingerprint)');
       } else {
         if (cacheCheck.reason !== 'PLAN_MISSING') {
           invalidateStaleCycleArtifacts(cleanRoot, cacheCheck.reason, currentRequestFingerprint, writeProjectState);
@@ -2424,9 +2424,6 @@ function createAutopilotEngine(deps) {
         const saved = persistFreshPlan(planText);
         planText = saved.wrapped;
         currentPlanFingerprint = saved.planFingerprint;
-        if (job.phase.startsWith('PLANNING')) {
-          notifyWhatsApp('[HERMES /run-cycle] Faza PLANNER: SUKSES (Plan i vlefshëm)');
-        }
       }
 
       job.planFingerprint = currentPlanFingerprint;
@@ -2503,7 +2500,6 @@ function createAutopilotEngine(deps) {
         if (cpCheck.verified && normalizedTargets.length > 0 && verifiedTargets.length === normalizedTargets.length) {
           verifiedTargets.forEach(function(t) { allWrittenFilesSet.add(t); });
           job.completed = i + 1;
-          notifyWhatsApp('[HERMES /run-cycle] Faza CODER: Batch ' + (i + 1) + '/' + batches.length + ' I KALUAR (I verifikuar)');
           continue;
         }
 
@@ -2518,7 +2514,6 @@ function createAutopilotEngine(deps) {
         }
 
         job.phase = 'CODING_BATCH ' + (i + 1) + '/' + batches.length;
-        notifyWhatsApp('[HERMES /run-cycle] Faza CODER: Filloi (Batch ' + (i + 1) + '/' + batches.length + ')');
         const receipts = await executeBatchWithRecovery(batches[i], state, routing, job, { batchIndex: i });
         for (const receipt of receipts) {
           batchReceipts.push(receipt);
@@ -2572,13 +2567,10 @@ function createAutopilotEngine(deps) {
           state.changedFiles.push(...(receipt.filesWritten || []));
         }
         job.completed = i + 1;
-        notifyWhatsApp('[HERMES /run-cycle] Faza CODER: Batch ' + (i + 1) + '/' + batches.length + ' SUKSES');
       }
-      notifyWhatsApp('[HERMES /run-cycle] Faza CODER: SUKSES (Të gjitha batch-et)');
 
       let allWrittenFiles = Array.from(allWrittenFilesSet).sort();
       job.phase = 'FINAL_APPLY_AND_TEST';
-      notifyWhatsApp('[HERMES /run-cycle] Faza APPLY: Filloi (Build dhe Quick Checks)');
       let finalChecks = await executor.runFinalBuildAndTests(cleanRoot);
       writeFileAtomic(logPath, JSON.stringify(finalChecks, null, 2));
 
@@ -2605,7 +2597,6 @@ function createAutopilotEngine(deps) {
         const mentioned = extractTargetsFromError(errorText, knownTargets);
         if (!mentioned.length) break;
         job.phase = 'INTEGRATION_REPAIR';
-        notifyWhatsApp('[HERMES /run-cycle] Faza APPLY: Riparim integrimi (Raundi ' + repairRound + ')');
         state.lastErrorReceipt = 'FINAL_APPLY_AND_TEST_FAILED (round ' + repairRound + '):' + NL + truncateUtf8(errorText, 12000);
         const repairBatch = { batchId: 'INTEGRATION-REPAIR-' + repairRound, targets: mentioned.slice(0, 2), halvingLevel: 1 };
         const receipts = await executeBatchWithRecovery(repairBatch, state, routing, job, { compact: true, singleRetry: true });
@@ -2632,7 +2623,6 @@ function createAutopilotEngine(deps) {
       }
 
       if (finalChecks.status !== 'CHECK_PASSED') {
-        notifyWhatsApp('[HERMES /run-cycle] Faza APPLY: DËSHTIM' + (environmentErrorDetected ? ' (Mungon vegla/SDK mjedisi)' : ''));
         writeProjectState(cleanRoot, {
           phase: 'BUILD_FAILED',
           lastStatus: environmentErrorDetected ? 'ENVIRONMENT_TOOLING_FAILED' : 'FINAL_APPLY_AND_TEST_FAILED',
@@ -2642,11 +2632,8 @@ function createAutopilotEngine(deps) {
         });
         throw new Error(environmentErrorDetected ? ('ENVIRONMENT_TOOLING_FAILED: ' + truncateUtf8(environmentErrorDetected, 400)) : 'FINAL_APPLY_AND_TEST_FAILED');
       }
-      notifyWhatsApp('[HERMES /run-cycle] Faza APPLY: SUKSES');
-
       allWrittenFiles = Array.from(allWrittenFilesSet).sort();
       job.phase = 'REVIEWING';
-      notifyWhatsApp('[HERMES /run-cycle] Faza REVIEWER: Filloi');
       let diffStdout = '';
       try {
         const diffResult = spawnSyncFn('git', ['diff', '--', ...allWrittenFiles], { cwd: cleanRoot, encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true });
@@ -2757,8 +2744,6 @@ function createAutopilotEngine(deps) {
 
       job.running = false;
       job.phase = approved ? 'COMPLETED' : 'FAILED_REVIEW';
-      notifyWhatsApp('[HERMES /run-cycle] Faza REVIEWER: ' + (approved ? 'SUKSES (PASSED)' : 'DËSHTIM (CHANGES_REQUIRED)'));
-      notifyWhatsApp('[HERMES /run-cycle] PËRFUNDOI: STATUS ' + (approved ? 'PASSED' : 'FAILED'));
       job.result = {
         status: approved ? 'CYCLE_COMPLETED' : 'REVIEW_FAILED',
         verdict: approved ? 'APPROVED' : 'CHANGES_REQUIRED',
@@ -2777,7 +2762,6 @@ function createAutopilotEngine(deps) {
       job.phase = job.cancelled ? 'CANCELLED' : (err && err.code === 'PLAN_NO_VALID_TARGETS' ? 'PLAN_FAILED' : 'FAILED');
       job.error = err.message || String(err);
       job.result = null;
-      notifyWhatsApp('[HERMES /run-cycle] DËSHTIM në fazën [' + job.phase + ']: ' + (err.message || String(err)));
       throw err;
     }
   }

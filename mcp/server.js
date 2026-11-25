@@ -12,7 +12,11 @@ const {
   resolveProjectRoot,
   computeRequestFingerprint,
   computePlanFingerprint,
-  embedPlanMetadataHeader
+  embedPlanMetadataHeader,
+  parseRootDirectiveAndRequest,
+  readRegistryState,
+  setActiveRegistryProject,
+  pickDefaultActiveProjectRoot
 } = require('./pipeline/target_path_utils');
 
 const PORT = 4321;
@@ -42,6 +46,11 @@ const {
   boundedDiagnosticExcerpt,
   freshProjectErrorLog
 } = require('./pipeline/local_executor.js');
+
+const {
+  resolveActivityDrivenBudgets,
+  evaluateDomActivityState
+} = require('./pipeline/dom_liveness_wait.js');
 
 const googleSearchEngineModule = require('./engines/google_search_engine.js');
 const {
@@ -254,7 +263,7 @@ function persistTabConfig() {
   } catch (_) {}
 }
 
-function buildDashboardState(projects) {
+function buildDashboardState(projects, activeProjectRoot) {
   const isTestExport = process.env.ANTIGRAVITY_TEST_EXPORT === '1' && process.env.ANTIGRAVITY_TRUTHFUL_TEST !== '1';
   const tabStates = {};
   for (const k of Object.keys(tabs)) {
@@ -269,6 +278,7 @@ function buildDashboardState(projects) {
         : Boolean(googleSearchModelReceipts[k] && googleSearchModelReceipts[k].verified === true));
     const entry = {
       open: isOpen,
+      profileName: getProfileNameForTab(k),
       auth: isOpen ? tabAuthStatus[k] : 'UNKNOWN',
       model: isTestExport
         ? tabActiveModel[k]
@@ -306,7 +316,11 @@ function buildDashboardState(projects) {
     }
     tabStates[k] = entry;
   }
-  return { projects: projects || [], tabs: tabStates };
+  return {
+    projects: projects || [],
+    activeProject: activeProjectRoot || null,
+    tabs: tabStates
+  };
 }
 const tabLocks = {
   web1: Promise.resolve(),
@@ -353,6 +367,8 @@ function getGoogleSearchEngine() {
 }
 
 function getProfileNameForTab(tabKey) {
+  if (tabKey === 'web1') return 'm365_web1';
+  if (tabKey === 'web2') return 'm365_web2';
   if (tabKey.startsWith('web')) return 'm365';
   if (tabKey.startsWith('google_search_')) {
     const num = tabKey.replace('google_search_', '');
@@ -1253,14 +1269,14 @@ async function probeWebChatState(targetFrame,isGemini,sendMeta){
     let assistants=arg.gem?Array.from(chatRoot.querySelectorAll('response-container')):uniqueTurnNodes('[data-testid="chat-turn-assistant"],[data-testid="ai-message"],[data-message-author-role="assistant"],[data-content="ai-message"],.assistant-message,[data-testid="chatOutput"],[data-testid="copilot-message-div"],.fai-CopilotMessage,[data-testid="chat-response-message"],[data-testid*="response" i],[class*="copilot-message" i],[class*="assistant-message" i],[class*="chat-turn" i],.fui-ChatMessage,[data-content="ai-message"]');if(arg.gem&&assistants.length===0)assistants=Array.from(chatRoot.querySelectorAll('model-response,[data-message-author-role="model"]'));if(!arg.gem&&assistants.length===0)assistants=uniqueTurnNodes('main div[role="region"], [data-testid*="turn" i], .fui-ChatMessageContent, [class*="response-message" i], [class*="agent-response" i]').filter(function(el){return (el.textContent||'').trim().length>10;});
     const latestAssistant=assistants[assistants.length-1]||null;if(latestAssistant&&!latestAssistant.dataset.antigravityTurnId)latestAssistant.dataset.antigravityTurnId='ag-turn-'+Array.from(chatRoot.querySelectorAll('*')).indexOf(latestAssistant);
     const latestAssistantText=latestAssistant?norm(latestAssistant.textContent||''):'',latestAssistantFingerprint=latestAssistantText.slice(0,160)+'|'+latestAssistantText.length,latestAssistantNodeSignature=latestAssistant?(latestAssistant.tagName.toLowerCase()+'|'+latestAssistant.dataset.antigravityTurnId):'';
-    const latestTurnRoot=latestAssistant||chatRoot,thoughtNodes=Array.from(latestTurnRoot.querySelectorAll('model-thoughts,.thoughts-container,.thought-container,[data-test-id*="thought" i],[data-testid*="thought" i],ms-thought-chunk')),thoughtText=thoughtNodes.map(function(el){return norm(el.textContent||'');}).join('|'),thoughtLen=thoughtText.length,thoughtFingerprint=thoughtText.slice(0,160)+'|'+thoughtLen;
-    const latestUser=users.length?norm(users[users.length-1].textContent||''):'',chips=composerRoot?Array.from(composerRoot.querySelectorAll('uploader-file-preview,gem-attachment,[class*="attachment" i],[class*="chip" i]')).filter(visible):[],stop=composerRoot?Array.from(composerRoot.querySelectorAll('button[aria-label*="stop" i],button[title*="stop" i],button.stop-button,button.send-button.stop,button:has(mat-icon[fonticon="stop"])')).find(function(el){return visible(el)&&!el.disabled&&el.getAttribute('aria-disabled')!=='true';}):null;
+    const thoughtNodes=latestAssistant?Array.from(latestAssistant.querySelectorAll('model-thoughts,.thoughts-container,.thought-container,[data-test-id*="thought" i],[data-testid*="thought" i],ms-thought-chunk,[class*="thought" i],[class*="reason" i],[data-testid*="reason" i]')):Array.from(chatRoot.querySelectorAll('model-thoughts,.thoughts-container,.thought-container,ms-thought-chunk')),thoughtText=thoughtNodes.map(function(el){return norm(el.textContent||'');}).join('|'),thoughtLen=thoughtText.length,thoughtFingerprint=thoughtText.slice(0,160)+'|'+thoughtLen;
+    const latestUser=users.length?norm(users[users.length-1].textContent||''):'',chips=composerRoot?Array.from(composerRoot.querySelectorAll('uploader-file-preview,gem-attachment,[class*="attachment" i],[class*="chip" i]')).filter(visible):[],stop=composerRoot?Array.from(composerRoot.querySelectorAll('button[aria-label*="stop" i],button[title*="stop" i],[data-testid*="stop" i],button.stop-button,button.send-button.stop,button:has(mat-icon[fonticon="stop"])')).find(function(el){return visible(el)&&!el.disabled&&el.getAttribute('aria-disabled')!=='true';}):null;
     const classifyGeminiRoute=function(value){const normalized=String(value||'').replace(/\/+$/,'')||'/',match=normalized.match(/^\/app\/([^/?#]+)$/i);return {normalized:normalized,isGenericApp:normalized==='/app',isConversationRoute:Boolean(match),conversationId:match?match[1]:''};};
     const routeKey=location.pathname+location.search,preRoute=classifyGeminiRoute(arg.meta.routeKey||''),currentRoute=classifyGeminiRoute(routeKey),committedUserStillPresent=Boolean(arg.meta.newUserTurnFingerprint&&latestUser.includes(arg.meta.newUserTurnFingerprint)),sameConversationRoute=Boolean(preRoute.isConversationRoute&&currentRoute.isConversationRoute&&preRoute.conversationId===currentRoute.conversationId);
-    const processingTurnRoot=latestAssistant?(latestAssistant.closest('model-response,[data-message-author-role="model"],.conversation-container,.conversation-turn')||latestAssistant):chatRoot,presentedRoot=latestAssistant?latestAssistant.querySelector('.presented-response-container,[class*="presented-response" i]'):null;
+    const processingTurnRoot=latestAssistant?(latestAssistant.closest('model-response,[data-message-author-role="model"],.conversation-container,.conversation-turn,[data-testid="chat-turn-assistant"]')||latestAssistant):chatRoot,presentedRoot=latestAssistant?latestAssistant.querySelector('.presented-response-container,[class*="presented-response" i]'):null;
     const processingSelectors=['.response-container-header-processing-state','.response-container-header svg','.presented-response-container svg','.presented-response-container canvas','.presented-response-container bard-avatar','.presented-response-container lottie-animation','pending-response','loading-indicator','bard-avatar','lottie-animation','[role="progressbar"]','[aria-busy="true"]','mat-progress-spinner','[class*="spinner" i]','[class*="loading" i]','[class*="processing" i]'].join(','),thinkingStatusText=thoughtText.slice(0,240),composerText=editor?norm(/^(TEXTAREA|INPUT)$/.test(editor.tagName)?editor.value:(editor.textContent||'')):'',landingHeading=Array.from(chatRoot.querySelectorAll('h1,h2,h3,[role="heading"]')).some(function(el){return visible(el)&&/where should we start\??/i.test(norm(el.textContent||''));}),generating=Boolean(stop),landing=landingHeading&&Boolean(editor&&visible(editor))&&composerText.length===0&&users.length===0&&assistants.length===0&&chips.length===0&&!generating;
     let conversationContinuity=!arg.meta.committed||Boolean(committedUserStillPresent||sameConversationRoute||users.length>0||assistants.length>0);if(arg.meta.committed&&landing&&users.length===0&&assistants.length===0&&!generating)conversationContinuity=false;
-    const canProbeProcessing=Boolean(arg.gem&&latestAssistant&&assistants.length>0&&users.length>0&&!landing&&arg.domainOk),processingProbeSuppressed=!canProbeProcessing,processingRoots=canProbeProcessing?[presentedRoot,latestAssistant,processingTurnRoot].filter(Boolean):[],candidateSet=new Set();if(canProbeProcessing)processingRoots.forEach(function(root){if(root.matches&&root.matches(processingSelectors))candidateSet.add(root);root.querySelectorAll(processingSelectors).forEach(function(el){candidateSet.add(el);});});
+    const canProbeProcessing=Boolean((arg.gem||Boolean(stop)||latestAssistant||thoughtLen>0)&&users.length>0&&!landing&&arg.domainOk);
     const candidateVisible=function(el){if(!el||!el.isConnected)return false;const st=getComputedStyle(el),r=el.getBoundingClientRect();return st.display!=='none'&&st.visibility!=='hidden'&&parseFloat(st.opacity||'1')>.05&&r.width>=8&&r.height>=4;},animated=function(el){const st=getComputedStyle(el);return (st.animationName&&st.animationName!=='none'&&parseFloat(st.animationDuration||'0')>0)||(st.transitionProperty&&st.transitionProperty!=='none'&&parseFloat(st.transitionDuration||'0')>0);};
     let smallDotWrapper=null;if(canProbeProcessing&&processingTurnRoot){smallDotWrapper=Array.from(processingTurnRoot.querySelectorAll('div,span,svg,canvas,bard-avatar,lottie-animation,pending-response,loading-indicator')).find(function(el){const children=Array.from(el.children||[]);return children.length>=2&&children.length<=5&&candidateVisible(el)&&(animated(el)||children.some(animated));})||null;if(smallDotWrapper)candidateSet.add(smallDotWrapper);}
     const processingCandidates=canProbeProcessing?Array.from(candidateSet).filter(candidateVisible):[],processingVisualDetected=canProbeProcessing&&processingCandidates.length>0,visibleProcessingSpinner=processingVisualDetected,visibleStopControl=Boolean(stop),assistantPlaceholderCreated=assistants.length>(arg.meta.preAssistantCount||0),hasThoughtContent=thoughtLen>0,hasAssistantContent=latestAssistantText.length>0,latestAssistantIdentityChanged=Boolean(latestAssistantNodeSignature&&latestAssistantNodeSignature!==(arg.meta.preAssistantNodeSignature||'')),thoughtFingerprintChanged=Boolean(hasThoughtContent&&arg.meta.preThoughtFingerprint&&thoughtFingerprint!==arg.meta.preThoughtFingerprint),latestAssistantFingerprintChanged=Boolean(hasAssistantContent&&arg.meta.preAssistantFingerprint&&latestAssistantFingerprint!==arg.meta.preAssistantFingerprint),hasSubstantiveThinkingEvidence=Boolean(hasAssistantContent||hasThoughtContent||latestAssistantFingerprintChanged||thoughtFingerprintChanged),processingFallbackDetected=Boolean(canProbeProcessing&&assistantPlaceholderCreated&&visibleStopControl&&latestAssistantText.length===0),activeProcessingEvidence=Boolean(generating&&!landing&&arg.domainOk&&conversationContinuity&&users.length>0&&assistants.length>0&&(processingVisualDetected||processingFallbackDetected)),processingProbeTags=processingCandidates.slice(0,20).map(function(el){return el.tagName.toLowerCase()+'.'+Array.from(el.classList||[]).slice(0,4).join('.');}),processingRootTag=canProbeProcessing?(presentedRoot||latestAssistant||processingTurnRoot).tagName.toLowerCase():'';
@@ -1491,27 +1507,29 @@ async function collectGeminiTerminalDiagnostics(args) {
   return getGeminiEngine().collectGeminiTerminalDiagnostics(args);
 }
 async function waitAndExtractCleanResponse(page,targetFrame,tabKey,projectRoot,previousCount,sendMeta){
-  sendMeta=sendMeta||{};const isGemini=tabKey.startsWith('gemini'),hardCapMs=sendMeta.hardCapMs||(isGemini?900000:360000),defaultFirstTokenDeadlineMs=isGemini?600000:120000,firstTokenOverride=Number(sendMeta.firstTokenDeadlineMs),firstTokenDeadlineMs=Number.isFinite(firstTokenOverride)&&firstTokenOverride>0?Math.min(hardCapMs,Math.max(5000,firstTokenOverride)):defaultFirstTokenDeadlineMs,activeThinkingFreshMs=sendMeta.activeThinkingFreshMs||45000,explicitMaxThinkingStallMs=Number(sendMeta.maxThinkingWithoutDomProgressMs),maxThinkingWithoutDomProgressMs=Number.isFinite(explicitMaxThinkingStallMs)&&explicitMaxThinkingStallMs>0?explicitMaxThinkingStallMs:(isGemini?600000:120000),start=Date.now(),recoveryAttempt=sendMeta.recoveryAttempt||0,silentDeadlineMs=sendMeta.silentDeadlineMs||(isGemini?600000:300000),terminalDiagReceipts=new Map(),preUserCount=Number(sendMeta.preUserCount||0),preAssistantCount=Number(sendMeta.preAssistantCount||0);let lastProgressAt=start,lastLogAt=0,lastDeferredLogAt=0,lastSilentContinueAt=0,lastExtractionReceiptAt=0,lastExtractionChars=-1,lastProgress='',lastText='',stable=0,resetTicks=0,observedUserHighWatermark=preUserCount,observedAssistantHighWatermark=Math.max(previousCount,preAssistantCount),lastThoughtFingerprint=sendMeta.preThoughtFingerprint||'',observedSubstantiveThinkingEvidence=false,silentCheckpointCaptured=false,wasActiveProcessing=false;
+  sendMeta=sendMeta||{};const isGemini=tabKey.startsWith('gemini'),budgets=resolveActivityDrivenBudgets(sendMeta,isGemini),hardCapMs=budgets.runawayCapMs,firstTokenDeadlineMs=budgets.firstTokenDeadlineMs,activeThinkingFreshMs=budgets.activeThinkingFreshMs,maxThinkingWithoutDomProgressMs=budgets.maxThinkingWithoutDomProgressMs,start=Date.now(),recoveryAttempt=sendMeta.recoveryAttempt||0,silentDeadlineMs=budgets.silentDeadlineMs,terminalDiagReceipts=new Map(),preUserCount=Number(sendMeta.preUserCount||0),preAssistantCount=Number(sendMeta.preAssistantCount||0);let lastProgressAt=start,lastGeneratingPulseAt=start,lastLogAt=0,lastDeferredLogAt=0,lastSilentContinueAt=0,lastExtractionReceiptAt=0,lastExtractionChars=-1,lastProgress='',lastText='',stable=0,resetTicks=0,observedUserHighWatermark=preUserCount,observedAssistantHighWatermark=Math.max(previousCount,preAssistantCount),lastThoughtFingerprint=sendMeta.preThoughtFingerprint||'',observedSubstantiveThinkingEvidence=false,silentCheckpointCaptured=false,wasActiveProcessing=false,effectiveLoopLimitMs=budgets.baseHardCapMs;
   const captureTerminalDiagnosticsOnce=async function(code,state,elapsedMs,progressAgeMs){const key=code+':'+recoveryAttempt;if(terminalDiagReceipts.has(key))return terminalDiagReceipts.get(key);const receipt=typeof collectGeminiTerminalDiagnostics==='function'?await collectGeminiTerminalDiagnostics({page:page,targetFrame:targetFrame,tabKey:tabKey,projectRoot:projectRoot,dispatchId:sendMeta.diagId,errorCode:code,state:state,elapsedMs:elapsedMs,progressAgeMs:progressAgeMs}):{errorCode:'',retryVisible:false};terminalDiagReceipts.set(key,receipt);return receipt;};
-  while(Date.now()-start<hardCapMs){const reboundFrame=findChatFrameOrPage(page);if(reboundFrame!==targetFrame){const priorUrl=await targetFrame.evaluate(function(){return location.href;}).catch(function(){return '';});const reboundUrl=await reboundFrame.evaluate(function(){return location.href;}).catch(function(){return '';});targetFrame=reboundFrame;appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','CHAT_CONTEXT_REBOUND',{priorUrl:priorUrl,reboundUrl:reboundUrl,elapsedMs:Date.now()-start});}await page.waitForTimeout(750);const state=await probeWebChatState(targetFrame,isGemini,sendMeta);const elapsed=Date.now()-start;
+  while(Date.now()-start<effectiveLoopLimitMs){const reboundFrame=findChatFrameOrPage(page);if(reboundFrame!==targetFrame){const priorUrl=await targetFrame.evaluate(function(){return location.href;}).catch(function(){return '';});const reboundUrl=await reboundFrame.evaluate(function(){return location.href;}).catch(function(){return '';});targetFrame=reboundFrame;appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','CHAT_CONTEXT_REBOUND',{priorUrl:priorUrl,reboundUrl:reboundUrl,elapsedMs:Date.now()-start});}await page.waitForTimeout(750);const state=await probeWebChatState(targetFrame,isGemini,sendMeta);const elapsed=Date.now()-start;
     observedUserHighWatermark=Math.max(observedUserHighWatermark,state.userTurnCount);observedAssistantHighWatermark=Math.max(observedAssistantHighWatermark,state.assistantTurnCount);const newTurnWasObserved=Boolean(observedUserHighWatermark>preUserCount||observedAssistantHighWatermark>preAssistantCount||sendMeta.newUserTurnFingerprint||sendMeta.userTurnFingerprintMatched||(sendMeta.evidence&&sendMeta.evidence.userTurnFingerprintMatched)),countsReturnedToBaseline=Boolean(state.userTurnCount<=preUserCount&&state.assistantTurnCount<=preAssistantCount),committedTurnMissing=Boolean(!state.committedUserStillPresent),turnRolledBackAfterSend=Boolean(isGemini&&sendMeta.committed&&newTurnWasObserved&&countsReturnedToBaseline&&committedTurnMissing&&!state.generating&&!lastText),domainDriftCandidate=Boolean(isGemini&&sendMeta.committed&&state.domainMismatch&&state.userTurnCount===0&&state.assistantTurnCount===0&&!state.generating),landingResetCandidate=Boolean(isGemini&&sendMeta.committed&&state.landingVisible&&state.userTurnCount===0&&state.assistantTurnCount===0&&!state.generating&&!state.conversationContinuity),resetCandidate=Boolean(domainDriftCandidate||landingResetCandidate||turnRolledBackAfterSend),resetKind=domainDriftCandidate?'DOMAIN_DRIFT':(landingResetCandidate?'LANDING_RESET':(turnRolledBackAfterSend?'TURN_ROLLBACK':''));const resetInvariant=resetCandidate;resetTicks=resetInvariant?resetTicks+1:0;const resetMeta={preRouteKey:state.preRouteKey,currentRouteKey:state.currentRouteKey,preConversationId:state.preConversationId,currentConversationId:state.currentConversationId,committedUserStillPresent:state.committedUserStillPresent,users:state.userTurnCount,assistants:state.assistantTurnCount,preUserCount:preUserCount,preAssistantCount:preAssistantCount,observedUserHighWatermark:observedUserHighWatermark,observedAssistantHighWatermark:observedAssistantHighWatermark,countsReturnedToBaseline:countsReturnedToBaseline,committedTurnMissing:committedTurnMissing,newTurnWasObserved:newTurnWasObserved,turnRolledBackAfterSend:turnRolledBackAfterSend,resetKind:resetKind,landing:state.landingVisible,generating:state.generating,processingProbeSuppressed:state.processingProbeSuppressed,recoveryBudgetRemaining:Math.max(0,1-(sendMeta.recoveryAttempt||0))};if(resetTicks===1){appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','RESET_CANDIDATE_DETECTED',resetMeta);continue;}
     if(resetTicks>=2){const code=domainDriftCandidate?'ENGINE_DOMAIN_DRIFT_AFTER_SEND':(turnRolledBackAfterSend&&!landingResetCandidate?'GEMINI_TURN_ROLLED_BACK_AFTER_SEND':'GEMINI_CONVERSATION_RESET_AFTER_SEND'),progressAgeMs=Date.now()-lastProgressAt,receipt=await captureTerminalDiagnosticsOnce(code,state,elapsed,progressAgeMs);appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','RESET_CONFIRMED',Object.assign({code:code,elapsedMs:elapsed,resetTicks:resetTicks,screenshot:receipt&&receipt.screenshotPath},resetMeta));appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','RESET_DETECTED',Object.assign({code:code,elapsedMs:elapsed},resetMeta));const e=new Error(code);e.receipt=Object.assign({},state,{terminalDiagnostics:receipt});throw e;}
-    const hasSubstantiveThinkingEvidence=state.hasSubstantiveThinkingEvidence!==undefined?Boolean(state.hasSubstantiveThinkingEvidence):Boolean(state.hasThinkingEvidence&&((state.thoughtLen||0)>0||(state.latestAssistantChars||0)>0)),activeProcessingEvidence=state.activeProcessingEvidence!==undefined?Boolean(state.activeProcessingEvidence):Boolean(state.generating&&state.visibleProcessingSpinner!==false&&state.visibleStopControl!==false&&state.conversationContinuity&&!state.landingVisible&&!state.domainMismatch),progress=[state.latestAssistantFingerprint||'',state.latestAssistantNodeSignature||'',state.thoughtFingerprint||''].join('|');if(progress!==lastProgress&&(hasSubstantiveThinkingEvidence||!lastProgress)){lastProgress=progress;if(hasSubstantiveThinkingEvidence)lastProgressAt=Date.now();}
+    const hasSubstantiveThinkingEvidence=state.hasSubstantiveThinkingEvidence!==undefined?Boolean(state.hasSubstantiveThinkingEvidence):Boolean(state.hasThinkingEvidence&&((state.thoughtLen||0)>0||(state.latestAssistantChars||0)>0)),activeProcessingEvidence=state.activeProcessingEvidence!==undefined?Boolean(state.activeProcessingEvidence):Boolean(state.generating&&state.visibleProcessingSpinner!==false&&state.visibleStopControl!==false&&state.conversationContinuity&&!state.landingVisible&&!state.domainMismatch),progress=[state.latestAssistantFingerprint||'',state.latestAssistantNodeSignature||'',state.thoughtFingerprint||''].join('|');if(progress!==lastProgress&&(hasSubstantiveThinkingEvidence||!lastProgress)){lastProgress=progress;if(hasSubstantiveThinkingEvidence){lastProgressAt=Date.now();lastGeneratingPulseAt=Date.now();}}
     const hasAssistantContent=Boolean((state.latestAssistantChars||0)>0),hasThoughtContent=Boolean((state.thoughtLen||0)>0),latestAssistantChanged=Boolean(state.latestAssistantFingerprint&&state.latestAssistantFingerprint!==(sendMeta.preAssistantFingerprint||'')),latestAssistantIdentityChanged=state.latestAssistantIdentityChanged!==undefined?Boolean(state.latestAssistantIdentityChanged):Boolean(state.latestAssistantNodeSignature&&state.latestAssistantNodeSignature!==(sendMeta.preAssistantNodeSignature||'')),latestAssistantFingerprintChanged=state.latestAssistantFingerprintChanged!==undefined?Boolean(state.latestAssistantFingerprintChanged):Boolean(hasAssistantContent&&state.latestAssistantFingerprint&&state.latestAssistantFingerprint!==(sendMeta.preAssistantFingerprint||'')),latestAssistantNodeSignatureChanged=Boolean(state.latestAssistantNodeSignature&&state.latestAssistantNodeSignature!==(sendMeta.preAssistantNodeSignature||'')),thoughtFingerprintChanged=state.thoughtFingerprintChanged!==undefined?Boolean(state.thoughtFingerprintChanged):Boolean(hasThoughtContent&&state.thoughtFingerprint&&state.thoughtFingerprint!==lastThoughtFingerprint),extractionEligible=Boolean(!((countsReturnedToBaseline&&committedTurnMissing)||turnRolledBackAfterSend)&&(state.assistantTurnCount>previousCount||(state.conversationContinuity&&(latestAssistantChanged||latestAssistantIdentityChanged||latestAssistantNodeSignatureChanged))));if(thoughtFingerprintChanged)lastThoughtFingerprint=state.thoughtFingerprint;
-    if(Date.now()-lastLogAt>=5000){lastLogAt=Date.now();appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','RESPONSE_POLL',{elapsedMs:elapsed,users:state.userTurnCount,assistantTotal:state.assistantTotal,assistantVisible:state.assistantVisible,assistantHighWatermark:observedAssistantHighWatermark,preUserCount:preUserCount,preAssistantCount:preAssistantCount,observedUserHighWatermark:observedUserHighWatermark,observedAssistantHighWatermark:observedAssistantHighWatermark,countsReturnedToBaseline:countsReturnedToBaseline,committedTurnMissing:committedTurnMissing,newTurnWasObserved:newTurnWasObserved,turnRolledBackAfterSend:turnRolledBackAfterSend,resetKind:resetKind,latestAssistantFingerprint:state.latestAssistantFingerprint,latestAssistantChanged:latestAssistantChanged,latestAssistantIdentityChanged:latestAssistantIdentityChanged,latestAssistantFingerprintChanged:latestAssistantFingerprintChanged,hasAssistantContent:hasAssistantContent,thoughtNodes:state.thoughtNodes,thoughtFingerprintChanged:thoughtFingerprintChanged,hasThoughtContent:hasThoughtContent,hasSubstantiveThinkingEvidence:hasSubstantiveThinkingEvidence,extractionEligible:extractionEligible,assistantPlaceholderCreated:Boolean(state.assistantPlaceholderCreated),hasSubstantiveThinkingEvidence:hasSubstantiveThinkingEvidence,activeProcessingEvidence:activeProcessingEvidence,processingVisualDetected:Boolean(state.processingVisualDetected),processingFallbackDetected:Boolean(state.processingFallbackDetected),processingRootTag:state.processingRootTag||'',processingMatchCount:state.processingMatchCount||0,processingProbeTags:state.processingProbeTags||[],visibleProcessingSpinner:Boolean(state.visibleProcessingSpinner),visibleStopControl:Boolean(state.visibleStopControl),silentCheckpointCaptured:silentCheckpointCaptured,silentDeadlineMs:silentDeadlineMs,recoveryAttempt:recoveryAttempt,recoveryBudgetRemaining:Math.max(0,1-recoveryAttempt),preRouteKey:state.preRouteKey,currentRouteKey:state.currentRouteKey,preConversationId:state.preConversationId,currentConversationId:state.currentConversationId,committedUserStillPresent:state.committedUserStillPresent,processingProbeSuppressed:state.processingProbeSuppressed,generating:state.generating,progressAgeMs:Date.now()-lastProgressAt,landing:state.landingVisible,continuity:state.conversationContinuity});}
+    if(state.generating||activeProcessingEvidence||state.visibleStopControl||state.visibleProcessingSpinner)lastGeneratingPulseAt=Date.now();
+    const domActivity=evaluateDomActivityState({state:state,budgets:budgets,now:Date.now(),start:start,lastProgressAt:lastProgressAt,lastGeneratingPulseAt:lastGeneratingPulseAt,lastText:lastText});effectiveLoopLimitMs=domActivity.effectiveLoopLimitMs;
+    if(Date.now()-lastLogAt>=5000){lastLogAt=Date.now();appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','RESPONSE_POLL',{elapsedMs:elapsed,effectiveLoopLimitMs:effectiveLoopLimitMs,users:state.userTurnCount,assistantTotal:state.assistantTotal,assistantVisible:state.assistantVisible,assistantHighWatermark:observedAssistantHighWatermark,preUserCount:preUserCount,preAssistantCount:preAssistantCount,observedUserHighWatermark:observedUserHighWatermark,observedAssistantHighWatermark:observedAssistantHighWatermark,countsReturnedToBaseline:countsReturnedToBaseline,committedTurnMissing:committedTurnMissing,newTurnWasObserved:newTurnWasObserved,turnRolledBackAfterSend:turnRolledBackAfterSend,resetKind:resetKind,latestAssistantFingerprint:state.latestAssistantFingerprint,latestAssistantChanged:latestAssistantChanged,latestAssistantIdentityChanged:latestAssistantIdentityChanged,latestAssistantFingerprintChanged:latestAssistantFingerprintChanged,hasAssistantContent:hasAssistantContent,thoughtNodes:state.thoughtNodes,thoughtFingerprintChanged:thoughtFingerprintChanged,hasThoughtContent:hasThoughtContent,hasSubstantiveThinkingEvidence:hasSubstantiveThinkingEvidence,extractionEligible:extractionEligible,assistantPlaceholderCreated:Boolean(state.assistantPlaceholderCreated),activeProcessingEvidence:activeProcessingEvidence,processingVisualDetected:Boolean(state.processingVisualDetected),processingFallbackDetected:Boolean(state.processingFallbackDetected),processingRootTag:state.processingRootTag||'',processingMatchCount:state.processingMatchCount||0,processingProbeTags:state.processingProbeTags||[],visibleProcessingSpinner:Boolean(state.visibleProcessingSpinner),visibleStopControl:Boolean(state.visibleStopControl),silentCheckpointCaptured:silentCheckpointCaptured,silentDeadlineMs:silentDeadlineMs,recoveryAttempt:recoveryAttempt,recoveryBudgetRemaining:Math.max(0,1-recoveryAttempt),preRouteKey:state.preRouteKey,currentRouteKey:state.currentRouteKey,preConversationId:state.preConversationId,currentConversationId:state.currentConversationId,committedUserStillPresent:state.committedUserStillPresent,processingProbeSuppressed:state.processingProbeSuppressed,generating:state.generating,progressAgeMs:Date.now()-lastProgressAt,pulseAgeMs:domActivity.pulseAgeMs,landing:state.landingVisible,continuity:state.conversationContinuity});}
     if(extractionEligible){const extracted=await extractWebAssistantContent(targetFrame,isGemini);const extractionChars=extracted.metadata.contentCharsAfterClean;if(extractionChars!==lastExtractionChars||Date.now()-lastExtractionReceiptAt>=(extractionChars===0?15000:5000)){lastExtractionChars=extractionChars;lastExtractionReceiptAt=Date.now();appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','EXTRACTION_RECEIPT',extracted.metadata);}if(extracted.error)throw new Error(extracted.error);const text=extracted.text;if(text&&text===lastText&&!state.generating){stable++;if(stable>=4){appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','RESPONSE_EXTRACTED',{chars:text.length});return text;}}else{stable=0;lastText=text;}}
-    if(hasSubstantiveThinkingEvidence)observedSubstantiveThinkingEvidence=true;const progressAgeMs=Date.now()-lastProgressAt,activeThinkingFresh=Boolean(isGemini&&state.conversationContinuity&&!state.landingVisible&&state.generating&&hasSubstantiveThinkingEvidence&&progressAgeMs<activeThinkingFreshMs);
+    if(hasSubstantiveThinkingEvidence)observedSubstantiveThinkingEvidence=true;const progressAgeMs=Date.now()-lastProgressAt,activeThinkingFresh=Boolean(domActivity.activeThinkingFresh||(isGemini&&state.conversationContinuity&&!state.landingVisible&&state.generating&&hasSubstantiveThinkingEvidence&&progressAgeMs<activeThinkingFreshMs));
     const lowText=String(lastText||'').toLowerCase();if(lastText.length<500&&SERVICE_ERROR_PATTERNS.some(function(p){return lowText.includes(p);})){appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','ERROR',{code:'SERVICE_REFUSAL',elapsedMs:elapsed});throw new Error('WEB_SERVICE_REFUSAL: '+lastText.slice(0,150));}
     const assistantPlaceholderCreated=state.assistantPlaceholderCreated!==undefined?Boolean(state.assistantPlaceholderCreated):Boolean(state.assistantTurnCount>(sendMeta.preAssistantCount||0)),silentCandidate=Boolean(isGemini&&state.conversationContinuity&&!state.landingVisible&&!state.domainMismatch&&state.userTurnCount>0&&state.assistantTurnCount>0&&state.latestAssistantChars===0&&!hasSubstantiveThinkingEvidence);
     const shouldProbeProcessingLoss=Boolean(!lastText&&silentCandidate&&wasActiveProcessing&&!activeProcessingEvidence);wasActiveProcessing=wasActiveProcessing||activeProcessingEvidence;
     let silentDiag=null,checkpointConsumedThisPoll=false;const silentPreflight=Boolean(silentCandidate&&activeProcessingEvidence);
     if(resetTicks===0&&!lastText&&silentPreflight){if(elapsed>=firstTokenDeadlineMs&&!silentCheckpointCaptured){silentDiag=await captureTerminalDiagnosticsOnce('GEMINI_SILENT_PREFLIGHT_CHECKPOINT',state,elapsed,progressAgeMs);if(silentDiag.errorCode)throw new Error(silentDiag.errorCode+(silentDiag.retryVisible?' RETRY_VISIBLE':''));silentCheckpointCaptured=true;checkpointConsumedThisPoll=true;if(typeof appendDispatchDiag==='function')appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','SILENT_PREFLIGHT_CHECKPOINT',{elapsedMs:elapsed,progressAgeMs:progressAgeMs,silentDeadlineMs:silentDeadlineMs,recoveryAttempt:recoveryAttempt});if(typeof appendDispatchDiag==='function')appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','SILENT_PREFLIGHT_CONTINUING',{elapsedMs:elapsed,silentDeadlineMs:silentDeadlineMs,recoveryAttempt:recoveryAttempt});await page.waitForTimeout(750);continue;}if(elapsed>=silentDeadlineMs){await captureTerminalDiagnosticsOnce('GEMINI_SILENT_PREFLIGHT_TIMEOUT',state,elapsed,progressAgeMs);if(typeof appendDispatchDiag==='function')appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','SILENT_PREFLIGHT_TIMEOUT',{elapsedMs:elapsed,recoveryAttempt:recoveryAttempt});appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','SILENT_PREFLIGHT_CLASSIFIED',{elapsedMs:elapsed,progressAgeMs:progressAgeMs,recoveryAttempt:recoveryAttempt});throw new Error('GEMINI_SILENT_PREFLIGHT_TIMEOUT elapsedMs='+elapsed+' deadlineMs='+silentDeadlineMs);}if(elapsed>=firstTokenDeadlineMs&&Date.now()-lastSilentContinueAt>=30000){lastSilentContinueAt=Date.now();if(typeof appendDispatchDiag==='function')appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','SILENT_PREFLIGHT_CONTINUING',{elapsedMs:elapsed,silentDeadlineMs:silentDeadlineMs,recoveryAttempt:recoveryAttempt});}continue;}
     if(shouldProbeProcessingLoss&&!activeProcessingEvidence){silentDiag=await captureTerminalDiagnosticsOnce('GEMINI_FIRST_TOKEN_TIMEOUT',state,elapsed,progressAgeMs);if(silentDiag&&silentDiag.errorCode)throw new Error(silentDiag.errorCode+(silentDiag.retryVisible?' RETRY_VISIBLE':''));throw new Error('GEMINI_FIRST_TOKEN_TIMEOUT processing_evidence_lost elapsedMs='+elapsed+' progressAgeMs='+progressAgeMs);}
-    const effectiveMaxThinkingStallMs=isGemini&&!(Number.isFinite(explicitMaxThinkingStallMs)&&explicitMaxThinkingStallMs>0)&&activeProcessingEvidence?720000:maxThinkingWithoutDomProgressMs;if(resetTicks===0&&!lastText&&progressAgeMs>=effectiveMaxThinkingStallMs&&observedSubstantiveThinkingEvidence){const code='GEMINI_THINKING_STALL',diag=await captureTerminalDiagnosticsOnce(code,state,elapsed,progressAgeMs);if(diag.errorCode)throw new Error(diag.errorCode+(diag.retryVisible?' RETRY_VISIBLE':''));throw new Error(code+' elapsedMs='+elapsed+' progressAgeMs='+progressAgeMs+' deadlineMs='+effectiveMaxThinkingStallMs);}
+    const effectiveMaxThinkingStallMs=!(Number.isFinite(Number(sendMeta.maxThinkingWithoutDomProgressMs))&&Number(sendMeta.maxThinkingWithoutDomProgressMs)>0)&&activeProcessingEvidence?Math.max(maxThinkingWithoutDomProgressMs,720000):maxThinkingWithoutDomProgressMs;if(resetTicks===0&&!lastText&&progressAgeMs>=effectiveMaxThinkingStallMs&&observedSubstantiveThinkingEvidence&&domActivity.pulseAgeMs>=effectiveMaxThinkingStallMs){const code='GEMINI_THINKING_STALL',diag=await captureTerminalDiagnosticsOnce(code,state,elapsed,progressAgeMs);if(diag.errorCode)throw new Error(diag.errorCode+(diag.retryVisible?' RETRY_VISIBLE':''));throw new Error(code+' elapsedMs='+elapsed+' progressAgeMs='+progressAgeMs+' deadlineMs='+effectiveMaxThinkingStallMs);}
     if(resetTicks===0&&!lastText&&elapsed>=firstTokenDeadlineMs&&!activeThinkingFresh&&!silentPreflight&&!activeProcessingEvidence&&!checkpointConsumedThisPoll){const code='GEMINI_FIRST_TOKEN_TIMEOUT',diag=isGemini?await captureTerminalDiagnosticsOnce(code,state,elapsed,progressAgeMs):null;if(diag&&diag.errorCode)throw new Error(diag.errorCode+(diag.retryVisible?' RETRY_VISIBLE':''));throw new Error(code+' elapsedMs='+elapsed+' progressAgeMs='+progressAgeMs+' deadlineMs='+firstTokenDeadlineMs);}
-    if(!lastText&&elapsed>=firstTokenDeadlineMs&&activeThinkingFresh&&Date.now()-lastDeferredLogAt>=30000){lastDeferredLogAt=Date.now();appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','FIRST_TOKEN_DEADLINE_DEFERRED',{reason:'ACTIVE_THINKING',elapsedMs:elapsed,progressAgeMs:progressAgeMs});}
+    if(!lastText&&elapsed>=firstTokenDeadlineMs&&activeThinkingFresh&&Date.now()-lastDeferredLogAt>=30000){lastDeferredLogAt=Date.now();appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','FIRST_TOKEN_DEADLINE_DEFERRED',{reason:'ACTIVE_THINKING',elapsedMs:elapsed,progressAgeMs:progressAgeMs,pulseAgeMs:domActivity.pulseAgeMs,effectiveLoopLimitMs:effectiveLoopLimitMs});}
   }
-  targetFrame=findChatFrameOrPage(page);const finalState=await probeWebChatState(targetFrame,isGemini,sendMeta);let finalExtract={text:'',metadata:{codeBlockCount:0}};if(finalState.assistantTurnCount>0)finalExtract=await extractWebAssistantContent(targetFrame,isGemini);if(finalExtract.error==='GEMINI_EXTRACTION_OVERPRUNED')throw new Error('GEMINI_EXTRACTION_OVERPRUNED');const finalText=String(finalExtract.text||'').trim(),finalElapsed=Date.now()-start;if(!finalState.generating&&finalState.conversationContinuity&&!finalState.landingVisible&&!finalState.domainMismatch&&finalText.length>25){appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','RESPONSE_EXTRACTED_AFTER_DEADLINE',{elapsedMs:finalElapsed,chars:finalText.length,codeBlockCount:(finalExtract.metadata&&finalExtract.metadata.codeBlockCount)||0});return finalText;}if(resetTicks===0){if(isGemini)await captureTerminalDiagnosticsOnce('GEMINI_HARD_CAP_TIMEOUT',finalState,finalElapsed,Date.now()-lastProgressAt);throw new Error('GEMINI_HARD_CAP_TIMEOUT elapsedMs='+finalElapsed+' deadlineMs='+hardCapMs+' route='+finalState.routeKey+' users='+finalState.userTurnCount+' assistants='+finalState.assistantTurnCount);}throw new Error('GEMINI_RESET_DEBOUNCE_INCOMPLETE elapsedMs='+finalElapsed+' resetTicks='+resetTicks);
+  targetFrame=findChatFrameOrPage(page);const finalState=await probeWebChatState(targetFrame,isGemini,sendMeta);let finalExtract={text:'',metadata:{codeBlockCount:0}};if(finalState.assistantTurnCount>0)finalExtract=await extractWebAssistantContent(targetFrame,isGemini);if(finalExtract.error==='GEMINI_EXTRACTION_OVERPRUNED')throw new Error('GEMINI_EXTRACTION_OVERPRUNED');const finalText=String(finalExtract.text||'').trim(),finalElapsed=Date.now()-start;if(!finalState.generating&&finalState.conversationContinuity&&!finalState.landingVisible&&!finalState.domainMismatch&&finalText.length>25){appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','RESPONSE_EXTRACTED_AFTER_DEADLINE',{elapsedMs:finalElapsed,chars:finalText.length,codeBlockCount:(finalExtract.metadata&&finalExtract.metadata.codeBlockCount)||0});return finalText;}if(resetTicks===0){if(isGemini)await captureTerminalDiagnosticsOnce('GEMINI_HARD_CAP_TIMEOUT',finalState,finalElapsed,Date.now()-lastProgressAt);throw new Error('GEMINI_HARD_CAP_TIMEOUT elapsedMs='+finalElapsed+' deadlineMs='+effectiveLoopLimitMs+' route='+finalState.routeKey+' users='+finalState.userTurnCount+' assistants='+finalState.assistantTurnCount);}throw new Error('GEMINI_RESET_DEBOUNCE_INCOMPLETE elapsedMs='+finalElapsed+' resetTicks='+resetTicks);
 }
 
 function classifyWebServiceFailure(input){input=input||{};const text=[input.text||'',...(input.alerts||[]).map(function(x){return typeof x==='string'?x:(x.textPreview||x.text||'');}),...(input.httpHints||[])].join(' ').toLowerCase();const groups=[['QUOTA_OR_LIMIT_ERROR','WEB_QUOTA_OR_LIMIT_ERROR',false,/quota exceeded|limit reached|reached your limit|resets in|upgrade to advanced|upgrade your plan|usage limit|too many requests|rate limit/],['POLICY_REFUSAL','WEB_POLICY_REFUSAL',false,/i can(?:not|'t) help with that|i cannot assist|violates policy|not able to comply|prefer not to continue/],['AUTH_OR_SESSION_ERROR','WEB_AUTH_OR_SESSION_ERROR',false,/sign in|session expired|authentication required|log in to continue/],['PAYLOAD_REJECTED','WEB_PAYLOAD_REJECTED_OR_OVERSIZED',true,/file too large|payload too large|context too long|maximum context|attachment.*(?:large|rejected)/],['TRANSIENT_SERVICE_ERROR','WEB_TRANSIENT_SERVICE_ERROR',true,/encountered an error doing what you asked|could you try again|something went wrong|try again later|service unavailable|oops.? something happened|response wasn.?t generated/]];for(const g of groups){const m=text.match(g[3]);if(m)return {class:g[0],retryable:g[2],code:g[1],matchedSignals:[m[0]]};}return {class:'UNKNOWN_SERVICE_ERROR',retryable:false,code:'WEB_UNKNOWN_SERVICE_ERROR',matchedSignals:[]};}
@@ -1539,15 +1557,15 @@ async function runWebDispatchWithRetryPolicy(opts){const dispatchId=opts.dispatc
       if (tabKey.startsWith('gemini') && typeof ensureGeminiTemporaryChat === 'function') {
         const tempRes = await ensureGeminiTemporaryChat(targetFrame, tabKey, desiredTemp);
         geminiTemporaryChatStatus[tabKey] = tempRes || { active: Boolean(tempRes && tempRes.active), verified: false, status: 'MISMATCH_OR_UNVERIFIED' };
-        if (desiredTemp && (!tempRes || !tempRes.verified || !tempRes.active)) {
-          await captureSupportEvidence(page, projectRoot, tabKey, 'TEMPORARY_CHAT_UNVERIFIED', 'Temporary Chat u kerkua ON por deshtoi verifikimi ne DOM: ' + JSON.stringify(tempRes || {}));
+        if ((desiredTemp && (!tempRes || !tempRes.verified || !tempRes.active)) || (!desiredTemp && (!tempRes || !tempRes.verified || tempRes.active !== false))) {
+          await captureSupportEvidence(page, projectRoot, tabKey, 'TEMPORARY_CHAT_UNVERIFIED', 'Gemini Temporary Chat u kerkua ' + (desiredTemp ? 'ON' : 'OFF') + ' por deshtoi verifikimi ne DOM: ' + JSON.stringify(tempRes || {}));
         }
         targetFrame = findChatFrameOrPage(page);
       } else if (tabKey.startsWith('web') && typeof ensureCopilotTemporaryChat === 'function') {
         const tempRes = await ensureCopilotTemporaryChat(targetFrame, tabKey, desiredTemp);
         copilotTemporaryChatStatus[tabKey] = tempRes || { active: Boolean(tempRes && tempRes.active), verified: false, status: 'MISMATCH_OR_UNVERIFIED' };
-        if (desiredTemp && (!tempRes || !tempRes.verified || !tempRes.active)) {
-          await captureSupportEvidence(page, projectRoot, tabKey, 'TEMPORARY_CHAT_UNVERIFIED', 'Copilot Temporary Chat u kerkua ON por deshtoi verifikimi ne DOM: ' + JSON.stringify(tempRes || {}));
+        if ((desiredTemp && (!tempRes || !tempRes.verified || !tempRes.active)) || (!desiredTemp && (!tempRes || !tempRes.verified || tempRes.active !== false))) {
+          await captureSupportEvidence(page, projectRoot, tabKey, 'TEMPORARY_CHAT_UNVERIFIED', 'Copilot Temporary Chat u kerkua ' + (desiredTemp ? 'ON' : 'OFF') + ' por deshtoi verifikimi ne DOM: ' + JSON.stringify(tempRes || {}));
         }
         targetFrame = findChatFrameOrPage(page);
       }
@@ -2062,13 +2080,27 @@ function resolveAndEmbedExternalFiles(userRequest) { return autopilotEngineModul
 async function waitJobSlice(cleanRoot, maxSliceMs) { return getAutopilotEngine().waitJobSlice(cleanRoot, maxSliceMs); }
 function resolveTargetProjectAndRequest(payload) {
   payload = payload || {};
-  let rawRoot = (payload.projectRoot || payload.project_root || '').trim();
+  let rawRoot = String(payload.projectRoot || payload.project_root || '').trim();
+  let req = String(payload.userRequest || payload.user_request || payload.prompt || '').trim();
+
+  const parsedDirective = parseRootDirectiveAndRequest(req);
+  if (parsedDirective.extractedRoot) {
+    if (!rawRoot || path.resolve(rawRoot).toLowerCase() === PLUGIN_ROOT.toLowerCase()) {
+      rawRoot = parsedDirective.extractedRoot;
+    }
+    req = parsedDirective.cleanedRequest;
+  }
+
   let cleanRoot = rawRoot ? path.resolve(rawRoot) : '';
 
   if (!cleanRoot || cleanRoot.toLowerCase() === PLUGIN_ROOT.toLowerCase() || !fs.existsSync(cleanRoot)) {
     const activeRoots = Object.keys(activeCycleJobs).filter(function(k) { return activeCycleJobs[k] && activeCycleJobs[k].running; });
     if (activeRoots.length > 0) {
       cleanRoot = activeRoots[0];
+    }
+    if (!cleanRoot) {
+      const reg = readRegistryState(REGISTRY_PATH);
+      cleanRoot = pickDefaultActiveProjectRoot(reg, PLUGIN_ROOT);
     }
     if (!cleanRoot) {
       for (const t of Object.keys(activeProjectPerTab)) {
@@ -2078,15 +2110,6 @@ function resolveTargetProjectAndRequest(payload) {
         }
       }
     }
-    if (!cleanRoot && fs.existsSync(REGISTRY_PATH)) {
-      try {
-        const reg = JSON.parse(fs.readFileSync(REGISTRY_PATH, 'utf8'));
-        const valid = (reg.projects || []).filter(function(p) { return fs.existsSync(p); });
-        if (valid.length > 0) {
-          cleanRoot = path.resolve(valid[valid.length - 1]);
-        }
-      } catch (_) {}
-    }
     if (!cleanRoot) {
       cleanRoot = process.cwd();
     }
@@ -2094,7 +2117,6 @@ function resolveTargetProjectAndRequest(payload) {
 
   cleanRoot = resolveProjectRoot(cleanRoot).root;
 
-  let req = (payload.userRequest || payload.user_request || payload.prompt || '').trim();
   const isGeneric = !req || req === 'null' || req === 'undefined' || req.includes('Perdoruesi thirri /run-cycle');
   if (isGeneric) {
     const searchDirs = [cleanRoot, path.join(cleanRoot, 'docs')].filter(function(d) { return fs.existsSync(d); });
@@ -2353,7 +2375,8 @@ res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
 return res.end(html);
 }
 if (req.method === 'GET' && req.url === '/api/state') {
-const reg = JSON.parse(fs.readFileSync(REGISTRY_PATH, 'utf8'));
+const reg = readRegistryState(REGISTRY_PATH);
+const resolvedActive = pickDefaultActiveProjectRoot(reg, PLUGIN_ROOT);
 const projectsData = reg.projects.filter(function(p) { return fs.existsSync(p); }).map(function(p) {
 const cfg = ensureProjectSetup(p);
 const st = readProjectState(p);
@@ -2361,9 +2384,10 @@ const liveJob = activeCycleJobs[path.resolve(p)];
 if (liveJob && liveJob.running) {
 st.phase = liveJob.phase;
 }
-return Object.assign({}, cfg, { state: st });
+const isActive = Boolean(resolvedActive && path.resolve(p).toLowerCase() === resolvedActive.toLowerCase());
+return Object.assign({}, cfg, { state: st, isActive: isActive });
 });
-const dashboardState = buildDashboardState(projectsData);
+const dashboardState = buildDashboardState(projectsData, resolvedActive || null);
 res.writeHead(200, { 'Content-Type': 'application/json' });
 return res.end(JSON.stringify(dashboardState));
 }
@@ -2450,13 +2474,26 @@ if (typeof data.buildCmd === 'string') current.buildCmd = data.buildCmd.trim();
 if (typeof data.testCmd === 'string') current.testCmd = data.testCmd.trim();
 if (data.bundleFormat) current.bundleFormat = data.bundleFormat;
 fs.writeFileSync(rPath, JSON.stringify(current, null, 2), 'utf8');
+setActiveRegistryProject(REGISTRY_PATH, data.projectRoot);
 res.writeHead(200, { 'Content-Type': 'application/json' });
-return res.end(JSON.stringify({ ok: true }));
+return res.end(JSON.stringify({ ok: true, activeProject: path.resolve(data.projectRoot) }));
 }
 if (req.url === '/api/add-project') {
 const cfg = ensureProjectSetup(data.projectRoot);
+setActiveRegistryProject(REGISTRY_PATH, data.projectRoot);
 res.writeHead(200, { 'Content-Type': 'application/json' });
-return res.end(JSON.stringify({ ok: true, project: cfg }));
+return res.end(JSON.stringify({ ok: true, project: cfg, activeProject: path.resolve(data.projectRoot) }));
+}
+if (req.url === '/api/set-active-project') {
+const targetRoot = path.resolve(data.projectRoot || '');
+if (!targetRoot || !fs.existsSync(targetRoot)) {
+res.writeHead(400, { 'Content-Type': 'application/json' });
+return res.end(JSON.stringify({ ok: false, error: 'VALID_PROJECT_ROOT_REQUIRED' }));
+}
+ensureProjectSetup(targetRoot);
+const updatedReg = setActiveRegistryProject(REGISTRY_PATH, targetRoot);
+res.writeHead(200, { 'Content-Type': 'application/json' });
+return res.end(JSON.stringify({ ok: true, activeProject: updatedReg.activeProject }));
 }
 if (req.url === '/api/delete-project') {
 const targetRoot = path.resolve(data.projectRoot || data.project_id || '');
@@ -2464,14 +2501,17 @@ if (!targetRoot) {
 res.writeHead(400, { 'Content-Type': 'application/json' });
 return res.end(JSON.stringify({ ok: false, error: 'projectRoot is required' }));
 }
-const reg = JSON.parse(fs.readFileSync(REGISTRY_PATH, 'utf8'));
-const initialLen = (reg.projects || []).length;
-reg.projects = (reg.projects || []).filter(function(p) {
+const reg = readRegistryState(REGISTRY_PATH);
+const initialLen = reg.projects.length;
+reg.projects = reg.projects.filter(function(p) {
 return path.resolve(p).toLowerCase() !== targetRoot.toLowerCase();
 });
-fs.writeFileSync(REGISTRY_PATH, JSON.stringify(reg, null, 2), 'utf8');
+const nextActive = (reg.activeProject && reg.activeProject.toLowerCase() === targetRoot.toLowerCase())
+  ? pickDefaultActiveProjectRoot({ projects: reg.projects, activeProject: null }, PLUGIN_ROOT)
+  : reg.activeProject;
+fs.writeFileSync(REGISTRY_PATH, JSON.stringify({ projects: reg.projects, activeProject: nextActive || null }, null, 2), 'utf8');
 res.writeHead(200, { 'Content-Type': 'application/json' });
-return res.end(JSON.stringify({ ok: true, removed: initialLen !== reg.projects.length, projectRoot: targetRoot }));
+return res.end(JSON.stringify({ ok: true, removed: initialLen !== reg.projects.length, projectRoot: targetRoot, activeProject: nextActive || null }));
 }
 if (req.url === '/api/purge-exchange') {
 const targetRoot = path.resolve(data.projectRoot || '');
@@ -2497,20 +2537,47 @@ res.writeHead(200, { 'Content-Type': 'application/json' });
 return res.end(JSON.stringify({ ok: true }));
 }
     if (req.url === '/api/login-profile') {
-      const reqName = data.profileName;
+      const reqName = String((data && data.profileName) || '').trim();
+      if (!reqName || reqName === 'm365') {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({
+          ok: false,
+          error: 'SHARED_M365_PROFILE_DEPRECATED: Perdor "m365_web1" (web1) ose "m365_web2" (web2) per izolim te plote.'
+        }));
+      }
       const profile = getProfileNameForTab(reqName);
-      const targetUrl = getTargetUrl(reqName);
+      const linkedTab = profile === 'm365_web1' ? 'web1' : (profile === 'm365_web2' ? 'web2' : reqName);
+      const targetUrl = getTargetUrl(linkedTab);
 
       const visibleCtx = await getOrLaunchContext(profile, false);
       const pages = visibleCtx.pages();
-      const loginPage = (pages.length > 0 && !pages[0].isClosed()) ? pages[0] : await visibleCtx.newPage();
-      await loginPage.goto(targetUrl, { waitUntil: 'domcontentloaded' }).catch(function() {});
+      const existingTab = Object.prototype.hasOwnProperty.call(tabs, linkedTab) && tabs[linkedTab] && !tabs[linkedTab].isClosed()
+        ? tabs[linkedTab]
+        : null;
+      const loginPage = existingTab || ((pages.length > 0 && !pages[0].isClosed()) ? pages[0] : await visibleCtx.newPage());
+      if (Object.prototype.hasOwnProperty.call(tabs, linkedTab) && !tabs[linkedTab]) {
+        tabs[linkedTab] = loginPage;
+        if (typeof loginPage.on === 'function') {
+          loginPage.on('close', function() {
+            if (tabs[linkedTab] === loginPage) tabs[linkedTab] = null;
+            invalidateGeminiReceipt(linkedTab);
+            invalidateCopilotReceipt(linkedTab);
+          });
+        }
+      }
+      const curUrl = (typeof loginPage.url === 'function' ? loginPage.url() : '') || '';
+      const isMidAuth = /microsoftonline\.com|login\.live\.com|login\.windows\.net|accounts\.google\.com/i.test(curUrl);
+      if (!curUrl || curUrl === 'about:blank' || (!doesUrlMatchEngine(linkedTab, curUrl) && !isMidAuth)) {
+        await loginPage.goto(targetUrl, { waitUntil: 'domcontentloaded' }).catch(function() {});
+      }
       await loginPage.bringToFront().catch(function() {});
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({
         ok: true,
-        message: 'Dritarja e dukshme per [' + reqName + ' (Profili: ' + profile + ')] u hap me sukses!\n\n1. Identifikohu me llogarine tende ne Google/Microsoft.\n2. Zgjidh modelin ose kalo verifikimet/cookies nese kerkohen.\n3. Mbylle dritaren me [X] kur te mbarosh, qe profili te ruhet per ekzekutimet automatike ne sfond.'
+        profile: profile,
+        tabKey: linkedTab,
+        message: 'Dritarja e dukshme e izoluar per [' + linkedTab + ' -> .profiles/' + profile + '] u hap me sukses!\n\n1. Identifikohu me llogarine tende (mund te kesh account tjeter ne Web 1 vs Web 2).\n2. Zgjidh ose verifiko modelin / cookies nese kerkohen.\n3. Mund ta lesh hapur ose ta mbyllesh me [X] qe cookies, localStorage dhe sesioni te ruhen vecmas.'
       }));
     }
 if (req.url === '/api/kill-all') {
@@ -2536,7 +2603,7 @@ return res.end(JSON.stringify(result));
 }
 if (reqPath === '/check_cycle_progress' || reqPath === '/api/check-progress' || (reqPath.startsWith('/cycle/') && reqPath.endsWith('/wait'))) {
 const root = path.resolve(data.projectRoot || '.');
-const result = await executeCoreAction('check_cycle_progress', { projectRoot: root, waitMs: data.waitMs || 20000, _internal: true });
+const result = await executeCoreAction('check_cycle_progress', { projectRoot: root, waitMs: data.waitMs, _internal: true });
 res.writeHead(200, { 'Content-Type': 'application/json' });
 return res.end(JSON.stringify(result));
 }
@@ -2614,14 +2681,14 @@ return {
 tools: [
 {
 name: 'run_full_cycle',
-description: 'MJETI KRYESOR AUTOPILOT: Ekzekuton ne menyre te bllokuar (blocking) te gjithe ciklin autonom (pack -> planner -> coder -> apply -> reviewer) dhe kthen raportin e certifikuar final me 0 babysitting. Nese projectRoot ose userRequest mungojne, ura i zgjidh automatikisht nga projekti aktiv dhe urdhri i punes ne disk.',
+description: 'MJETI KRYESOR AUTOPILOT: Ekzekuton ciklin autonom (pack -> planner -> coder -> apply -> reviewer) mbi projektin aktiv te Dashboard-it ose mbi rrugen e dhene pas `root <path>`. Nese projectRoot lihet bosh, perdor automatikisht projektin aktiv ne Dashboard (4321). Nese userRequest permban nje rruge skedari .md/.txt ose tekst, lexohet automatikisht.',
 inputSchema: {
 type: 'object',
 properties: {
-projectRoot: { type: 'string', description: 'Rruga e projektit (nese lihet bosh, merret projekti aktiv)' },
-userRequest: { type: 'string', description: 'Kerkesa e punes (nese lihet bosh, merret urdhri i punes nga disku)' }
+projectRoot: { type: 'string', description: 'Opsionale: rruga e projektit (nese lihet bosh, merret projekti aktiv i konfiguruar ne Dashboard)' },
+userRequest: { type: 'string', description: 'Kerkesa e punes (tekst i lire, rruge skedari .md/.txt, ose `root <path> <kerkesa>`)' }
 },
-required: ['projectRoot', 'userRequest']
+required: []
 }
 },
 {
@@ -2630,7 +2697,7 @@ description: 'Pret ecurine e ciklit aktiv ne menyre deterministe derisa te kthej
 inputSchema: {
 type: 'object',
 properties: { projectRoot: { type: 'string', description: 'Rruga e projektit (opsionale)' } },
-required: ['projectRoot']
+required: []
 }
 },
 {
@@ -2717,7 +2784,7 @@ for (const k of Object.keys(tabs)) {
 process.on('SIGINT', async function() { await closeAllContexts(); process.exit(0); });
 process.on('SIGTERM', async function() { await closeAllContexts(); process.exit(0); });
 if(process.env.ANTIGRAVITY_TEST_EXPORT==='1'){module.exports={CHUNK_ENGINE_LIMITS,scanRepositoryUniversal,buildCompactRepoMap,buildDependencyGraph,partitionAnalysisChunks,analyzeRepositoryChunks,buildFinalPlanningContext,parseAndValidatePlanBatches,partitionCodingBatches,buildBatchContext,runCodingBatch,applyBatch,runBatchQuickChecks,repairBatchOnce,halveBatchAdaptively,buildCrossBatchContractSummary,buildDiffFocusedReviewContext,writeChunkContextFile,extractTargetsFromError,scoreAnalysisChunkRelevance,buildLocalStructuralChunkSummary,buildBatchMiniMap,extractBatchPlanSlice,buildMinimalBatchContext,selectCodingTransport,selectAdaptiveReasoningLevel,classifyAttachmentHandshakeStrict,getFailoverEngines,parseCodeBlocksFromMarkdown,normalizeFailureCode,isAdaptiveHalvingFailure,persistCheckpointReceiptOnce};}
-if(process.env.ANTIGRAVITY_TEST_EXPORT==='1'){Object.defineProperty(module.exports,'buildDashboardState',{value:buildDashboardState,enumerable:false});Object.defineProperty(module.exports,'WEB_ENGINE_ADAPTERS',{value:WEB_ENGINE_ADAPTERS,enumerable:false});Object.defineProperty(module.exports,'conversationIdFromUrl',{value:conversationIdFromUrl,enumerable:false});Object.defineProperty(module.exports,'probeChatCleanState',{value:probeChatCleanState,enumerable:false});}
+if(process.env.ANTIGRAVITY_TEST_EXPORT==='1'){Object.defineProperty(module.exports,'buildDashboardState',{value:buildDashboardState,enumerable:false});Object.defineProperty(module.exports,'WEB_ENGINE_ADAPTERS',{value:WEB_ENGINE_ADAPTERS,enumerable:false});Object.defineProperty(module.exports,'conversationIdFromUrl',{value:conversationIdFromUrl,enumerable:false});Object.defineProperty(module.exports,'probeChatCleanState',{value:probeChatCleanState,enumerable:false});Object.defineProperty(module.exports,'getProfileNameForTab',{value:getProfileNameForTab,enumerable:false});}
 if(process.env.ANTIGRAVITY_TEST_EXPORT!=='1')startDashboardAndSingletonServer();
 if(process.env.ANTIGRAVITY_TEST_EXPORT!=='1' && !process.stdin.isTTY) {
 const transport = new StdioServerTransport();

@@ -1,28 +1,21 @@
 ---
 name: run-cycle
-description: Ekzekuton ciklin e plotë autonom Multi-AI (pack -> planner -> coder -> apply -> reviewer) mbi projektin aktiv duke përdorur Google Gemini Neon High dhe M365 Copilot me zero kredi IDE dhe zero babysitting.
+description: Orkestron automatikisht ciklin e plotë Multi-AI përmes MCP `multi-ai-relay` mbi projektin aktiv në Dashboard (4321) ose `root <path>`, me zero hardcoding dhe zero timer manual.
 ---
 
-# Rregulli Suprem për /run-cycle dhe Autopilot (Zero-Babysitting Closed Loop)
+# Rregulli Universal për /run-cycle (Zero Pyetje, Zero Hardcoding)
 
-Kur përdoruesi jep komandën `/run_cycle`, `/run-cycle`, ose kërkon ekzekutim të ciklit mbi një projekt:
+Kur përdoruesi jep `/run-cycle` me çfarëdo argumenti (tekst i thjeshtë, rrugë skedari `.md`/`.txt`, ose `root <RrugaEProjektit> ...`):
 
-1. **Ekzekutimi Kryesor Determinist (Zero Babysitting & Zero LLM Quota):**
-   - Agjenti (Hermes) ekzekuton menjëherë runner-in determinist autonom:
-     ```powershell
-     node scripts/run_autonomous_cycle.mjs --project-dir "<PROJECT_ROOT>" --prompt-text "<USER_REQUEST>" --output ".antigravity/bridge/exchange/final_verdict.json"
-     ```
-   - **Pse përdoret ky runner?**
-     Ky runner merr përsipër të gjithë pritjen dhe polling-un në Node.js (0 tokenë LLM të djegur gjatë pritjes, 0 lekë kosto, 0 ndërhyrje njerëzore).
-     Ai bën polling me heartbeat në stderr çdo 10s, përballon të gjitha fazat (Planning chunks, Coding, Apply, Test, Review), dhe del vetëm kur cikli përfundon plotësisht me `STATUS: PASSED` ose `STATUS: FAILED`.
+1. **Mos pyet kurrë për `projectRoot` ose konfirmime — nis menjëherë:**
+   - Nëse përdoruesi ka shkruar **`root <PATH>`** në kërkesë, kalo `projectRoot: "<PATH>"` dhe pjesën tjetër të mesazhit si `userRequest`.
+   - Nëse përdoruesi **NUK** ka shkruar `root <PATH>` (p.sh. dha vetëm tekstin e kërkesës ose një rrugë skedari si `"C:\...\spec.md"`), **mos shpik rrugë projekti**: thirr `mcp__multi_ai_relay__run_full_cycle` me `projectRoot: ""` (bosh) dhe tekstin/rrugën e përdoruesit në `userRequest`. Ura (`127.0.0.1:4321`) zgjidh automatikisht **projektin aktiv të konfiguruar në Dashboard**, rolet (`web1`/`web2`/`gemini1..3`), komandat build/test, dhe lexon vetë skedarin e specifikimeve.
 
-2. **Ekzekutimi Alternativ me MCP Tool (Nëse nuk përdoret CLI):**
-   - Nëse thirret mjeti MCP `run_full_cycle`, dhe serveri kthen `STILL_RUNNING_CALL_CHECK_PROGRESS`:
-   - Agjentit i **NDALOHET KATEGORIKISHT** t'i shkruajë përdoruesit në chat.
-   - Agjenti thërret menjëherë në unazë të mbyllur `check_cycle_progress` (me `poll_seq`) derisa statusi të jetë `CYCLE_COMPLETED` ose `PASSED`.
+2. **Unaza Deterministe e Pritjes (Zero Timer Manual):**
+   - Sapo `mcp__multi_ai_relay__run_full_cycle` kthen `STILL_RUNNING_CALL_CHECK_PROGRESS`, **mos shkruaj raporte të ndërmjetme në chat** dhe **mos lexo skedarë/logje me terminal**.
+   - Thirr në unazë **`mcp__multi_ai_relay__check_cycle_progress`** (pa timer arbitrar — Ura monitoron aktivitetin e DOM-it në shfletues edhe për 20–30+ min Thinking Mode) derisa statusi të jetë terminal (`CYCLE_COMPLETED`, `PASSED`, `FAILED`, `SUPPORT_REQUIRED_STOP_IMMEDIATELY`, ose `QUOTA_LIMIT_STOP`).
 
-3. **Formati i Raportit Përfundimtar drejt Përdoruesit (Vetëm në përfundim):**
-   - Përdoruesit i raportohet **VETËM NJË HERË NË FUND**:
-     * **Statusi:** PASSED | FAILED
-     * **Modelet:** Google Gemini Neon High (Lock 100%)
-     * **Testet:** Rezultati i testbed-it dhe faturat fizike.
+3. **Raporti Përfundimtar (Vetëm në fund):**
+   - **Statusi:** `PASSED | FAILED | BLOCKED`
+   - **Projekti & Modelet:** Emri/rruga e projektit + modelet e verifikuara Web 1 / Web 2 / Web 3
+   - **Skedarët & Testet:** Dëshmitë reale nga disku.

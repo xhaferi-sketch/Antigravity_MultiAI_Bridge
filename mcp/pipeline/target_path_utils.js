@@ -1121,6 +1121,131 @@ function extractPlanTargets(planText, projectRoot) {
   };
 }
 
+function parseRootDirectiveAndRequest(rawPrompt, existsFn, isDirFn) {
+  const exists = typeof existsFn === 'function' ? existsFn : fs.existsSync;
+  const isDir = typeof isDirFn === 'function'
+    ? isDirFn
+    : function(p) {
+        try { return fs.statSync(p).isDirectory(); } catch (_) { return false; }
+      };
+
+  const text = String(rawPrompt || '').trim();
+  if (!text) return { extractedRoot: '', cleanedRequest: '' };
+
+  const prefixMatch = text.match(/^(?:root|projectroot)\s*(?:[:=]\s*|\s+)([\s\S]+)$/i);
+  if (!prefixMatch) {
+    return { extractedRoot: '', cleanedRequest: text };
+  }
+
+  const rest = prefixMatch[1].trimStart();
+  const quotedMatch = rest.match(/^(['"])([A-Za-z]:[\\/][^'"]+|\/[^'"]+)\1(?:\s+([\s\S]*))?$/);
+  if (quotedMatch) {
+    return {
+      extractedRoot: path.resolve(quotedMatch[2].trim()),
+      cleanedRequest: String(quotedMatch[3] || '').trim()
+    };
+  }
+
+  // Unquoted path (may contain spaces like `C:\...\Revit Personal ai\Personal AI Revit\App`):
+  // Match longest existing directory prefix separated by whitespace boundaries.
+  const winDriveMatch = rest.match(/^([A-Za-z]:[\\/][\s\S]*)$/);
+  const posixMatch = !winDriveMatch ? rest.match(/^(\/[^\s]+)(?:\s+([\s\S]*))?$/) : null;
+  if (winDriveMatch) {
+    const body = winDriveMatch[1];
+    const stopIdxMatch = body.search(/\s+(?:"[^"]*"|'[^']*'|[A-Za-z]:[\\/]|\/)/);
+    const searchLimit = stopIdxMatch > 0 ? stopIdxMatch : body.length;
+    const pathChunk = body.slice(0, searchLimit).trim();
+    const afterChunk = body.slice(searchLimit).trim();
+
+    let bestEnd = -1;
+    for (let i = 0; i <= pathChunk.length; i++) {
+      if (i < pathChunk.length && !/\s/.test(pathChunk[i])) continue;
+      const cand = pathChunk.slice(0, i).trim().replace(/[\\/]+$/, '');
+      if (cand.length >= 3 && /^[A-Za-z]:[\\/]/.test(cand) && exists(cand) && isDir(cand)) {
+        bestEnd = i;
+      }
+    }
+    if (bestEnd > 0) {
+      const matchedRoot = path.resolve(pathChunk.slice(0, bestEnd).trim());
+      const remainder = (pathChunk.slice(bestEnd) + (afterChunk ? ' ' + afterChunk : '')).trim();
+      return { extractedRoot: matchedRoot, cleanedRequest: remainder };
+    }
+
+    // Fallback when path doesn't exist yet or tests use non-disk paths: up to first break token.
+    return {
+      extractedRoot: path.resolve(pathChunk.replace(/[\\/]+$/, '') || pathChunk),
+      cleanedRequest: afterChunk
+    };
+  }
+
+  if (posixMatch) {
+    return {
+      extractedRoot: path.resolve(posixMatch[1]),
+      cleanedRequest: String(posixMatch[2] || '').trim()
+    };
+  }
+
+  return { extractedRoot: '', cleanedRequest: text };
+}
+
+function readRegistryState(registryPath) {
+  if (!registryPath || !fs.existsSync(registryPath)) {
+    return { projects: [], activeProject: null };
+  }
+  try {
+    const raw = JSON.parse(fs.readFileSync(registryPath, 'utf8'));
+    const projects = Array.isArray(raw && raw.projects)
+      ? raw.projects.filter(function(p) { return typeof p === 'string' && p.trim(); })
+      : [];
+    const activeProject = typeof (raw && raw.activeProject) === 'string' && raw.activeProject.trim()
+      ? path.resolve(raw.activeProject.trim())
+      : null;
+    return { projects, activeProject };
+  } catch (_) {
+    return { projects: [], activeProject: null };
+  }
+}
+
+function setActiveRegistryProject(registryPath, projectRoot, opts) {
+  opts = opts || {};
+  const reg = readRegistryState(registryPath);
+  const cleanRoot = projectRoot ? path.resolve(String(projectRoot).trim()) : null;
+  if (cleanRoot) {
+    const alreadyPresent = reg.projects.some(function(p) {
+      return path.resolve(p).toLowerCase() === cleanRoot.toLowerCase();
+    });
+    if (!alreadyPresent && opts.addIfMissing !== false) {
+      reg.projects.push(cleanRoot);
+    }
+    reg.activeProject = cleanRoot;
+  } else {
+    reg.activeProject = null;
+  }
+  fs.writeFileSync(registryPath, JSON.stringify({
+    projects: reg.projects,
+    activeProject: reg.activeProject
+  }, null, 2), 'utf8');
+  return reg;
+}
+
+function pickDefaultActiveProjectRoot(regState, pluginRoot, existsFn) {
+  const exists = typeof existsFn === 'function' ? existsFn : fs.existsSync;
+  const reg = regState || { projects: [], activeProject: null };
+  if (reg.activeProject && exists(reg.activeProject)) {
+    return path.resolve(reg.activeProject);
+  }
+  const valid = (reg.projects || []).filter(function(p) { return exists(p); });
+  if (valid.length === 0) return '';
+  const pluginNorm = pluginRoot ? path.resolve(pluginRoot).toLowerCase() : '';
+  const external = pluginNorm
+    ? valid.filter(function(p) { return path.resolve(p).toLowerCase() !== pluginNorm; })
+    : valid;
+  if (external.length > 0) {
+    return path.resolve(external[external.length - 1]);
+  }
+  return path.resolve(valid[valid.length - 1]);
+}
+
 module.exports = {
   sanitizeTargetPath,
   normalizeTargetKey,
@@ -1132,5 +1257,9 @@ module.exports = {
   computePlanFingerprint,
   embedPlanMetadataHeader,
   extractPlanMetadataHeader,
-  extractPlanTargets
+  extractPlanTargets,
+  parseRootDirectiveAndRequest,
+  readRegistryState,
+  setActiveRegistryProject,
+  pickDefaultActiveProjectRoot
 };

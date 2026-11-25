@@ -105,10 +105,21 @@ function createCopilotEngine(runtimeContext) {
         return (((el && el.innerText) || '') + ' ' + ((el && el.getAttribute('aria-label')) || '')).replace(/\s+/g, ' ').trim();
       };
       const selectors = 'button[aria-label*="model" i],button[aria-label*="mode" i],[data-testid*="model-switcher" i],[data-testid*="mode-selector" i],.fui-Dropdown';
-      let button = Array.from(document.querySelectorAll(selectors)).find(visible) || null;
+      const isExcludedControl = function(val) {
+        return /\b(dark\s*mode|light\s*mode|color\s*mode|theme|sidebar|navigation|history|voice|microphone|dictate|attach|upload|settings|cookie)\b/i.test(String(val || ''));
+      };
+      const isLikelyModelControl = function(el) {
+        if (!visible(el)) return false;
+        const t = text(el);
+        if (!t || isExcludedControl(t)) return false;
+        if (el.matches('[data-testid*="model-switcher" i],[data-testid*="mode-selector" i],button[aria-label*="model" i]')) return true;
+        return /\b(gpt-5\.6|sol\s*think|think\s*deeper|quick\s*response|auto|model|smart|study)\b/i.test(t);
+      };
+      const candidates = Array.from(document.querySelectorAll(selectors)).filter(visible);
+      let button = candidates.find(isLikelyModelControl) || candidates.find(function(el) { return !isExcludedControl(text(el)); }) || null;
       const isForbiddenWeakModel = function(val) {
         const lower = String(val || '').toLowerCase();
-        return /\b(auto|quick\s*response|fast|flash|lite|mini|basic|standard)\b/i.test(lower);
+        return /\b(auto|quick\s*response|fast|flash|lite|mini|basic|standard|gpt-4|gpt-4o|gpt-3\.5)\b/i.test(lower);
       };
       const requiredModelVisible = function(val) {
         const lower = String(val || '').toLowerCase();
@@ -119,7 +130,13 @@ function createCopilotEngine(runtimeContext) {
         if (lower.includes(req.reasoningLabel.toLowerCase()) || /\bdeep\b|think\s*deeper|extra\s*thorough|\bhigh\b/i.test(lower)) return true;
         return Array.from(document.querySelectorAll('button,[role="switch"],[role="menuitemradio"],[role="option"]')).filter(visible).some(function(el) {
           const t = text(el).toLowerCase();
-          const active = el.getAttribute('aria-pressed') === 'true' || el.getAttribute('aria-checked') === 'true' || el.classList.contains('active') || el.classList.contains('is-active');
+          const active = el.getAttribute('aria-pressed') === 'true' ||
+            el.getAttribute('aria-checked') === 'true' ||
+            el.getAttribute('aria-selected') === 'true' ||
+            el.getAttribute('data-checked') === 'true' ||
+            el.getAttribute('data-state') === 'checked' ||
+            el.classList.contains('active') ||
+            el.classList.contains('is-active');
           return active && /think\s*deeper|deep|high/i.test(t);
         });
       };
@@ -128,34 +145,52 @@ function createCopilotEngine(runtimeContext) {
       }
       if (!button) {
         const opener = Array.from(document.querySelectorAll('button')).filter(visible).find(function(el) {
-          return /model|gpt|think|auto|quick/i.test(text(el));
+          const t = text(el);
+          return !isExcludedControl(t) && /model|gpt|think|auto|quick/i.test(t);
         });
         if (opener) {
           opener.click();
           await new Promise(function(resolve) { setTimeout(resolve, 350); });
-          button = Array.from(document.querySelectorAll(selectors)).find(visible) || opener;
+          const refreshed = Array.from(document.querySelectorAll(selectors)).filter(visible);
+          button = refreshed.find(isLikelyModelControl) || opener;
         }
       }
       if (button) {
         button.click();
         await new Promise(function(resolve) { setTimeout(resolve, 600); });
-        const menuContainer = document.querySelector('.fui-MenuPopover, [role="menu"], [role="listbox"], .fui-MenuList');
+        const menuContainer = Array.from(document.querySelectorAll('.fui-MenuPopover, .fui-PopoverSurface, [role="menu"], [role="listbox"], .fui-MenuList')).find(visible) || null;
         const searchScope = menuContainer || document;
-        const options = Array.from(searchScope.querySelectorAll('[role="option"],[role="menuitemradio"],[role="menuitem"],[role="menuitemcheckbox"],.fui-MenuItem,.fui-Option,button,div')).filter(function(el) {
+        const optionSelector = menuContainer
+          ? '[role="option"],[role="menuitemradio"],[role="menuitem"],[role="menuitemcheckbox"],.fui-MenuItem,.fui-Option,button,div'
+          : '[role="option"],[role="menuitemradio"],[role="menuitem"],[role="menuitemcheckbox"],.fui-MenuItem,.fui-Option,button,a[role="button"]';
+        const options = Array.from(searchScope.querySelectorAll(optionSelector)).filter(function(el) {
           if (!visible(el)) return false;
           const t = text(el);
-          return t.length > 2 && t.length < 100;
+          return t.length > 2 && t.length < 100 && !isExcludedControl(t);
         });
         const available = options.map(function(o) { return text(o); }).filter(Boolean).slice(0, 25);
-        const model = options.find(function(el) {
-          const value = text(el).toLowerCase();
-          if (isForbiddenWeakModel(value)) return false;
-          return (value.includes('gpt-5.6') && (value.includes('sol think') || value.includes('think deeper'))) || value.includes(req.modelLabel.toLowerCase()) || value.includes('5.6 sol think') || value.includes('sol think') || value.includes('think deeper');
-        });
+        const nonWeakOptions = options.filter(function(el) { return !isForbiddenWeakModel(text(el)); });
+        const model =
+          nonWeakOptions.find(function(el) {
+            const v = text(el).toLowerCase();
+            return v.includes('gpt-5.6') && v.includes('sol think') && v.includes('think deeper');
+          }) ||
+          nonWeakOptions.find(function(el) {
+            const v = text(el).toLowerCase();
+            return v.includes('gpt-5.6') && (v.includes('sol think') || v.includes('think deeper'));
+          }) ||
+          nonWeakOptions.find(function(el) {
+            const v = text(el).toLowerCase();
+            return v.includes(req.modelLabel.toLowerCase()) || v.includes('5.6 sol think') || v.includes('sol think');
+          }) ||
+          nonWeakOptions.find(function(el) {
+            return text(el).toLowerCase().includes('think deeper');
+          });
         if (model) {
           model.click();
           await new Promise(function(resolve) { setTimeout(resolve, 500); });
-          button = Array.from(document.querySelectorAll(selectors)).find(visible) || button;
+          const refreshed = Array.from(document.querySelectorAll(selectors)).filter(visible);
+          button = refreshed.find(isLikelyModelControl) || button;
         } else {
           return { ok: false, reason: 'COPILOT_REQUIRED_MODEL_UNAVAILABLE', active: text(button), available: available, hasMenu: Boolean(menuContainer) };
         }
@@ -239,20 +274,23 @@ async function inspectCopilotTemporaryChatDom(page) {
       const toggleControl = Array.from(document.querySelectorAll('button, [role="button"], [role="switch"], [role="checkbox"], a'))
         .find(function(el) {
           if (!actionable(el)) return false;
-          const label = normalize((el.getAttribute('aria-label') || '') + ' ' + (el.innerText || el.textContent || '') + ' ' + (el.getAttribute('data-testid') || ''));
+          const label = normalize((el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '') + ' ' + (el.innerText || el.textContent || '') + ' ' + (el.getAttribute('data-testid') || ''));
           return /temporary chat|private chat|off the record|incognito|don't save history|mos ruaj|përkohshme/i.test(label);
         }) || null;
 
       const ariaPressed = toggleControl ? toggleControl.getAttribute('aria-pressed') : null;
       const ariaChecked = toggleControl ? toggleControl.getAttribute('aria-checked') : null;
       const controlLabel = toggleControl
-        ? String(toggleControl.getAttribute('aria-label') || toggleControl.innerText || toggleControl.getAttribute('data-testid') || '').trim().slice(0, 120)
+        ? String(toggleControl.getAttribute('aria-label') || toggleControl.getAttribute('title') || toggleControl.innerText || toggleControl.getAttribute('data-testid') || '').trim().slice(0, 120)
         : '';
 
       const controlActive = Boolean(
         toggleControl && (
           ariaPressed === 'true' ||
           ariaChecked === 'true' ||
+          toggleControl.getAttribute('aria-selected') === 'true' ||
+          toggleControl.getAttribute('data-checked') === 'true' ||
+          toggleControl.checked === true ||
           toggleControl.classList.contains('active') ||
           toggleControl.classList.contains('is-active') ||
           toggleControl.getAttribute('data-state') === 'checked'
@@ -270,7 +308,8 @@ async function inspectCopilotTemporaryChatDom(page) {
           .filter(actionable);
         indicatorFound = elements.some(function(el) {
           const t = normalize(el.innerText || el.textContent || '');
-          return (t.includes('temporary chat') || t.includes('private chat') || t.includes('bisedë e përkohshme')) &&
+          return t.length > 0 && t.length <= 320 &&
+            (t.includes('temporary chat') || t.includes('private chat') || t.includes('bisedë e përkohshme')) &&
             (t.includes("won't be saved") || t.includes("won't appear") || t.includes('is on') || t.includes('është aktive') || el.classList.contains('active'));
         });
       }
@@ -375,7 +414,7 @@ async function ensureCopilotTemporaryChat(page, tabId, desiredEnabled, opts) {
     const toggleControl = Array.from(document.querySelectorAll('button, [role="button"], [role="switch"], [role="checkbox"], a'))
       .find(function(el) {
         if (!actionable(el)) return false;
-        const label = normalize((el.getAttribute('aria-label') || '') + ' ' + (el.innerText || el.textContent || '') + ' ' + (el.getAttribute('data-testid') || ''));
+        const label = normalize((el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '') + ' ' + (el.innerText || el.textContent || '') + ' ' + (el.getAttribute('data-testid') || ''));
         return /temporary chat|private chat|off the record|incognito|don't save history|mos ruaj|përkohshme/i.test(label);
       });
     if (toggleControl && typeof toggleControl.click === 'function') {
