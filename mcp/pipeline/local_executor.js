@@ -211,7 +211,13 @@ function parseCodeBlocksFromMarkdown(markdown, expectedTargets, projectRoot) {
   let fenceIndex = 0;
   while ((match = dynamicFencePattern.exec(source)) !== null) {
     const declaredTarget = match[1];
+    const fenceLang = String(match[3] || '').toLowerCase();
     const code = match[4];
+    const looksLikeUnifiedDiff = fenceLang === 'diff' || fenceLang === 'patch' ||
+      /^(?:diff --git a\/|---\s+a\/[^\r\n]+\r?\n\+\+\+\s+b\/)/m.test(code);
+    if (looksLikeUnifiedDiff && (!declaredTarget || /^(?:diff --git a\/|@@\s+-\d+)/m.test(code))) {
+      continue;
+    }
     if (declaredTarget) {
       accept(declaredTarget, code);
     } else {
@@ -391,6 +397,7 @@ function applyHunksToText(originalText, fileDiff) {
   }
   if (!hunkMatches.length) return null;
 
+  const eol = originalText.includes('\r\n') ? '\r\n' : '\n';
   let origLines = originalText.split(/\r?\n/);
   let lineOffset = 0;
 
@@ -446,6 +453,18 @@ function applyHunksToText(originalText, fileDiff) {
           break;
         }
       }
+      if (matchIdx < 0 && expectedOld.length >= 3) {
+        const globalMatches = [];
+        for (let pos = 0; pos <= origLines.length - expectedOld.length; pos++) {
+          if (matchesAt(pos)) {
+            globalMatches.push(pos);
+            if (globalMatches.length > 1) break;
+          }
+        }
+        if (globalMatches.length === 1) {
+          matchIdx = globalMatches[0];
+        }
+      }
     }
 
     if (matchIdx < 0) {
@@ -456,7 +475,7 @@ function applyHunksToText(originalText, fileDiff) {
     lineOffset += replacementNew.length - expectedOld.length;
   }
 
-  return origLines.join('\n');
+  return origLines.join(eol);
 }
 
 function createLocalExecutor(runtimeContext) {
@@ -545,7 +564,11 @@ function createLocalExecutor(runtimeContext) {
         const patchTail = batchOutput.slice(patchStart);
         const fileBlockStart = patchTail.search(/^### FILE:/m);
         let rawPatch = (fileBlockStart >= 0 ? patchTail.slice(0, fileBlockStart) : patchTail).trimEnd();
-        rawPatch = rawPatch.replace(/\r?\n```[a-zA-Z0-9_-]*\s*$/g, '').trimEnd();
+        rawPatch = rawPatch
+          .split(/\r?\n/)
+          .filter(function(ln) { return !/^\s*```[a-zA-Z0-9_-]*\s*$/.test(ln); })
+          .join('\n')
+          .trimEnd();
         const patchText = rawPatch + NL;
         const patchLines = patchText.split('\n').length;
         if (patchLines > 800) {
@@ -582,12 +605,35 @@ function createLocalExecutor(runtimeContext) {
           }
         }
         patchPaths.forEach(backupOnce);
+        const prePatchHashes = {};
+        for (const rel of patchPaths) {
+          const abs = absoluteTarget(rel);
+          prePatchHashes[rel] = fs.existsSync(abs)
+            ? crypto.createHash('sha256').update(fs.readFileSync(abs)).digest('hex')
+            : null;
+        }
+
+        let gitDirArg = [];
+        let relSubPrefix = '';
+        try {
+          const revParse = spawnSync('git', ['rev-parse', '--show-toplevel'], { cwd: root, encoding: 'utf8', windowsHide: true });
+          if (revParse.status === 0 && revParse.stdout) {
+            const gitTop = fs.realpathSync(path.resolve(String(revParse.stdout || '').trim()));
+            if (gitTop !== root && root.startsWith(gitTop + path.sep)) {
+              const relSub = path.relative(gitTop, root).replace(/\\/g, '/');
+              if (relSub) {
+                gitDirArg = ['--directory=' + relSub];
+                relSubPrefix = relSub + '/';
+              }
+            }
+          }
+        } catch (_) {}
 
         const patchFile = path.join(root, '.antigravity-patch-' + process.pid + '-' + crypto.randomBytes(6).toString('hex') + '.patch');
         temporaryFiles.push(patchFile);
         fs.writeFileSync(patchFile, patchText, 'utf8');
-        let check = spawnSync('git', ['apply', '--check', '--recount', '--whitespace=error-all', patchFile], { cwd: root, encoding: 'utf8', windowsHide: true });
-        let applyArgs = ['apply', '--recount', '--whitespace=error-all', patchFile];
+        let check = spawnSync('git', ['apply', '--check', '--recount', '--whitespace=error-all'].concat(gitDirArg).concat([patchFile]), { cwd: root, encoding: 'utf8', windowsHide: true });
+        let applyArgs = ['apply', '--recount', '--whitespace=error-all'].concat(gitDirArg).concat([patchFile]);
         if (check.error || check.status !== 0) {
           const gitDirResult = spawnSync('git', ['rev-parse', '--git-dir'], { cwd: root, encoding: 'utf8', windowsHide: true });
           if (gitDirResult.error || gitDirResult.status !== 0) throw new Error('GIT_THREE_WAY_REQUIRES_REPOSITORY');
@@ -600,10 +646,17 @@ function createLocalExecutor(runtimeContext) {
               throw new Error('GIT_THREE_WAY_BLOB_IDENTITY_MISSING: ' + rel);
             }
           }
-          check = spawnSync('git', ['apply', '--check', '--3way', '--recount', '--whitespace=error-all', patchFile], { cwd: root, encoding: 'utf8', windowsHide: true });
-          applyArgs = ['apply', '--3way', '--recount', '--whitespace=error-all', patchFile];
+          check = spawnSync('git', ['apply', '--check', '--3way', '--recount', '--whitespace=error-all'].concat(gitDirArg).concat([patchFile]), { cwd: root, encoding: 'utf8', windowsHide: true });
+          applyArgs = ['apply', '--3way', '--recount', '--whitespace=error-all'].concat(gitDirArg).concat([patchFile]);
         }
         let gitApplySuccess = false;
+        const extractFileDiffSection = function(rel) {
+          const fileHeader = 'diff --git a/' + rel + ' b/' + rel;
+          const fStart = patchText.indexOf(fileHeader);
+          const fTail = fStart >= 0 ? patchText.slice(fStart) : patchText;
+          const nextDiffIdx = fTail.slice(fileHeader.length).search(/^diff --git /m);
+          return nextDiffIdx >= 0 ? fTail.slice(0, fileHeader.length + nextDiffIdx) : fTail;
+        };
         if (check.error || check.status !== 0) {
           let fallbackSuccess = true;
           for (const rel of patchPaths) {
@@ -618,11 +671,7 @@ function createLocalExecutor(runtimeContext) {
             }
             if (fs.existsSync(abs)) {
               const origText = fs.readFileSync(abs, 'utf8');
-              const fileHeader = 'diff --git a/' + rel + ' b/' + rel;
-              const fStart = patchText.indexOf(fileHeader);
-              const fTail = fStart >= 0 ? patchText.slice(fStart) : patchText;
-              const nextDiffIdx = fTail.slice(fileHeader.length).search(/^diff --git /m);
-              const fileDiff = nextDiffIdx >= 0 ? fTail.slice(0, fileHeader.length + nextDiffIdx) : fTail;
+              const fileDiff = extractFileDiffSection(rel);
               const patched = applyHunksToText(origText, fileDiff);
               if (patched !== null) {
                 backupOnce(rel);
@@ -649,6 +698,31 @@ function createLocalExecutor(runtimeContext) {
           if (applyArgs.includes('--3way')) {
             const unmerged = spawnSync('git', ['ls-files', '--unmerged'], { cwd: root, encoding: 'utf8', windowsHide: true });
             if (unmerged.error || unmerged.status !== 0 || String(unmerged.stdout || '').trim()) throw new Error('GIT_APPLY_THREE_WAY_CONFLICT');
+          }
+        }
+        // Fail-closed: prevent silent no-op patch writes (e.g. git apply returning 0 without modifying target)
+        for (const rel of patchPaths) {
+          const fileDiff = extractFileDiffSection(rel);
+          const hasHunkMutation = /^(?:\+(?!\+\+)|-(?!---))/m.test(fileDiff);
+          if (!hasHunkMutation) continue;
+          const abs = absoluteTarget(rel);
+          let postHash = fs.existsSync(abs)
+            ? crypto.createHash('sha256').update(fs.readFileSync(abs)).digest('hex')
+            : null;
+          if (postHash === prePatchHashes[rel]) {
+            if (fs.existsSync(abs)) {
+              const origText = fs.readFileSync(abs, 'utf8');
+              const patched = applyHunksToText(origText, fileDiff);
+              if (patched !== null && patched !== origText) {
+                const tmp = abs + '.antigravity-tmp';
+                fs.writeFileSync(tmp, patched, 'utf8');
+                fs.renameSync(tmp, abs);
+                postHash = crypto.createHash('sha256').update(fs.readFileSync(abs)).digest('hex');
+              }
+            }
+            if (postHash === prePatchHashes[rel]) {
+              throw new Error('PATCH_NOT_APPLIED_NOOP: ' + rel + (relSubPrefix ? ' (subdir ' + relSubPrefix + ')' : ''));
+            }
           }
         }
         patchPaths.forEach(function(rel) { seen.add(rel); });
@@ -708,6 +782,26 @@ function createLocalExecutor(runtimeContext) {
     return { status: 'CHECK_PASSED', receipts: receipts };
   }
 
+  function buildToolingEnv(baseEnv, command) {
+    const env = Object.assign({}, baseEnv || process.env);
+    if (process.platform === 'win32' && /\bdotnet\b/i.test(String(command || ''))) {
+      const pfSdk = path.join(env.ProgramFiles || 'C:\\Program Files', 'dotnet', 'sdk');
+      const pfHasSdk = fs.existsSync(pfSdk) && fs.readdirSync(pfSdk).length > 0;
+      const userHome = env.USERPROFILE || require('node:os').homedir();
+      const userDotnet = userHome ? path.join(userHome, '.dotnet') : '';
+      const userSdk = userDotnet ? path.join(userDotnet, 'sdk') : '';
+      if (!pfHasSdk && userSdk && fs.existsSync(userSdk) && fs.readdirSync(userSdk).length > 0) {
+        const curPath = env.PATH || env.Path || '';
+        const sep = curPath ? ';' : '';
+        env.PATH = userDotnet + sep + curPath;
+        env.Path = env.PATH;
+        if (!env.DOTNET_ROOT) env.DOTNET_ROOT = userDotnet;
+        env.DOTNET_MULTILEVEL_LOOKUP = '0';
+      }
+    }
+    return env;
+  }
+
   function executeProcessWithIdleWatchdog(command, cwd, idleTimeoutMs) {
     idleTimeoutMs = idleTimeoutMs || 300000;
     return new Promise(function(resolve) {
@@ -717,7 +811,7 @@ function createLocalExecutor(runtimeContext) {
       let timedOut = false;
       let proc;
       try {
-        proc = nodeSpawn(command, { cwd: cwd, shell: true, windowsHide: true });
+        proc = nodeSpawn(command, { cwd: cwd, shell: true, windowsHide: true, env: buildToolingEnv(process.env, command) });
       } catch (err) {
         return resolve({
           status: 1, signal: null, stdout: '', stderr: String(err && err.message), timedOut: false
@@ -958,7 +1052,10 @@ function createLocalExecutor(runtimeContext) {
       if (!targetAbs || !fs.existsSync(targetAbs) || !fs.statSync(targetAbs).isFile()) throw new Error('CHECKPOINT_TARGET_NOT_FOUND: ' + target);
       const outputSha256 = crypto.createHash('sha256').update(fs.readFileSync(targetAbs)).digest('hex');
       const inputSha256 = /^[a-f0-9]{64}$/i.test(String(x.inputSha256 || '')) ? String(x.inputSha256).toLowerCase() : outputSha256;
-      return '<!-- CHECKPOINT_FILE_VERIFIED target=' + target + ' inputSha256=' + inputSha256 + ' outputSha256=' + outputSha256 + ' repositoryFingerprint=' + (checkpointIdentity ? checkpointIdentity.repositoryFingerprint : '') + ' planFingerprint=' + (checkpointIdentity ? checkpointIdentity.planFingerprint : '') + ' parserMode=FENCED verificationBasis=BATCH_APPLY migrationSource=NEW_APPLY historicalOutputProvenance=VERIFIED syntax=PASS quickCheck=PASS status=VERIFIED -->' + NL + '### FILE: ' + target + NL + FENCE3 + path.extname(target).slice(1) + NL + x.code + NL + FENCE3;
+      const mode = (typeof x.code === 'string' && x.code.length > 0) ? 'FENCED' : 'DIFF_PATCH';
+      const metaLine = '<!-- CHECKPOINT_FILE_VERIFIED target=' + target + ' inputSha256=' + inputSha256 + ' outputSha256=' + outputSha256 + ' repositoryFingerprint=' + (checkpointIdentity ? checkpointIdentity.repositoryFingerprint : '') + ' planFingerprint=' + (checkpointIdentity ? checkpointIdentity.planFingerprint : '') + ' parserMode=' + mode + ' verificationBasis=BATCH_APPLY migrationSource=NEW_APPLY historicalOutputProvenance=VERIFIED syntax=PASS quickCheck=PASS status=VERIFIED -->';
+      if (mode === 'DIFF_PATCH') return metaLine;
+      return metaLine + NL + '### FILE: ' + target + NL + FENCE3 + path.extname(target).slice(1) + NL + x.code + NL + FENCE3;
     });
     fs.appendFileSync(codePath, header + entries.join(NL + NL), 'utf8');
   }

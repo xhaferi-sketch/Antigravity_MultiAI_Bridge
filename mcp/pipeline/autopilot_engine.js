@@ -1400,11 +1400,73 @@ function extractBatchPlanSlice(planText, batch) {
   return matched.length > 0 ? matched.join(NL + NL) : truncateUtf8(full, 16000);
 }
 
+function extractTargetedSourceForBatch(fullText, maxBytes, planSlice, userRequest) {
+  const source = String(fullText || '');
+  if (Buffer.byteLength(source, 'utf8') <= maxBytes) return source;
+  const lines = source.split(/\r?\n/);
+  const hintText = String(planSlice || '') + '\n' + String(userRequest || '');
+  const anchorLines = new Set();
+
+  // Line number hints (e.g., "~1270", "rreshti 1270", "line 1270")
+  const lineRe = /(?:rreshti|line|L)\s*[~:#]?\s*(\d{2,6})\b|~(\d{2,6})\b/gi;
+  let lm;
+  while ((lm = lineRe.exec(hintText)) !== null) {
+    const ln = parseInt(lm[1] || lm[2], 10);
+    if (ln >= 1 && ln <= lines.length) anchorLines.add(ln - 1);
+  }
+
+  // Meaningful identifier hints mentioned in plan/request
+  const stopWords = new Set(['FILE_TARGET', 'ALLOWED_FILES', 'FORBIDDEN_FILES', 'OBJEKTIVAT', 'ENTRY', 'ROOT', 'CAUSE', 'HARDENING', 'DEFINITION', 'Revit', 'Snowdon', 'Towers', 'Problemi', 'Skedari', 'Gabimi', 'Shkaku', 'Metoda', 'Skriptet', 'Orchestrator', 'expected', 'string', 'public', 'private', 'internal', 'static', 'return']);
+  const symMatches = hintText.match(/\b[A-Za-z_][A-Za-z0-9_]{5,}\b/g) || [];
+  const symbols = Array.from(new Set(symMatches.filter(function(s) { return !stopWords.has(s); }))).slice(0, 24);
+  if (symbols.length) {
+    for (let idx = 0; idx < lines.length; idx++) {
+      const line = lines[idx];
+      if (symbols.some(function(sym) { return line.includes(sym); })) {
+        anchorLines.add(idx);
+      }
+    }
+  }
+
+  if (!anchorLines.size) return truncateUtf8(source, maxBytes);
+
+  const windows = [[0, Math.min(lines.length - 1, 39)]];
+  const sortedAnchors = Array.from(anchorLines).sort(function(a, b) { return a - b; });
+  for (const a of sortedAnchors) {
+    windows.push([Math.max(0, a - 55), Math.min(lines.length - 1, a + 75)]);
+  }
+  windows.sort(function(a, b) { return a[0] - b[0]; });
+  const merged = [];
+  for (const w of windows) {
+    if (!merged.length || w[0] > merged[merged.length - 1][1] + 5) {
+      merged.push([w[0], w[1]]);
+    } else {
+      merged[merged.length - 1][1] = Math.max(merged[merged.length - 1][1], w[1]);
+    }
+  }
+
+  const outParts = [];
+  let usedBytes = 0;
+  for (const seg of merged) {
+    const header = '// [EXCERPT_LINES ' + (seg[0] + 1) + '-' + (seg[1] + 1) + ' of ' + lines.length + ']';
+    const body = lines.slice(seg[0], seg[1] + 1).join(NL);
+    const chunk = header + NL + body + NL;
+    const cb = Buffer.byteLength(chunk, 'utf8');
+    if (usedBytes + cb > maxBytes && outParts.length > 0) break;
+    outParts.push(usedBytes + cb > maxBytes ? truncateUtf8(chunk, Math.max(1024, maxBytes - usedBytes)) : chunk);
+    usedBytes += cb;
+  }
+  return outParts.join(NL);
+}
+
 function buildMinimalBatchContext(batch, state, limits) {
   limits = limits || CHUNK_ENGINE_LIMITS;
   const hardBudget = limits.batchHard || CHUNK_ENGINE_LIMITS.batchHard;
-  const maxTargetBytes = limits.maxBatchTargetSourceBytes || CHUNK_ENGINE_LIMITS.maxBatchTargetSourceBytes;
+  const configuredTargetBytes = limits.maxBatchTargetSourceBytes || CHUNK_ENGINE_LIMITS.maxBatchTargetSourceBytes;
   const targets = (batch && Array.isArray(batch.targets)) ? batch.targets : [];
+  const maxTargetBytes = (limits === CHUNK_ENGINE_LIMITS && targets.length <= 2)
+    ? Math.max(configuredTargetBytes, 24 * 1024)
+    : configuredTargetBytes;
   const projectRoot = state && state.scan && state.scan.projectRoot ? state.scan.projectRoot : null;
 
   const miniMap = buildBatchMiniMap(batch, state, limits);
@@ -1436,7 +1498,7 @@ function buildMinimalBatchContext(batch, state, limits) {
         const raw = fs.readFileSync(abs);
         const inspected = inspectTextBuffer(raw);
         if (inspected.isText) {
-          blocks.push('', '--- FILE: ' + rel + ' ---', truncateUtf8(inspected.text, maxTargetBytes));
+          blocks.push('', '--- FILE: ' + rel + ' ---', extractTargetedSourceForBatch(inspected.text, maxTargetBytes, planSlice, state && state.userRequest));
         }
       } catch (_) {}
     }
@@ -1953,11 +2015,12 @@ function createAutopilotEngine(deps) {
       return { parsed: parsed, missing: missing, extra: extra };
     };
 
-    const repairFormat = async function(detail) {
+    const repairFormat = async function(detail, targetsOverride) {
       job.retriesUsed = (job.retriesUsed || 0) + 1;
+      const retryTargets = (Array.isArray(targetsOverride) && targetsOverride.length) ? targetsOverride : expectedTargets;
       const corrPrompt = [
         'KORRIGJIM FORMATI I DETYRUESHEM: ' + detail,
-        'Kthe kodin 100% te plote me etiketen ### FILE: rruga/skedari.ext per keto objektiva: ' + expectedTargets.join(', ')
+        'Kthe patch-in e plote diff --git (ose ### FILE: vetem per skedar te ri) per keto objektiva: ' + retryTargets.join(', ')
       ].join(NL);
       return await dispatchChunkedEngineTurn(engine, state.scan.projectRoot, corrPrompt, null, {
         forceFreshChat: false,
@@ -2091,8 +2154,13 @@ function createAutopilotEngine(deps) {
             const subReceipts = await executeBatchWithRecovery(subBatch, state, routing, job, Object.assign({}, opts, { coderEngine: initialEngine, halvingLevel: level + 1, batchCosts: batchCosts, failoverScope: { localFailoverCount: 0, batchLocalFailedEngines: new Set() } }));
             for (const r of subReceipts) {
               results.push(r);
-              if (r.parsedFiles && r.parsedFiles.length && !r.skippedFromCheckpoint) {
-                executor.persistCheckpointReceiptOnce(codePath, r, r.parsedFiles, state.scan.projectRoot, checkpointIdentity);
+              const cpEntries = (r.parsedFiles && r.parsedFiles.length)
+                ? r.parsedFiles
+                : (r.filesWritten || []).map(function(rel) {
+                    return { relPath: rel, inputSha256: (r.fileHashes && r.fileHashes[rel]) || '' };
+                  });
+              if (cpEntries.length && !r.skippedFromCheckpoint) {
+                executor.persistCheckpointReceiptOnce(codePath, r, cpEntries, state.scan.projectRoot, checkpointIdentity);
                 r.checkpointPersisted = true;
               }
             }
@@ -2102,7 +2170,7 @@ function createAutopilotEngine(deps) {
       }
 
       const exhausted = 'BATCH_RECOVERY_EXHAUSTED: ' + batchToHalve.batchId + ' ' + String(err && err.message || err);
-      if (batchToHalve.targets.length > 1 || !isEngineFailoverEligible(exhausted) || failoverScope.localFailoverCount >= 2) throw new Error(exhausted);
+      if (!isEngineFailoverEligible(exhausted) || failoverScope.localFailoverCount >= 2) throw new Error(exhausted);
       failoverScope.batchLocalFailedEngines.add(initialEngine);
       state.failedEngines.add(initialEngine);
       const nextEngine = getFailoverEngines(initialEngine, failoverScope.batchLocalFailedEngines, runtimeContext)[0];
@@ -2456,8 +2524,13 @@ function createAutopilotEngine(deps) {
           batchReceipts.push(receipt);
           const writtenNorm = (receipt.filesWritten || []).map(normalizeCheckpointTarget);
           writtenNorm.forEach(function(t) { allWrittenFilesSet.add(t); });
-          if (!receipt.checkpointPersisted && receipt.parsedFiles && receipt.parsedFiles.length && !receipt.skippedFromCheckpoint) {
-            executor.persistCheckpointReceiptOnce(codePath, receipt, receipt.parsedFiles, cleanRoot, checkpointIdentity);
+          const cpEntries = (receipt.parsedFiles && receipt.parsedFiles.length)
+            ? receipt.parsedFiles
+            : writtenNorm.map(function(rel) {
+                return { relPath: rel, inputSha256: (receipt.fileHashes && receipt.fileHashes[rel]) || '' };
+              });
+          if (!receipt.checkpointPersisted && cpEntries.length && !receipt.skippedFromCheckpoint) {
+            executor.persistCheckpointReceiptOnce(codePath, receipt, cpEntries, cleanRoot, checkpointIdentity);
           }
           const cpHeader = buildBatchCheckpointHeader({
             planFingerprint: currentPlanFingerprint,
@@ -2509,9 +2582,26 @@ function createAutopilotEngine(deps) {
       let finalChecks = await executor.runFinalBuildAndTests(cleanRoot);
       writeFileAtomic(logPath, JSON.stringify(finalChecks, null, 2));
 
-      for (let repairRound = 1; repairRound <= 2 && finalChecks.status !== 'CHECK_PASSED'; repairRound++) {
+      const isEnvironmentToolingError = function(text) {
+        const raw = String(text || '');
+        return /No \.NET SDKs were found|dotnet\/sdk-not-found|MSB\d{4}:.*(?:SDK|reference assemblies)|is not recognized as an internal or external command|command not found|ENOENT|EACCES|EPERM/i.test(raw);
+      };
+      const isArchiveOrIgnoredTarget = function(relPath) {
+        return /^(?:artifacts|archive|archives|backup|backups|snapshots|packages|obj|bin|\.localpersonalai|\.antigravity|node_modules)\//i.test(String(relPath || '').replace(/\\/g, '/'));
+      };
+      const allowedPlanTargets = new Set(batches.flatMap(function(b) { return (b && Array.isArray(b.targets)) ? b.targets.map(normalizeCheckpointTarget) : []; }));
+
+      let environmentErrorDetected = null;
+      if (finalChecks.status !== 'CHECK_PASSED' && isEnvironmentToolingError(JSON.stringify(finalChecks))) {
+        environmentErrorDetected = (finalChecks.repairEvidence && finalChecks.repairEvidence.errorExcerpt) || 'ENVIRONMENT_TOOLING_FAILED';
+      }
+
+      for (let repairRound = 1; repairRound <= 2 && finalChecks.status !== 'CHECK_PASSED' && !environmentErrorDetected; repairRound++) {
         const errorText = JSON.stringify(finalChecks);
-        const knownTargets = Array.from(new Set([...allWrittenFiles, ...scan.files.map(function(f) { return f.path; })]));
+        const nonArchiveFiles = scan.files.map(function(f) { return f.path; }).filter(function(p) {
+          return !isArchiveOrIgnoredTarget(p) || allowedPlanTargets.has(normalizeCheckpointTarget(p));
+        });
+        const knownTargets = Array.from(new Set([...allWrittenFiles, ...nonArchiveFiles]));
         const mentioned = extractTargetsFromError(errorText, knownTargets);
         if (!mentioned.length) break;
         job.phase = 'INTEGRATION_REPAIR';
@@ -2522,25 +2612,35 @@ function createAutopilotEngine(deps) {
         for (const receipt of receipts) {
           batchReceipts.push(receipt);
           (receipt.filesWritten || []).map(normalizeCheckpointTarget).forEach(function(t) { allWrittenFilesSet.add(t); });
-          if (!receipt.checkpointPersisted && receipt.parsedFiles && receipt.parsedFiles.length && !receipt.skippedFromCheckpoint) {
-            executor.persistCheckpointReceiptOnce(codePath, receipt, receipt.parsedFiles, cleanRoot, checkpointIdentity);
+          const cpEntries = (receipt.parsedFiles && receipt.parsedFiles.length)
+            ? receipt.parsedFiles
+            : writtenNorm.map(function(rel) {
+                return { relPath: rel, inputSha256: (receipt.fileHashes && receipt.fileHashes[rel]) || '' };
+              });
+          if (!receipt.checkpointPersisted && cpEntries.length && !receipt.skippedFromCheckpoint) {
+            executor.persistCheckpointReceiptOnce(codePath, receipt, cpEntries, cleanRoot, checkpointIdentity);
           }
         }
         allWrittenFiles = Array.from(allWrittenFilesSet).sort();
         finalChecks = await executor.runFinalBuildAndTests(cleanRoot);
         writeFileAtomic(logPath, JSON.stringify(finalChecks, null, 2));
         if (finalChecks.status === 'CHECK_PASSED') state.lastErrorReceipt = '';
+        else if (isEnvironmentToolingError(JSON.stringify(finalChecks))) {
+          environmentErrorDetected = (finalChecks.repairEvidence && finalChecks.repairEvidence.errorExcerpt) || 'ENVIRONMENT_TOOLING_FAILED';
+          break;
+        }
       }
 
       if (finalChecks.status !== 'CHECK_PASSED') {
-        notifyWhatsApp('[HERMES /run-cycle] Faza APPLY: DËSHTIM');
+        notifyWhatsApp('[HERMES /run-cycle] Faza APPLY: DËSHTIM' + (environmentErrorDetected ? ' (Mungon vegla/SDK mjedisi)' : ''));
         writeProjectState(cleanRoot, {
           phase: 'BUILD_FAILED',
-          lastStatus: 'FINAL_APPLY_AND_TEST_FAILED',
+          lastStatus: environmentErrorDetected ? 'ENVIRONMENT_TOOLING_FAILED' : 'FINAL_APPLY_AND_TEST_FAILED',
+          lastError: environmentErrorDetected ? truncateUtf8(environmentErrorDetected, 1000) : undefined,
           requestFingerprint: currentRequestFingerprint,
           planFingerprint: currentPlanFingerprint
         });
-        throw new Error('FINAL_APPLY_AND_TEST_FAILED');
+        throw new Error(environmentErrorDetected ? ('ENVIRONMENT_TOOLING_FAILED: ' + truncateUtf8(environmentErrorDetected, 400)) : 'FINAL_APPLY_AND_TEST_FAILED');
       }
       notifyWhatsApp('[HERMES /run-cycle] Faza APPLY: SUKSES');
 

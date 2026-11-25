@@ -70,6 +70,7 @@ test('inspectGeminiTemporaryChatDom detects real Gemini Temporary Chat banner ("
       innerText: "Just stopping by?\nTemporary chats don't appear in recent chats and aren't used to improve Google AI. Stored for 72 hours for safety.",
       classList: { contains: () => false },
       getAttribute: () => '',
+      closest: () => null,
       getBoundingClientRect: () => ({ width: 400, height: 120 })
     };
     global.window = { getComputedStyle: () => ({ display: 'block', visibility: 'visible' }) };
@@ -80,6 +81,39 @@ test('inspectGeminiTemporaryChatDom detects real Gemini Temporary Chat banner ("
     const res = await inspectGeminiTemporaryChatDom({ evaluate: (fn) => fn() });
     assert.equal(res.indicatorFound, true);
     assert.equal(res.active, true);
+
+    // Turn-2 active conversation: top header shows "Temporary Chat", while sidebar button should not false-trigger when inactive
+    const headerNode = {
+      isConnected: true,
+      innerText: 'Temporary Chat',
+      classList: { contains: () => false },
+      getAttribute: () => '',
+      closest: () => null,
+      getBoundingClientRect: () => ({ width: 120, height: 24 })
+    };
+    global.document = {
+      querySelectorAll: (sel) => (sel.includes('header') ? [headerNode] : []),
+      querySelector: () => null
+    };
+    const turn2Res = await inspectGeminiTemporaryChatDom({ evaluate: (fn) => fn() });
+    assert.equal(turn2Res.indicatorFound, true);
+    assert.equal(turn2Res.active, true);
+
+    const sidebarButtonNode = {
+      isConnected: true,
+      innerText: 'Temporary Chat',
+      classList: { contains: () => false },
+      getAttribute: () => '',
+      closest: (s) => (s.includes('button') ? {} : null),
+      getBoundingClientRect: () => ({ width: 120, height: 24 })
+    };
+    global.document = {
+      querySelectorAll: (sel) => (sel.includes('header') ? [sidebarButtonNode] : []),
+      querySelector: () => null
+    };
+    const offRes = await inspectGeminiTemporaryChatDom({ evaluate: (fn) => fn() });
+    assert.equal(offRes.indicatorFound, false);
+    assert.equal(offRes.active, false);
   } finally {
     global.document = prevDocument;
     global.window = prevWindow;
@@ -124,5 +158,113 @@ test('local_executor spawns git/node/python/taskkill strictly with windowsHide:t
   assert.ok(spawnLines.length >= 10);
   for (const line of spawnLines) {
     assert.match(line, /windowsHide:\s*true/, `Missing windowsHide:true on line: ${line.trim()}`);
+  }
+});
+
+test('parseCodeBlocksFromMarkdown skips fenced diff patches so applyBatch never treats diff as collapsed stub', () => {
+  const { parseCodeBlocksFromMarkdown } = require(path.join(__dirname, '..', 'pipeline', 'local_executor.js'));
+  const diffMd = [
+    '```diff',
+    'diff --git a/src/Other.cs b/src/Other.cs',
+    '--- a/src/Other.cs',
+    '+++ b/src/Other.cs',
+    '@@ -1,2 +1,2 @@',
+    '-old();',
+    '+new();',
+    '```'
+  ].join('\n');
+  const parsed = parseCodeBlocksFromMarkdown(diffMd, ['src/BigExecutor.cs', 'src/Other.cs']);
+  assert.equal(parsed.length, 0, 'Fenced unified diff must not be parsed as full-file replacement for BigExecutor.cs');
+});
+
+test('buildMinimalBatchContext extracts line/symbol windows from >200KB source files', () => {
+  const os = require('os');
+  const { buildMinimalBatchContext, CHUNK_ENGINE_LIMITS } = require(path.join(__dirname, '..', 'pipeline', 'autopilot_engine.js'));
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-big-src-'));
+  try {
+    fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+    const lines = [];
+    for (let i = 1; i <= 3000; i++) {
+      if (i === 1270) {
+        lines.push('internal static void ValidateAcceptedConnectivity() { if (OpenConnectors == 0) {} }');
+      } else {
+        lines.push('// filler line ' + i + ' ' + 'x'.repeat(80));
+      }
+    }
+    fs.writeFileSync(path.join(tmpDir, 'src', 'Huge.cs'), lines.join('\r\n'), 'utf8');
+    const ctx = buildMinimalBatchContext(
+      { batchId: 'B1', targets: ['src/Huge.cs'] },
+      { scan: { projectRoot: tmpDir, files: [{ path: 'src/Huge.cs', bytes: 260000 }] }, planSlice: 'Rreth rreshtit ~1270 ValidateAcceptedConnectivity OpenConnectors' },
+      CHUNK_ENGINE_LIMITS
+    );
+    assert.ok(ctx.text.includes('ValidateAcceptedConnectivity'), 'Targeted symbol window around line 1270 must be included in batch context');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('applyBatch applies patch inside App subdirectory of parent .git repository', () => {
+  const os = require('os');
+  const { spawnSync } = require('child_process');
+  const { applyBatch } = require(path.join(__dirname, '..', 'pipeline', 'local_executor.js'));
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-subgit-'));
+  try {
+    const app = path.join(parent, 'App');
+    fs.mkdirSync(path.join(app, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(app, 'src', 'Demo.cs'), 'line1\r\nline2\r\n', 'utf8');
+    spawnSync('git', ['init'], { cwd: parent, windowsHide: true });
+    spawnSync('git', ['config', 'user.email', 'test@example.com'], { cwd: parent, windowsHide: true });
+    spawnSync('git', ['config', 'user.name', 'Test'], { cwd: parent, windowsHide: true });
+    spawnSync('git', ['add', '.'], { cwd: parent, windowsHide: true });
+    spawnSync('git', ['commit', '-m', 'init'], { cwd: parent, windowsHide: true });
+
+    const patchOutput = [
+      'diff --git a/src/Demo.cs b/src/Demo.cs',
+      '--- a/src/Demo.cs',
+      '+++ b/src/Demo.cs',
+      '@@ -1,2 +1,2 @@',
+      ' line1',
+      '-line2',
+      '+line2_fixed'
+    ].join('\n');
+    const res = applyBatch({
+      projectRoot: app,
+      batch: { batchId: 'SUBGIT_1', targets: ['src/Demo.cs'] },
+      parsedFiles: [],
+      batchOutput: patchOutput
+    });
+    assert.equal(res.status, 'BATCH_APPLIED');
+    assert.match(fs.readFileSync(path.join(app, 'src', 'Demo.cs'), 'utf8'), /line2_fixed/);
+  } finally {
+    fs.rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+test('autopilot_engine fails fast without wasting INTEGRATION_REPAIR calls on environment tooling errors', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'pipeline', 'autopilot_engine.js'), 'utf8');
+  assert.match(src, /isEnvironmentToolingError/);
+  assert.match(src, /ENVIRONMENT_TOOLING_FAILED/);
+  assert.match(src, /isArchiveOrIgnoredTarget/);
+});
+
+test('persistCheckpointReceiptOnce persists DIFF_PATCH targets and isTargetVerifiedForCheckpoint validates them on resume', () => {
+  const os = require('os');
+  const crypto = require('crypto');
+  const le = require(path.join(__dirname, '..', 'pipeline', 'local_executor.js'));
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-diff-cp-'));
+  try {
+    fs.mkdirSync(path.join(tmpRoot, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(tmpRoot, 'src', 'Target.cs'), 'class A { int x = 2; }\n', 'utf8');
+    const codePath = path.join(tmpRoot, 'code.md');
+    const planText = 'FILE_TARGET: src/Target.cs';
+    const planFp = crypto.createHash('sha256').update(planText).digest('hex');
+    const identity = Object.assign({}, le.computeCheckpointIdentity(tmpRoot, planText), { planFingerprint: planFp });
+    const exec = le.createLocalExecutor({ fs, path, crypto });
+    fs.writeFileSync(codePath, '<!-- CODE_PLAN_META planFingerprint=' + planFp + ' -->\n', 'utf8');
+    exec.persistCheckpointReceiptOnce(codePath, { batchId: 'BATCH_1' }, [{ relPath: 'src/Target.cs' }], tmpRoot, identity);
+    const audit = le.parseCheckpointAudit(fs.readFileSync(codePath, 'utf8'));
+    assert.equal(le.isTargetVerifiedForCheckpoint(audit, 'src/Target.cs', tmpRoot, identity), true);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });

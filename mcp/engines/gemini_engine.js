@@ -591,7 +591,9 @@ async function inspectGeminiTemporaryChatDom(page) {
           .filter(actionable);
         indicatorFound = elements.some(function(el) {
           const t = normalize(el.innerText || el.textContent || '');
-          return (
+          const isHeaderOnlyBanner = !el.closest('button, [role="button"], [role="switch"], nav, [role="navigation"], aside, [role="menu"]') &&
+            (t === 'temporary chat' || t === 'bisedë e përkohshme');
+          return isHeaderOnlyBanner || (
             (t.includes('temporary chat') || t.includes('bisedë e përkohshme')) &&
             (t.includes("won't appear") || t.includes("won’t appear") || t.includes("don't appear") || t.includes("don’t appear") || t.includes("aren't used") || t.includes('recent chats') || t.includes('72 hours') || t.includes('nuk do të ruhet') || t.includes('is on') || t.includes('është aktive') || el.classList.contains('active'))
           ) || t === 'just stopping by?';
