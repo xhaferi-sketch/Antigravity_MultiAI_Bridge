@@ -248,6 +248,7 @@ function parseCodeBlocksFromMarkdown(markdown, expectedTargets, projectRoot) {
     const targetKey = normalizeTargetKey(target);
     if (!target || (expectedMap.size && !expectedMap.has(targetKey))) return;
     let code = (item.line.slice(target.length) + tail).trim();
+    code = code.replace(/\r?\nUse code with caution\.\s*$/, '');
     code = code.replace(/^(?:python|javascript|typescript|csharp|json|html|css|bash|shell)\s*/i, '');
     const ext = nodePath.extname(target).slice(1).toLowerCase();
     let kind = '';
@@ -259,7 +260,8 @@ function parseCodeBlocksFromMarkdown(markdown, expectedTargets, projectRoot) {
     else if (ext === 'css') kind = 'css';
     else if (['sh', 'bash'].includes(ext)) kind = 'sh';
     let lexical = false;
-    if (kind === 'py') lexical = matchesAnyStarter(code, PYTHON_STARTERS);
+    if (/^(?:\/\/[^\n]*\r?\n\s*)?<<<<<<< SEARCH\r?\n/m.test(code)) lexical = true;
+    else if (kind === 'py') lexical = matchesAnyStarter(code, PYTHON_STARTERS);
     else if (kind === 'js') lexical = matchesAnyStarter(code, JS_STARTERS);
     else if (starters[kind]) lexical = starters[kind].test(code);
     if (!lexical) return;
@@ -270,8 +272,116 @@ function parseCodeBlocksFromMarkdown(markdown, expectedTargets, projectRoot) {
   return results;
 }
 
+function hasSearchReplaceBlocks(text) {
+  const str = String(text || '');
+  return /^<<<<<<< SEARCH\r?\n[\s\S]*?\r?\n=======\r?\n[\s\S]*?\r?\n>>>>>>> REPLACE(?:\r?\n|$)/m.test(str) || str.includes('<<<<<<< SEARCH');
+}
+
+function parseSearchReplaceBlocks(patchText, relPath) {
+  const label = relPath || 'unknown';
+  const normalized = String(patchText || '').replace(/\r\n/g, '\n');
+  const lines = normalized.split('\n');
+  const blocks = [];
+  let state = 'OUTSIDE';
+  let searchLines = [];
+  let replaceLines = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line === '<<<<<<< SEARCH') {
+      if (state !== 'OUTSIDE') {
+        throw new Error('SEARCH_REPLACE_PARSE_FAILED: ' + label);
+      }
+      state = 'IN_SEARCH';
+      searchLines = [];
+      replaceLines = [];
+      continue;
+    }
+    if (line.startsWith('<<<<<<< SEARCH') && line.trim() !== '<<<<<<< SEARCH') {
+      throw new Error('SEARCH_REPLACE_PARSE_FAILED: ' + label);
+    }
+    if (line === '=======') {
+      if (state === 'IN_SEARCH') {
+        state = 'IN_REPLACE';
+        continue;
+      }
+      if (state === 'OUTSIDE') {
+        throw new Error('SEARCH_REPLACE_PARSE_FAILED: ' + label);
+      }
+    }
+    if (line === '>>>>>>> REPLACE') {
+      if (state !== 'IN_REPLACE') {
+        throw new Error('SEARCH_REPLACE_PARSE_FAILED: ' + label);
+      }
+      blocks.push({
+        search: searchLines.join('\n'),
+        replace: replaceLines.join('\n')
+      });
+      state = 'OUTSIDE';
+      continue;
+    }
+    if (line.startsWith('>>>>>>> REPLACE') && line.trim() !== '>>>>>>> REPLACE') {
+      throw new Error('SEARCH_REPLACE_PARSE_FAILED: ' + label);
+    }
+    if (state === 'IN_SEARCH') {
+      searchLines.push(line);
+    } else if (state === 'IN_REPLACE') {
+      replaceLines.push(line);
+    }
+  }
+
+  if (state !== 'OUTSIDE' || blocks.length === 0) {
+    throw new Error('SEARCH_REPLACE_PARSE_FAILED: ' + label);
+  }
+  return blocks;
+}
+
+function applySearchReplaceBlocks(existingText, patchText, relPath) {
+  const label = relPath || 'unknown';
+  const blocks = parseSearchReplaceBlocks(patchText, label);
+  const rawExisting = String(existingText ?? '');
+  const hasCrlf = /\r\n/.test(rawExisting);
+  let working = rawExisting.replace(/\r\n/g, '\n');
+
+  for (const blk of blocks) {
+    const search = String(blk.search ?? '').replace(/\r\n/g, '\n');
+    const replace = String(blk.replace ?? '').replace(/\r\n/g, '\n');
+
+    if (search === '') {
+      if (working !== '') {
+        throw new Error('SEARCH_BLOCK_NOT_FOUND: ' + label);
+      }
+      working = replace;
+      continue;
+    }
+
+    let count = 0;
+    let firstIdx = -1;
+    let fromIdx = 0;
+    while (true) {
+      const idx = working.indexOf(search, fromIdx);
+      if (idx === -1) break;
+      if (count === 0) firstIdx = idx;
+      count++;
+      if (count > 1) break;
+      fromIdx = idx + search.length;
+    }
+
+    if (count === 0) {
+      throw new Error('SEARCH_BLOCK_NOT_FOUND: ' + label);
+    }
+    if (count > 1) {
+      throw new Error('SEARCH_BLOCK_AMBIGUOUS: ' + label);
+    }
+
+    working = working.slice(0, firstIdx) + replace + working.slice(firstIdx + search.length);
+  }
+
+  return hasCrlf ? working.replace(/\n/g, '\r\n') : working;
+}
+
 function validateGeneratedCodeMarkdown(markdown, projectRoot) {
-  const hasDiffPatch = /^(?:diff --git a\/[^\r\n]+ b\/[^\r\n]+|--- a\/[^\r\n]+\r?\n\+\+\+ b\/[^\r\n]+)/m.test(markdown);
+  const hasDiffPatch = /^(?:diff --git a\/[^\r\n]+ b\/[^\r\n]+|--- (?:a\/[^\r\n]+|\/dev\/null)\r?\n\+\+\+ b\/[^\r\n]+)/m.test(markdown);
   if (hasDiffPatch) {
     return { valid: true, isPatch: true, fileBlocks: [] };
   }
@@ -286,9 +396,25 @@ function validateGeneratedCodeMarkdown(markdown, projectRoot) {
     /\/\/\s*TODO:\s*implement/i
   ];
   for (const b of fileBlocks) {
-    for (const pat of forbiddenPatterns) {
-      if (pat.test(b.code)) {
-        return { valid: false, reason: 'Placeholder i ndaluar u gjet ne skedarin ' + b.relPath + '. Kerkohet kod 100% i plote.' };
+    if (hasSearchReplaceBlocks(b.code)) {
+      let srBlocks;
+      try {
+        srBlocks = parseSearchReplaceBlocks(b.code, b.relPath);
+      } catch (err) {
+        return { valid: false, reason: err.message };
+      }
+      for (const sr of srBlocks) {
+        for (const pat of forbiddenPatterns) {
+          if (pat.test(sr.replace)) {
+            return { valid: false, reason: 'Placeholder i ndaluar u gjet ne skedarin ' + b.relPath + '. Kerkohet kod 100% i plote.' };
+          }
+        }
+      }
+    } else {
+      for (const pat of forbiddenPatterns) {
+        if (pat.test(b.code)) {
+          return { valid: false, reason: 'Placeholder i ndaluar u gjet ne skedarin ' + b.relPath + '. Kerkohet kod 100% i plote.' };
+        }
       }
     }
   }
@@ -733,17 +859,25 @@ function createLocalExecutor(runtimeContext) {
         if (seen.has(file.relPath) || !expectedMap.has(fileKey)) throw new Error('BATCH_OUTPUT_INCOMPLETE');
         const canonicalRel = expectedMap.get(fileKey) || file.relPath;
         const abs = absoluteTarget(canonicalRel);
-        if (detectUnpairedSurrogates(file.code) || Buffer.from(file.code).includes(0)) throw new Error('BUNDLE_INVALID_UNICODE');
-        if (fs.existsSync(abs)) {
+        const isSearchReplace = hasSearchReplaceBlocks(file.code);
+        let nextCode = file.code;
+        if (isSearchReplace) {
+          if (!fs.existsSync(abs)) {
+            throw new Error('SEARCH_TARGET_MISSING: ' + canonicalRel);
+          }
+          const existingContent = fs.readFileSync(abs, 'utf8');
+          nextCode = applySearchReplaceBlocks(existingContent, file.code, canonicalRel);
+        } else if (fs.existsSync(abs)) {
           const existingStat = fs.statSync(abs);
-          if (existingStat.size > 5000 && Buffer.byteLength(file.code, 'utf8') < existingStat.size * 0.25 && file.code.split('\n').length < 30) {
-            throw new Error('BATCH_OUTPUT_COLLAPSED_STUB: ' + canonicalRel + ' shrunk from ' + existingStat.size + ' bytes to ' + Buffer.byteLength(file.code, 'utf8') + ' bytes');
+          if (existingStat.size > 5000 && Buffer.byteLength(nextCode, 'utf8') < existingStat.size * 0.25 && nextCode.split('\n').length < 30) {
+            throw new Error('BATCH_OUTPUT_COLLAPSED_STUB: ' + canonicalRel + ' shrunk from ' + existingStat.size + ' bytes to ' + Buffer.byteLength(nextCode, 'utf8') + ' bytes');
           }
         }
+        if (detectUnpairedSurrogates(nextCode) || Buffer.from(nextCode).includes(0)) throw new Error('BUNDLE_INVALID_UNICODE');
         backupOnce(canonicalRel);
         fs.mkdirSync(path.dirname(abs), { recursive: true });
         const tmp = abs + '.antigravity-tmp';
-        fs.writeFileSync(tmp, file.code, 'utf8');
+        fs.writeFileSync(tmp, nextCode, 'utf8');
         fs.renameSync(tmp, abs);
         seen.add(canonicalRel);
       }
@@ -936,43 +1070,289 @@ function createLocalExecutor(runtimeContext) {
 
     const writtenFiles = [];
     if (check.isPatch) {
-      const patchStart = rawMarkdown.search(/^(?:diff --git a\/[^\r\n]+ b\/[^\r\n]+|--- a\/[^\r\n]+\r?\n\+\+\+ b\/[^\r\n]+)/m);
-      if (patchStart >= 0) {
-        let rawPatch = rawMarkdown.slice(patchStart);
-        const codeFenceEnd = rawPatch.search(/\r?\n```/);
-        if (codeFenceEnd >= 0) rawPatch = rawPatch.slice(0, codeFenceEnd);
-        rawPatch = rawPatch.trimEnd() + NL;
+      const patchStart = rawMarkdown.search(/^(?:diff --git a\/[^\r\n]+ b\/[^\r\n]+|--- (?:a\/[^\r\n]+|\/dev\/null)\r?\n\+\+\+ b\/[^\r\n]+)/m);
+      if (patchStart < 0) {
+        throw new Error('GIT_APPLY_FAILED: PATCH_PARSE_FAILED');
+      }
+      const realRoot = fs.realpathSync(cleanRoot);
+      const rawPatch = rawMarkdown
+        .slice(patchStart)
+        .split(/\r?\n/)
+        .filter(function(ln) { return !/^\s*```[a-zA-Z0-9_-]*\s*$/.test(ln); })
+        .join('\n')
+        .trimEnd() + NL;
 
-        const patchFile = path.join(cleanRoot, '.antigravity-patch-' + process.pid + '-' + crypto.randomBytes(6).toString('hex') + '.patch');
-        fs.writeFileSync(patchFile, rawPatch, 'utf8');
-
-        let gitDirArg = [];
-        try {
-          const revParse = spawnSync('git', ['rev-parse', '--show-toplevel'], { cwd: cleanRoot, encoding: 'utf8', windowsHide: true });
-          if (revParse.status === 0 && revParse.stdout) {
-            const gitTop = path.resolve(revParse.stdout.trim());
-            const absClean = path.resolve(cleanRoot);
-            if (gitTop !== absClean && absClean.startsWith(gitTop)) {
-              const relSub = path.relative(gitTop, absClean).replace(/\\/g, '/');
-              if (relSub) gitDirArg = ['--directory=' + relSub];
-            }
+      const resolveSafePatchTarget = function(rel) {
+        if (!rel || typeof rel !== 'string') throw new Error('SECURITY_BLOCK: invalid patch target ' + rel);
+        const cleaned = normalizeCheckpointTarget(rel);
+        if (!cleaned || /(?:^|[\\/])\.\.(?:[\\/]|$)/.test(rel) || /(?:^|[\\/])\.\.(?:[\\/]|$)/.test(cleaned)) {
+          throw new Error('SECURITY_BLOCK: path traversal ' + rel);
+        }
+        if (path.isAbsolute(rel) || path.isAbsolute(cleaned) || /^[a-zA-Z]:/.test(rel)) {
+          throw new Error('SECURITY_BLOCK: absolute path ' + rel);
+        }
+        const abs = path.resolve(realRoot, cleaned);
+        if (abs !== realRoot && !abs.startsWith(realRoot + path.sep)) {
+          throw new Error('SECURITY_BLOCK: outside projectRoot ' + rel);
+        }
+        let checkPath = fs.existsSync(abs) ? abs : path.dirname(abs);
+        while (checkPath && !fs.existsSync(checkPath)) {
+          const parent = path.dirname(checkPath);
+          if (parent === checkPath) break;
+          checkPath = parent;
+        }
+        if (checkPath && fs.existsSync(checkPath)) {
+          const realCheck = fs.realpathSync(checkPath);
+          if (realCheck !== realRoot && !realCheck.startsWith(realRoot + path.sep)) {
+            throw new Error('SECURITY_BLOCK: symlink escape ' + rel);
           }
-        } catch (_) {}
+        }
+        return abs;
+      };
 
-        let gitArgs = ['apply', '--3way', '--recount', '--whitespace=nowarn'].concat(gitDirArg).concat([patchFile]);
-        let applyResult = spawnSync('git', gitArgs, { cwd: cleanRoot, encoding: 'utf8', windowsHide: true });
-        try { fs.unlinkSync(patchFile); } catch (_) {}
+      const patchPaths = [];
+      const diffGitMatches = Array.from(rawPatch.matchAll(/^diff --git a\/([^\r\n]+) b\/([^\r\n]+)$/gm));
+      if (diffGitMatches.length > 0) {
+        for (const m of diffGitMatches) {
+          const rawOld = String(m[1] || '').trim();
+          const rawNew = String(m[2] || '').trim();
+          resolveSafePatchTarget(rawNew);
+          if (rawOld !== '/dev/null') resolveSafePatchTarget(rawOld);
+          const oldPath = rawOld === '/dev/null' ? '/dev/null' : normalizeCheckpointTarget(rawOld);
+          const newPath = normalizeCheckpointTarget(rawNew);
+          if (oldPath !== newPath && oldPath !== '/dev/null') {
+            throw new Error('GIT_APPLY_FAILED: PATCH_PATH_MISMATCH ' + oldPath + ' -> ' + newPath);
+          }
+          if (!patchPaths.includes(newPath)) patchPaths.push(newPath);
+        }
+      } else {
+        const unifiedMatches = Array.from(rawPatch.matchAll(/^--- (?:a\/([^\r\n]+)|\/dev\/null)\r?\n\+\+\+ b\/([^\r\n]+)$/gm));
+        for (const m of unifiedMatches) {
+          const rawOld = m[1] ? String(m[1]).trim() : '/dev/null';
+          const rawNew = String(m[2] || '').trim();
+          resolveSafePatchTarget(rawNew);
+          if (rawOld !== '/dev/null') resolveSafePatchTarget(rawOld);
+          const oldPath = rawOld === '/dev/null' ? '/dev/null' : normalizeCheckpointTarget(rawOld);
+          const newPath = normalizeCheckpointTarget(rawNew);
+          if (oldPath !== newPath && oldPath !== '/dev/null') {
+            throw new Error('GIT_APPLY_FAILED: PATCH_PATH_MISMATCH ' + oldPath + ' -> ' + newPath);
+          }
+          if (!patchPaths.includes(newPath)) patchPaths.push(newPath);
+        }
+      }
+      if (!patchPaths.length) {
+        throw new Error('GIT_APPLY_FAILED: PATCH_PARSE_FAILED');
+      }
 
-        const outText = (applyResult.stdout || '') + (applyResult.stderr || '');
-        if (applyResult.error || applyResult.status !== 0 || outText.includes('Skipped patch')) {
-          throw new Error('GIT_APPLY_FAILED: ' + (outText || (applyResult.error ? applyResult.error.message : 'Unknown git apply error')));
+      const backups = [];
+      const prePatchHashes = {};
+      for (const rel of patchPaths) {
+        const abs = resolveSafePatchTarget(rel);
+        const exists = fs.existsSync(abs);
+        const content = exists ? fs.readFileSync(abs) : null;
+        backups.push({ path: rel, abs: abs, exists: exists, content: content });
+        prePatchHashes[rel] = exists ? crypto.createHash('sha256').update(content).digest('hex') : null;
+      }
+      let gitIndexPath = null;
+      let gitIndexBackup = null;
+      const restoreAll = function() {
+        for (let i = backups.length - 1; i >= 0; i--) {
+          const b = backups[i];
+          if (b.exists) {
+            fs.mkdirSync(path.dirname(b.abs), { recursive: true });
+            fs.writeFileSync(b.abs, b.content);
+          } else if (fs.existsSync(b.abs)) {
+            fs.rmSync(b.abs, { force: true });
+          }
+          const tmp = b.abs + '.antigravity-tmp';
+          if (fs.existsSync(tmp)) fs.rmSync(tmp, { force: true });
+        }
+        if (gitIndexBackup && gitIndexPath) {
+          try { fs.writeFileSync(gitIndexPath, gitIndexBackup); } catch (_) {}
+        }
+      };
+
+      const extractFileDiffSection = function(patchStr, rel) {
+        const fileHeader = 'diff --git a/' + rel + ' b/' + rel;
+        const fStart = patchStr.indexOf(fileHeader);
+        if (fStart >= 0) {
+          const fTail = patchStr.slice(fStart);
+          const nextDiffIdx = fTail.slice(fileHeader.length).search(/^diff --git /m);
+          return nextDiffIdx >= 0 ? fTail.slice(0, fileHeader.length + nextDiffIdx) : fTail;
+        }
+        const escRel = rel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const hdrRe = new RegExp('^--- (?:a\\/' + escRel + '|\\/dev\\/null)\\r?\\n\\+\\+\\+ b\\/' + escRel + '$', 'm');
+        const m = hdrRe.exec(patchStr);
+        if (!m) return '';
+        const tail = patchStr.slice(m.index);
+        const nextIdx = tail.slice(m[0].length).search(/^(?:diff --git |--- (?:a\/|\/dev\/null))/m);
+        return nextIdx >= 0 ? tail.slice(0, m[0].length + nextIdx) : tail;
+      };
+      const extractAllAdditionsFromDiff = function(fileDiff) {
+        if (!fileDiff) return null;
+        const hunkStart = fileDiff.search(/^@@ /m);
+        if (hunkStart < 0) return null;
+        const lines = fileDiff.slice(hunkStart).split(/\r?\n/);
+        const contentLines = [];
+        let inHunk = false, hasPlus = false;
+        for (const line of lines) {
+          if (line.startsWith('@@ ')) { inHunk = true; continue; }
+          if (!inHunk) continue;
+          if (line.startsWith('+')) { contentLines.push(line.slice(1)); hasPlus = true; }
+          else if (line.startsWith('-') || line.startsWith(' ')) return null;
+          else if (line.startsWith('\\ No newline')) continue;
+          else if (!line.trim()) continue;
+          else return null;
+        }
+        return hasPlus ? contentLines.join('\n') + '\n' : null;
+      };
+
+      let gitDirArg = [];
+      try {
+        const revParse = spawnSync('git', ['rev-parse', '--show-toplevel'], { cwd: realRoot, encoding: 'utf8', windowsHide: true });
+        if (revParse.status === 0 && revParse.stdout) {
+          const gitTop = fs.realpathSync(path.resolve(String(revParse.stdout || '').trim()));
+          if (gitTop !== realRoot && realRoot.startsWith(gitTop + path.sep)) {
+            const relSub = path.relative(gitTop, realRoot).replace(/\\/g, '/');
+            if (relSub) gitDirArg = ['--directory=' + relSub];
+          }
+        }
+      } catch (_) {}
+
+      const patchFile = path.join(realRoot, '.antigravity-patch-' + process.pid + '-' + crypto.randomBytes(6).toString('hex') + '.patch');
+      try {
+        fs.writeFileSync(patchFile, rawPatch, 'utf8');
+        let appliedOk = false;
+        const diagnostics = [];
+
+        // Tier 1: Working-tree-first (no --3way)
+        const check1 = spawnSync('git', ['apply', '--check', '--recount', '--whitespace=nowarn'].concat(gitDirArg).concat([patchFile]), { cwd: realRoot, encoding: 'utf8', windowsHide: true });
+        const out1Check = (check1.stdout || '') + (check1.stderr || '');
+        if (!check1.error && check1.status === 0 && !out1Check.includes('Skipped patch')) {
+          const apply1 = spawnSync('git', ['apply', '--recount', '--whitespace=nowarn'].concat(gitDirArg).concat([patchFile]), { cwd: realRoot, encoding: 'utf8', windowsHide: true });
+          const out1Apply = (apply1.stdout || '') + (apply1.stderr || '');
+          if (!apply1.error && apply1.status === 0 && !out1Apply.includes('Skipped patch')) {
+            appliedOk = true;
+          } else {
+            diagnostics.push('tier1_apply=' + (out1Apply || (apply1.error && apply1.error.message) || ('status_' + apply1.status)));
+            restoreAll();
+          }
+        } else {
+          diagnostics.push('tier1_check=' + (out1Check || (check1.error && check1.error.message) || ('status_' + check1.status)));
         }
 
-        const pathMatches = Array.from(rawPatch.matchAll(/^(?:diff --git a\/([^\r\n]+) b\/([^\r\n]+)|--- a\/([^\r\n]+))/gm));
-        pathMatches.forEach(function(m) {
-          const p = m[2] || m[1] || m[3];
-          if (p && !writtenFiles.includes(p)) writtenFiles.push(p);
+        // Tier 2: --3way ONLY when git repo exists AND index identity verified for all patchPaths
+        if (!appliedOk) {
+          const gitDirResult = spawnSync('git', ['rev-parse', '--git-dir'], { cwd: realRoot, encoding: 'utf8', windowsHide: true });
+          if (!gitDirResult.error && gitDirResult.status === 0 && String(gitDirResult.stdout || '').trim()) {
+            let canThreeWay = true;
+            for (const rel of patchPaths) {
+              const identity = spawnSync('git', ['ls-files', '--stage', '--', rel], { cwd: realRoot, encoding: 'utf8', windowsHide: true });
+              const rows = String(identity.stdout || '').trim().split(/\r?\n/).filter(Boolean);
+              if (identity.error || identity.status !== 0 || rows.length !== 1 || !/^100[0-7]{3} [0-9a-f]{40,64} 0\t/.test(rows[0])) {
+                canThreeWay = false;
+                diagnostics.push('tier2_skip_no_index_identity=' + rel);
+                break;
+              }
+            }
+            if (canThreeWay) {
+              gitIndexPath = path.join(path.resolve(realRoot, String(gitDirResult.stdout || '').trim()), 'index');
+              gitIndexBackup = fs.existsSync(gitIndexPath) ? fs.readFileSync(gitIndexPath) : null;
+              const check2 = spawnSync('git', ['apply', '--check', '--3way', '--recount', '--whitespace=nowarn'].concat(gitDirArg).concat([patchFile]), { cwd: realRoot, encoding: 'utf8', windowsHide: true });
+              const out2Check = (check2.stdout || '') + (check2.stderr || '');
+              if (!check2.error && check2.status === 0 && !out2Check.includes('Skipped patch')) {
+                const apply2 = spawnSync('git', ['apply', '--3way', '--recount', '--whitespace=nowarn'].concat(gitDirArg).concat([patchFile]), { cwd: realRoot, encoding: 'utf8', windowsHide: true });
+                const out2Apply = (apply2.stdout || '') + (apply2.stderr || '');
+                const unmerged = spawnSync('git', ['ls-files', '--unmerged'], { cwd: realRoot, encoding: 'utf8', windowsHide: true });
+                if (!apply2.error && apply2.status === 0 && !out2Apply.includes('Skipped patch') && !unmerged.error && unmerged.status === 0 && !String(unmerged.stdout || '').trim()) {
+                  appliedOk = true;
+                } else {
+                  diagnostics.push('tier2_apply=' + (out2Apply || String(unmerged.stdout || '') || ('status_' + apply2.status)));
+                  restoreAll();
+                }
+              } else {
+                diagnostics.push('tier2_check=' + (out2Check || (check2.error && check2.error.message) || ('status_' + check2.status)));
+              }
+            }
+          } else {
+            diagnostics.push('tier2_skip_not_git_repo');
+          }
+        }
+
+        // Tier 3: Deterministic JS fallback (all-additions / applyHunksToText) with atomic write
+        if (!appliedOk) {
+          let fallbackOk = true;
+          for (const rel of patchPaths) {
+            const abs = resolveSafePatchTarget(rel);
+            const fileDiff = extractFileDiffSection(rawPatch, rel);
+            const isNewFileDiff = /^--- \/dev\/null$/m.test(fileDiff);
+            const extractedAllAdd = tryExtractFileFromAllAdditions(rawPatch, rel) || (isNewFileDiff ? extractAllAdditionsFromDiff(fileDiff) : null);
+            if (extractedAllAdd !== null) {
+              fs.mkdirSync(path.dirname(abs), { recursive: true });
+              const tmp = abs + '.antigravity-tmp';
+              fs.writeFileSync(tmp, extractedAllAdd, 'utf8');
+              fs.renameSync(tmp, abs);
+              continue;
+            }
+            if (fs.existsSync(abs) && fileDiff) {
+              const origText = fs.readFileSync(abs, 'utf8');
+              const patched = applyHunksToText(origText, fileDiff);
+              if (patched !== null) {
+                const tmp = abs + '.antigravity-tmp';
+                fs.writeFileSync(tmp, patched, 'utf8');
+                fs.renameSync(tmp, abs);
+                continue;
+              }
+            }
+            diagnostics.push('tier3_failed=' + rel);
+            fallbackOk = false;
+            break;
+          }
+          if (fallbackOk) {
+            appliedOk = true;
+          } else {
+            restoreAll();
+          }
+        }
+
+        if (!appliedOk) {
+          throw new Error('GIT_APPLY_FAILED: ' + truncateUtf8(diagnostics.join(' | ') || 'Unknown git apply error', 4000));
+        }
+
+        // Post-apply anti-noop verification
+        for (const rel of patchPaths) {
+          const fileDiff = extractFileDiffSection(rawPatch, rel);
+          const hasHunkMutation = /^(?:\+(?!\+\+)|-(?!---))/m.test(fileDiff);
+          if (!hasHunkMutation) continue;
+          const abs = resolveSafePatchTarget(rel);
+          let postHash = fs.existsSync(abs)
+            ? crypto.createHash('sha256').update(fs.readFileSync(abs)).digest('hex')
+            : null;
+          if (postHash === prePatchHashes[rel]) {
+            if (fs.existsSync(abs) && fileDiff) {
+              const origText = fs.readFileSync(abs, 'utf8');
+              const patched = applyHunksToText(origText, fileDiff);
+              if (patched !== null && patched !== origText) {
+                const tmp = abs + '.antigravity-tmp';
+                fs.writeFileSync(tmp, patched, 'utf8');
+                fs.renameSync(tmp, abs);
+                postHash = crypto.createHash('sha256').update(fs.readFileSync(abs)).digest('hex');
+              }
+            }
+            if (postHash === prePatchHashes[rel]) {
+              throw new Error('GIT_APPLY_FAILED: PATCH_NOT_APPLIED_NOOP ' + rel);
+            }
+          }
+        }
+
+        patchPaths.forEach(function(p) {
+          if (!writtenFiles.includes(p)) writtenFiles.push(p);
         });
+      } catch (err) {
+        restoreAll();
+        throw err;
+      } finally {
+        try { if (fs.existsSync(patchFile)) fs.unlinkSync(patchFile); } catch (_) {}
       }
     } else {
       for (const item of check.fileBlocks) {
@@ -981,9 +1361,17 @@ function createLocalExecutor(runtimeContext) {
         if (!targetAbs.startsWith(cleanRoot + path.sep) && targetAbs !== cleanRoot) {
           throw new Error('SECURITY_BLOCK: Tentative shkrimi jashte projectRoot: ' + item.relPath);
         }
+        let nextCode = item.code;
+        if (hasSearchReplaceBlocks(item.code)) {
+          if (!fs.existsSync(targetAbs)) {
+            throw new Error('SEARCH_TARGET_MISSING: ' + cleanRel);
+          }
+          const existingContent = fs.readFileSync(targetAbs, 'utf8');
+          nextCode = applySearchReplaceBlocks(existingContent, item.code, cleanRel);
+        }
         const parentDir = path.dirname(targetAbs);
         if (!fs.existsSync(parentDir)) fs.mkdirSync(parentDir, { recursive: true });
-        atomicWriteValidated(targetAbs, item.code, fs, crypto);
+        atomicWriteValidated(targetAbs, nextCode, fs, crypto);
         writtenFiles.push(item.relPath);
       }
     }
@@ -1079,7 +1467,10 @@ function createLocalExecutor(runtimeContext) {
     applyAndTestDeterministically,
     migrateLegacyCheckpointReceipts,
     appendBatchAudit,
-    persistCheckpointReceiptOnce
+    persistCheckpointReceiptOnce,
+    hasSearchReplaceBlocks,
+    parseSearchReplaceBlocks,
+    applySearchReplaceBlocks
   };
 }
 
@@ -1118,6 +1509,9 @@ module.exports = {
   findUnsafeGeneratedSourceCharacters,
   detectUnpairedSurrogates,
   parseCodeBlocksFromMarkdown,
+  hasSearchReplaceBlocks,
+  parseSearchReplaceBlocks,
+  applySearchReplaceBlocks,
   validateGeneratedCodeMarkdown,
   atomicWriteValidated,
   parseCheckpointAudit,

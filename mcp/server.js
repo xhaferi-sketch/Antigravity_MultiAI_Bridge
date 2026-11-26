@@ -7,7 +7,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { execSync, spawnSync } = require('child_process');
+const { execSync, spawnSync, spawn } = require('child_process');
 const {
   resolveProjectRoot,
   computeRequestFingerprint,
@@ -23,6 +23,8 @@ const PORT = 4321;
 const HOST = '127.0.0.1';
 const PLUGIN_ROOT = path.resolve(__dirname, '..');
 const PROFILES_DIR = path.join(PLUGIN_ROOT, '.profiles');
+const GEMINI_CDP_PORTS = Object.freeze({ gemini1: 18001, gemini2: 18002, gemini3: 18003 });
+const cdpBrowsers = {};
 const REGISTRY_PATH = path.join(PLUGIN_ROOT, 'projects_registry.json');
 const SCORES_PATH = path.join(__dirname, 'model_scores.json');
 const NL = String.fromCharCode(10);
@@ -213,7 +215,7 @@ const tabActiveModel = {
 };
 const tabDiscoveredModels = {
   web1: '-', web2: '-',
-  gemini1: '-', gemini2: '-',
+  gemini1: '-', gemini2: '-', gemini3: '-',
   google_search_1: '4 Hydrogen · Everyday help, 4 Carbon · Most complex work',
   google_search_2: '4 Hydrogen · Everyday help, 4 Carbon · Most complex work',
   google_search_3: '4 Hydrogen · Everyday help, 4 Carbon · Most complex work'
@@ -382,6 +384,42 @@ function getTargetUrl(tabKey) {
   return tabKey.startsWith('gemini') ? GEMINI_APP_URL : M365_CHAT_URL;
 }
 
+function findRealChromeBinary() {
+  const candidates = [
+    process.env.CHROME_BIN,
+    path.join(process.env['PROGRAMFILES'] || 'C:\\Program Files', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+    path.join(process.env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Google', 'Chrome', 'Application', 'chrome.exe') : ''
+  ].filter(Boolean);
+  for (const bin of candidates) {
+    if (fs.existsSync(bin)) return bin;
+  }
+  return 'chrome';
+}
+
+function probeCdpVersion(port, timeoutMs) {
+  return new Promise(function(resolve) {
+    const req = http.get({ hostname: '127.0.0.1', port: port, path: '/json/version', timeout: timeoutMs || 1500 }, function(res) {
+      let raw = '';
+      res.on('data', function(chunk) { raw += chunk; });
+      res.on('end', function() {
+        resolve(Boolean(res.statusCode === 200 && raw.includes('webSocketDebuggerUrl')));
+      });
+    });
+    req.on('error', function() { resolve(false); });
+    req.on('timeout', function() { req.destroy(); resolve(false); });
+  });
+}
+
+async function waitForCdpEndpoint(port, timeoutMs) {
+  const deadline = Date.now() + (timeoutMs || 20000);
+  while (Date.now() < deadline) {
+    if (await probeCdpVersion(port, 1200)) return true;
+    await new Promise(function(r) { setTimeout(r, 250); });
+  }
+  return false;
+}
+
 async function getOrLaunchContext(profileName, headless) {
   if (headless === undefined) headless = false;
   // Nëse konteksti ekziston tashmë (i hapur nga përdoruesi me 'Hap Dritaren' ose nga agjenti), PËRDORE MENJËHERË dhe mos e mbyll kurrë!
@@ -394,26 +432,60 @@ async function getOrLaunchContext(profileName, headless) {
     } catch (_) {}
   }
 
-  // Lidhje direkte me Chrome CDP port 18000 për Gemini (Neon High)
-  if (profileName === 'gemini') {
-    try {
-      const cdpBrowser = await chromium.connectOverCDP('http://127.0.0.1:18000', { timeout: 2000 });
-      const bContexts = cdpBrowser.contexts();
-      if (bContexts.length > 0) {
-        contexts[profileName] = bContexts[0];
-        contextModes[profileName] = 'visible';
-        return contexts[profileName];
-      }
-    } catch (_) {}
-  }
-
   const userDataDir = path.join(PROFILES_DIR, profileName);
   if (!fs.existsSync(userDataDir)) fs.mkdirSync(userDataDir, { recursive: true });
 
+  if (Object.prototype.hasOwnProperty.call(GEMINI_CDP_PORTS, profileName)) {
+    const port = GEMINI_CDP_PORTS[profileName];
+    const endpoint = 'http://127.0.0.1:' + port;
+    let browser = null;
+    try {
+      browser = await chromium.connectOverCDP(endpoint, { timeout: 2500 });
+    } catch (_) {
+      const chromeBin = findRealChromeBinary();
+      const chromeArgs = [
+        '--user-data-dir=' + userDataDir,
+        '--remote-debugging-port=' + port,
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--start-maximized'
+      ];
+      const child = spawn(chromeBin, chromeArgs, {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: false
+      });
+      child.on('error', function() {});
+      child.unref();
+      const ready = await waitForCdpEndpoint(port, 20000);
+      if (!ready) {
+        throw new Error('CDP_ENDPOINT_TIMEOUT: Chrome nuk u pergjigj ne ' + endpoint);
+      }
+      browser = await chromium.connectOverCDP(endpoint, { timeout: 15000 });
+    }
+
+    const defaultCtx = browser.contexts()[0];
+    if (!defaultCtx) {
+      throw new Error('CDP_DEFAULT_CONTEXT_MISSING per ' + profileName);
+    }
+    const clearCdpState = function() {
+      delete cdpBrowsers[profileName];
+      delete contexts[profileName];
+      delete contextModes[profileName];
+      for (const k of Object.keys(tabs)) {
+        if (getProfileNameForTab(k) === profileName) tabs[k] = null;
+      }
+    };
+    browser.on('disconnected', clearCdpState);
+    defaultCtx.on('close', clearCdpState);
+    cdpBrowsers[profileName] = browser;
+    contexts[profileName] = defaultCtx;
+    contextModes[profileName] = 'cdp';
+    return defaultCtx;
+  }
+
   const launchArgs = [
     '--disable-blink-features=AutomationControlled',
-    '--disable-gpu',
-    '--disable-dev-shm-usage',
     '--mute-audio',
     '--no-first-run',
     '--no-default-browser-check',
@@ -425,9 +497,9 @@ async function getOrLaunchContext(profileName, headless) {
     channel: 'chrome',
     headless: false,
     viewport: null,
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    chromiumSandbox: true,
     args: launchArgs,
-    ignoreDefaultArgs: ['--enable-automation', '--password-store=basic', '--use-mock-keychain']
+    ignoreDefaultArgs: ['--no-sandbox', '--enable-automation', '--password-store=basic', '--use-mock-keychain']
   });
 
   ctx.on('close', function() {
@@ -457,14 +529,6 @@ async function getOrCreateTab(tabKey) {
 
   let page = null;
   const existingPages = ctx.pages();
-
-  if (tabKey === 'gemini1') {
-    const archPage = existingPages.find(p => !p.isClosed() && (p.url().includes('9514703eb42c922a') || !Object.entries(tabs).some(([k, t]) => t === p && k !== tabKey)));
-    if (archPage && archPage.url().includes('9514703eb42c922a')) page = archPage;
-  } else if (tabKey === 'gemini2') {
-    const coderPage = existingPages.find(p => !p.isClosed() && (p.url().includes('159f7542a6843ce4') || !Object.entries(tabs).some(([k, t]) => t === p && k !== tabKey)));
-    if (coderPage && coderPage.url().includes('159f7542a6843ce4')) page = coderPage;
-  }
 
   if (!page) {
     for (const p of existingPages) {
@@ -1059,7 +1123,7 @@ const ABSOLUTE_BUNDLE_CEILING_BYTES=512*KIB;
 const CONTEXT_BUDGET_BYTES=Object.freeze({PLANNING_FULL:480*1024,CODING_FOCUSED:384*1024,REVIEW_FOCUSED:320*1024,RETRY_COMPACT:256*1024});
 const PACK_BUDGETS=CONTEXT_BUDGET_BYTES;
 const ABSOLUTE_BUNDLE_CEILING=ABSOLUTE_BUNDLE_CEILING_BYTES;
-const TEXT_BUNDLE_DENIED_DIRECTORIES=new Set(['__pycache__','.git','.svn','.hg','node_modules','bin','obj','dist','build','coverage','.cache','cache','tmp','temp','.venv','venv']);
+const TEXT_BUNDLE_DENIED_DIRECTORIES=new Set(['__pycache__','.git','.svn','.hg','node_modules','bin','obj','dist','build','coverage','.cache','cache','tmp','temp','.venv','venv','.hermes','.profiles','.antigravity','scratch','profiles']);
 const TEXT_BUNDLE_DENIED_EXTENSIONS=new Set(['.pyc','.pyo','.pyd','.dll','.exe','.com','.msi','.so','.dylib','.a','.lib','.o','.obj','.db','.sqlite','.sqlite3','.mdb','.zip','.7z','.rar','.tar','.gz','.bz2','.xz','.png','.jpg','.jpeg','.gif','.bmp','.webp','.ico','.tif','.tiff','.mp3','.wav','.flac','.aac','.ogg','.mp4','.mov','.avi','.mkv','.webm','.pdf','.woff','.woff2','.ttf','.otf','.eot','.class','.jar','.war','.rvt','.rfa','.ifc','.dwg','.dxf']);
 
 function inspectTextBuffer(buffer){
@@ -1114,13 +1178,6 @@ async function resetChatVerified(args){
     return;
   }
   if (!force && activeProjectPerTab[tabKey] === projectRoot) return;
-  if (!force && tabKey.startsWith('gemini') && page && !page.isClosed()) {
-    const u = page.url() || '';
-    if (u.includes('9514703eb42c922a') || u.includes('159f7542a6843ce4')) {
-      activeProjectPerTab[tabKey] = projectRoot;
-      return;
-    }
-  }
   const isGemini = tabKey.startsWith('gemini');
   const target = findChatFrameOrPage(page);
 
@@ -1180,6 +1237,8 @@ const SERVICE_ERROR_PATTERNS = [
   'having a hard time fulfilling your request',
   'i encountered an error',
   'encountering an error',
+  'an error occurred',
+  'error occurred',
   'can i try something else',
   'unable to complete your request',
   'temporarily unavailable',
@@ -1258,6 +1317,32 @@ function appendDispatchDiag(projectRoot, id, phase, metadata) {
   const fields=Object.keys(safe).sort().map(function(k){const v=typeof safe[k]==='object'?JSON.stringify(safe[k]):String(safe[k]);return k+'='+v.replace(/[\r\n]+/g,' ');}).join(' ');
   const line='[DISPATCH_DIAG] id='+id+' phase='+phase+(fields?' '+fields:'');console.error(line);fs.appendFileSync(path.join(ex,'last_dispatch_diag.log'),line+NL,'utf8');
 }
+function isTransientCopilotResponse(text, state) {
+  if (state && state.transientStatusOnly === true) return true;
+  const rawNoZw = String(text || '').replace(/[\u200B-\u200D\uFEFF]/g, '');
+  const clean = rawNoZw.replace(/\s+/g, ' ').trim();
+  if (!clean) return false;
+  if (
+    clean.includes(FENCE3) ||
+    /^diff --git /m.test(rawNoZw) ||
+    /^FILE:/m.test(rawNoZw) ||
+    /FILE_TARGET:/.test(rawNoZw) ||
+    /^STATUS:\s*(?:PASSED|APPROVED|CHANGES_REQUIRED|FAILED|REJECTED)\b/im.test(rawNoZw) ||
+    (clean.length > 320 && !(state && state.transientStatusOnly))
+  ) {
+    return false;
+  }
+  if (state && state.hasFeedback === true && !state.turnBusy && !state.transientStatusOnly) return false;
+  if (state && state.turnBusy === true && state.hasFeedback === false && clean.length < 300) return true;
+  if (clean.length <= 220) {
+    const statusLineRe = /^(?:thinking|thought\s+for\b|reasoning|analyzing|reading|searching|looking\s+up|gathering|working\s+on|generating|preparing|processing|loading|checking|inspecting|scanning|fetching|evaluating|one\s+moment|just\s+a\s+moment|hold\s+on|please\s+wait|duke\s+menduar|duke\s+analizuar|duke\s+lexuar|duke\s+k[eë]rkuar|duke\s+gjeneruar|duke\s+p[eë]rpunuar|nj[eë]\s+moment)(?:[\s:,\-\u2013\u2014][^\n!?]{0,160})?(?:\.{1,3}|\u2026)?$/i;
+    const lines = rawNoZw.split(/\r?\n/).map(function(l) { return l.replace(/\s+/g, ' ').trim(); }).filter(Boolean);
+    if (lines.length >= 1 && lines.length <= 4 && lines.every(function(l) { return !/[.!?]\s+[A-Z]/.test(l) && statusLineRe.test(l); })) {
+      return true;
+    }
+  }
+  return false;
+}
 async function probeWebChatState(targetFrame,isGemini,sendMeta){
   sendMeta=sendMeta||{};const currentUrl=await targetFrame.evaluate(function(){return location.href;}),tabKey=sendMeta.tabKey||(isGemini?'gemini1':'web1');
   const localEngineDomainFallback=function(key,url){try{const u=new URL(String(url||'')),host=u.hostname.toLowerCase(),pathname=u.pathname.toLowerCase();if(u.protocol==='about:'||!host)return true;if(key.startsWith('gemini'))return host==='gemini.google.com';if(key.startsWith('google_search_'))return /(^|\.)google\.com$/.test(host)&&(/^\/search/.test(pathname)||/^\/ai(?:mode)?(?:\/|$)/.test(pathname));if(key.startsWith('web')||key.startsWith('m365'))return host==='copilot.cloud.microsoft'||host==='m365.cloud.microsoft'||host.endsWith('.microsoft365.com')||host==='microsoft365.com'||host==='copilot.microsoft.com';return false;}catch(_){return false;}};
@@ -1270,18 +1355,74 @@ async function probeWebChatState(targetFrame,isGemini,sendMeta){
     const latestAssistant=assistants[assistants.length-1]||null;if(latestAssistant&&!latestAssistant.dataset.antigravityTurnId)latestAssistant.dataset.antigravityTurnId='ag-turn-'+Array.from(chatRoot.querySelectorAll('*')).indexOf(latestAssistant);
     const latestAssistantText=latestAssistant?norm(latestAssistant.textContent||''):'',latestAssistantFingerprint=latestAssistantText.slice(0,160)+'|'+latestAssistantText.length,latestAssistantNodeSignature=latestAssistant?(latestAssistant.tagName.toLowerCase()+'|'+latestAssistant.dataset.antigravityTurnId):'';
     const thoughtNodes=latestAssistant?Array.from(latestAssistant.querySelectorAll('model-thoughts,.thoughts-container,.thought-container,[data-test-id*="thought" i],[data-testid*="thought" i],ms-thought-chunk,[class*="thought" i],[class*="reason" i],[data-testid*="reason" i]')):Array.from(chatRoot.querySelectorAll('model-thoughts,.thoughts-container,.thought-container,ms-thought-chunk')),thoughtText=thoughtNodes.map(function(el){return norm(el.textContent||'');}).join('|'),thoughtLen=thoughtText.length,thoughtFingerprint=thoughtText.slice(0,160)+'|'+thoughtLen;
-    const latestUser=users.length?norm(users[users.length-1].textContent||''):'',chips=composerRoot?Array.from(composerRoot.querySelectorAll('uploader-file-preview,gem-attachment,[class*="attachment" i],[class*="chip" i]')).filter(visible):[],stop=composerRoot?Array.from(composerRoot.querySelectorAll('button[aria-label*="stop" i],button[title*="stop" i],[data-testid*="stop" i],button.stop-button,button.send-button.stop,button:has(mat-icon[fonticon="stop"])')).find(function(el){return visible(el)&&!el.disabled&&el.getAttribute('aria-disabled')!=='true';}):null;
+    const codeAncestorSelector='pre, code, .monaco-editor, [data-virtualized-code-find-root], code-block, .code-block, .code-container, .code-header, .code-block-decoration';
+    const stopSelector='button[aria-label*="stop" i],button[title*="stop" i],[data-testid*="stop" i],button.stop-button,button.send-button.stop,button:has(mat-icon[fonticon="stop"])';
+    const isVisibleStop=function(el){return visible(el)&&!el.disabled&&el.getAttribute('aria-disabled')!=='true'&&!el.closest(codeAncestorSelector);};
+    const latestUser=users.length?norm(users[users.length-1].textContent||''):'',chips=composerRoot?Array.from(composerRoot.querySelectorAll('uploader-file-preview,gem-attachment,[class*="attachment" i],[class*="chip" i]')).filter(visible):[],stop=(composerRoot?Array.from(composerRoot.querySelectorAll(stopSelector)).find(isVisibleStop):null)||Array.from(chatRoot.querySelectorAll(stopSelector)).find(isVisibleStop)||null;
     const classifyGeminiRoute=function(value){const normalized=String(value||'').replace(/\/+$/,'')||'/',match=normalized.match(/^\/app\/([^/?#]+)$/i);return {normalized:normalized,isGenericApp:normalized==='/app',isConversationRoute:Boolean(match),conversationId:match?match[1]:''};};
-    const routeKey=location.pathname+location.search,preRoute=classifyGeminiRoute(arg.meta.routeKey||''),currentRoute=classifyGeminiRoute(routeKey),committedUserStillPresent=Boolean(arg.meta.newUserTurnFingerprint&&latestUser.includes(arg.meta.newUserTurnFingerprint)),sameConversationRoute=Boolean(preRoute.isConversationRoute&&currentRoute.isConversationRoute&&preRoute.conversationId===currentRoute.conversationId);
+    const routeKey=location.pathname+location.search,preRoute=classifyGeminiRoute(arg.meta.routeKey||''),currentRoute=classifyGeminiRoute(routeKey),sameConversationRoute=Boolean(preRoute.isConversationRoute&&currentRoute.isConversationRoute&&preRoute.conversationId===currentRoute.conversationId);
     const processingTurnRoot=latestAssistant?(latestAssistant.closest('model-response,[data-message-author-role="model"],.conversation-container,.conversation-turn,[data-testid="chat-turn-assistant"]')||latestAssistant):chatRoot,presentedRoot=latestAssistant?latestAssistant.querySelector('.presented-response-container,[class*="presented-response" i]'):null;
     const processingSelectors=['.response-container-header-processing-state','.response-container-header svg','.presented-response-container svg','.presented-response-container canvas','.presented-response-container bard-avatar','.presented-response-container lottie-animation','pending-response','loading-indicator','bard-avatar','lottie-animation','[role="progressbar"]','[aria-busy="true"]','mat-progress-spinner','[class*="spinner" i]','[class*="loading" i]','[class*="processing" i]'].join(','),thinkingStatusText=thoughtText.slice(0,240),composerText=editor?norm(/^(TEXTAREA|INPUT)$/.test(editor.tagName)?editor.value:(editor.textContent||'')):'',landingHeading=Array.from(chatRoot.querySelectorAll('h1,h2,h3,[role="heading"]')).some(function(el){return visible(el)&&/where should we start\??/i.test(norm(el.textContent||''));}),generating=Boolean(stop),landing=landingHeading&&Boolean(editor&&visible(editor))&&composerText.length===0&&users.length===0&&assistants.length===0&&chips.length===0&&!generating;
+    let committedUserStillPresent=Boolean((arg.meta.newUserTurnFingerprint&&latestUser.includes(arg.meta.newUserTurnFingerprint))||(arg.gem&&arg.meta.committed&&!landing&&(currentRoute.isConversationRoute||thoughtLen>0)));
     let conversationContinuity=!arg.meta.committed||Boolean(committedUserStillPresent||sameConversationRoute||users.length>0||assistants.length>0);if(arg.meta.committed&&landing&&users.length===0&&assistants.length===0&&!generating)conversationContinuity=false;
-    const canProbeProcessing=Boolean((arg.gem||Boolean(stop)||latestAssistant||thoughtLen>0)&&users.length>0&&!landing&&arg.domainOk);
+    const canProbeProcessing=Boolean((arg.gem||Boolean(stop)||latestAssistant||thoughtLen>0)&&users.length>0&&!landing&&arg.domainOk),processingProbeSuppressed=!canProbeProcessing,processingRoots=canProbeProcessing?[presentedRoot,latestAssistant,processingTurnRoot].filter(Boolean):[],candidateSet=new Set();if(canProbeProcessing)processingRoots.forEach(function(root){if(root.matches&&root.matches(processingSelectors))candidateSet.add(root);root.querySelectorAll(processingSelectors).forEach(function(el){candidateSet.add(el);});});
     const candidateVisible=function(el){if(!el||!el.isConnected)return false;const st=getComputedStyle(el),r=el.getBoundingClientRect();return st.display!=='none'&&st.visibility!=='hidden'&&parseFloat(st.opacity||'1')>.05&&r.width>=8&&r.height>=4;},animated=function(el){const st=getComputedStyle(el);return (st.animationName&&st.animationName!=='none'&&parseFloat(st.animationDuration||'0')>0)||(st.transitionProperty&&st.transitionProperty!=='none'&&parseFloat(st.transitionDuration||'0')>0);};
-    let smallDotWrapper=null;if(canProbeProcessing&&processingTurnRoot){smallDotWrapper=Array.from(processingTurnRoot.querySelectorAll('div,span,svg,canvas,bard-avatar,lottie-animation,pending-response,loading-indicator')).find(function(el){const children=Array.from(el.children||[]);return children.length>=2&&children.length<=5&&candidateVisible(el)&&(animated(el)||children.some(animated));})||null;if(smallDotWrapper)candidateSet.add(smallDotWrapper);}
-    const processingCandidates=canProbeProcessing?Array.from(candidateSet).filter(candidateVisible):[],processingVisualDetected=canProbeProcessing&&processingCandidates.length>0,visibleProcessingSpinner=processingVisualDetected,visibleStopControl=Boolean(stop),assistantPlaceholderCreated=assistants.length>(arg.meta.preAssistantCount||0),hasThoughtContent=thoughtLen>0,hasAssistantContent=latestAssistantText.length>0,latestAssistantIdentityChanged=Boolean(latestAssistantNodeSignature&&latestAssistantNodeSignature!==(arg.meta.preAssistantNodeSignature||'')),thoughtFingerprintChanged=Boolean(hasThoughtContent&&arg.meta.preThoughtFingerprint&&thoughtFingerprint!==arg.meta.preThoughtFingerprint),latestAssistantFingerprintChanged=Boolean(hasAssistantContent&&arg.meta.preAssistantFingerprint&&latestAssistantFingerprint!==arg.meta.preAssistantFingerprint),hasSubstantiveThinkingEvidence=Boolean(hasAssistantContent||hasThoughtContent||latestAssistantFingerprintChanged||thoughtFingerprintChanged),processingFallbackDetected=Boolean(canProbeProcessing&&assistantPlaceholderCreated&&visibleStopControl&&latestAssistantText.length===0),activeProcessingEvidence=Boolean(generating&&!landing&&arg.domainOk&&conversationContinuity&&users.length>0&&assistants.length>0&&(processingVisualDetected||processingFallbackDetected)),processingProbeTags=processingCandidates.slice(0,20).map(function(el){return el.tagName.toLowerCase()+'.'+Array.from(el.classList||[]).slice(0,4).join('.');}),processingRootTag=canProbeProcessing?(presentedRoot||latestAssistant||processingTurnRoot).tagName.toLowerCase():'';
-    return {url:location.href,routeKey:routeKey,preRouteKey:preRoute.normalized,currentRouteKey:currentRoute.normalized,preConversationId:preRoute.conversationId,currentConversationId:currentRoute.conversationId,sameConversationRoute:sameConversationRoute,committedUserStillPresent:committedUserStillPresent,domainMismatch:!arg.domainOk,landingVisible:landing,composerVisible:Boolean(editor&&visible(editor)),composerTextLength:composerText.length,userTurnCount:users.length,assistantTurnCount:assistants.length,assistantTotal:assistants.length,assistantVisible:assistants.filter(visible).length,latestUserFingerprint:latestUser.slice(0,96),latestAssistantChars:latestAssistantText.length,latestAssistantFingerprint:latestAssistantFingerprint,latestAssistantNodeSignature:latestAssistantNodeSignature,thoughtLen:thoughtLen,thoughtNodes:thoughtNodes.length,thoughtFingerprint:thoughtFingerprint,thoughtFingerprintChanged:thoughtFingerprintChanged,latestAssistantIdentityChanged:latestAssistantIdentityChanged,latestAssistantFingerprintChanged:latestAssistantFingerprintChanged,assistantPlaceholderCreated:assistantPlaceholderCreated,hasThoughtContent:hasThoughtContent,hasAssistantContent:hasAssistantContent,hasSubstantiveThinkingEvidence:hasSubstantiveThinkingEvidence,hasThinkingEvidence:hasSubstantiveThinkingEvidence,visibleProcessingSpinner:visibleProcessingSpinner,visibleStopControl:visibleStopControl,processingVisualDetected:processingVisualDetected,processingFallbackDetected:processingFallbackDetected,processingProbeSuppressed:processingProbeSuppressed,processingRootTag:processingRootTag,processingMatchCount:processingCandidates.length,processingProbeTags:processingProbeTags,activeProcessingEvidence:activeProcessingEvidence,thinkingStatusText:thinkingStatusText,generating:landing?false:generating,generatingEvidence:landing?'landing-reset':(visibleStopControl?'visible-stop':(visibleProcessingSpinner?'visible-spinner':(thoughtLen?'thought-mutation':'none'))),attachmentChipCount:chips.length,conversationContinuity:conversationContinuity,progressFingerprint:[latestAssistantFingerprint,latestAssistantNodeSignature,thoughtFingerprint].join('|')};
-  },{gem:isGemini,meta:sendMeta,domainOk:domainMatches});
+    let smallDotWrapper=null;if(canProbeProcessing&&processingTurnRoot){smallDotWrapper=Array.from(processingTurnRoot.querySelectorAll('div,span,svg,canvas,bard-avatar,lottie-animation,pending-response,loading-indicator')).find(function(el){if(el.matches('div.response-content,.response-content,.markdown-main-panel,message-content,[role="alert"]')||el.closest('div.response-content,.response-content,.markdown-main-panel,message-content,[role="alert"]'))return false;if((el.textContent||'').trim().length>0)return false;const r=el.getBoundingClientRect();if(r.width>120||r.height>80)return false;const children=Array.from(el.children||[]);return children.length>=2&&children.length<=5&&candidateVisible(el)&&(animated(el)||children.some(animated));})||null;if(smallDotWrapper)candidateSet.add(smallDotWrapper);}
+    const isPassiveGeminiVisual=function(el){return arg.gem&&!stop&&el.matches('svg,canvas,bard-avatar')&&!el.closest('pending-response,loading-indicator,.response-container-header-processing-state,[aria-busy="true"],[role="progressbar"]')&&!animated(el);};
+    const hasActiveExplicitSpinner=Boolean(processingTurnRoot&&Array.from(processingTurnRoot.querySelectorAll('pending-response,loading-indicator,mat-progress-spinner,lottie-animation')).some(candidateVisible));
+    const processingCandidates=canProbeProcessing?Array.from(candidateSet).filter(function(el){return candidateVisible(el)&&!isPassiveGeminiVisual(el);}):[],processingVisualDetected=canProbeProcessing&&processingCandidates.length>0&&(Boolean(stop)||!arg.gem||hasActiveExplicitSpinner),visibleProcessingSpinner=processingVisualDetected,visibleStopControl=Boolean(stop),assistantPlaceholderCreated=assistants.length>(arg.meta.preAssistantCount||0),hasThoughtContent=thoughtLen>0,hasAssistantContent=latestAssistantText.length>0,latestAssistantIdentityChanged=Boolean(latestAssistantNodeSignature&&latestAssistantNodeSignature!==(arg.meta.preAssistantNodeSignature||'')),thoughtFingerprintChanged=Boolean(hasThoughtContent&&arg.meta.preThoughtFingerprint&&thoughtFingerprint!==arg.meta.preThoughtFingerprint),latestAssistantFingerprintChanged=Boolean(hasAssistantContent&&arg.meta.preAssistantFingerprint&&latestAssistantFingerprint!==arg.meta.preAssistantFingerprint),hasSubstantiveThinkingEvidence=Boolean(hasAssistantContent||hasThoughtContent||latestAssistantFingerprintChanged||thoughtFingerprintChanged),processingFallbackDetected=Boolean(canProbeProcessing&&assistantPlaceholderCreated&&visibleStopControl&&latestAssistantText.length===0),activeProcessingEvidence=Boolean(generating&&!landing&&arg.domainOk&&conversationContinuity&&users.length>0&&assistants.length>0&&(processingVisualDetected||processingFallbackDetected)),processingProbeTags=processingCandidates.slice(0,20).map(function(el){return el.tagName.toLowerCase()+'.'+Array.from(el.classList||[]).slice(0,4).join('.');}),processingRootTag=canProbeProcessing?(presentedRoot||latestAssistant||processingTurnRoot).tagName.toLowerCase():'';
+    if(arg.gem&&arg.meta.committed&&activeProcessingEvidence)committedUserStillPresent=true;
+    let inlineServiceError=false,inlineServiceErrorText='';
+    if(arg.gem){
+      const errScope=(latestAssistant&&latestAssistant.querySelector('.response-content'))||latestAssistant||(processingTurnRoot!==chatRoot?processingTurnRoot:null);
+      const rawErrText=errScope?norm(errScope.innerText||errScope.textContent||''):'';
+      if(rawErrText&&rawErrText.length<500){
+        const lowErr=rawErrText.toLowerCase();
+        const errPatterns=Array.isArray(arg.serviceErrorPatterns)?arg.serviceErrorPatterns:[];
+        const retryBtnVisible=Boolean((errScope||processingTurnRoot)&&Array.from((errScope||processingTurnRoot).querySelectorAll('button,[role="button"]')).some(function(b){return visible(b)&&/^(?:try again|retry)$/i.test(norm(b.innerText||b.textContent||b.getAttribute('aria-label')||''));}));
+        if(lowErr.includes('an error occurred')||(lowErr.includes('error occurred')&&retryBtnVisible)||errPatterns.some(function(p){return p&&lowErr.includes(String(p).toLowerCase());})){
+          inlineServiceError=true;
+          inlineServiceErrorText=rawErrText.replace(/^gemini said\s*/i,'').trim()||rawErrText;
+        }
+      }
+    }
+    let hasFeedback=false,turnBusy=false,transientStatusOnly=false;
+    if(!arg.gem){
+      const feedbackSelector='button[aria-label*="copy" i], button[aria-label*="like" i], button[aria-label*="dislike" i], button[aria-label*="thumbs" i], button[aria-label*="good response" i], button[aria-label*="bad response" i], button[aria-label*="regenerate" i], button[aria-label*="share" i], [data-testid*="feedback" i], [data-testid*="thumbs" i], [data-testid*="copy-message" i], [data-testid*="action-bar" i] button, .fui-ChatMessage__footer button';
+      const copilotStatusSelector='[role="status"], [role="progressbar"], [aria-busy="true"], [aria-live="polite"], [aria-live="assertive"], .fui-Spinner, .fui-Skeleton, [class*="spinner" i], [class*="loading" i], [class*="streaming" i], [class*="typing" i], [class*="shimmer" i], [class*="thinking" i], [class*="reasoning" i], [data-testid*="thinking" i], [data-testid*="progress" i], [data-testid*="status" i]';
+      const copilotBusySelector='[aria-busy="true"], [role="progressbar"], .fui-Spinner, .fui-Skeleton, [class*="spinner" i], [class*="loading" i], [class*="streaming" i], [class*="typing" i], [class*="shimmer" i]';
+      if(latestAssistant){
+        const feedbackScope=processingTurnRoot&&processingTurnRoot.contains(latestAssistant)?processingTurnRoot:latestAssistant;
+        hasFeedback=Array.from(feedbackScope.querySelectorAll(feedbackSelector)).some(function(el){return visible(el)&&!el.closest(codeAncestorSelector);});
+      }
+      turnBusy=Boolean(
+        stop||
+        processingVisualDetected||
+        (latestAssistant&&(
+          latestAssistant.getAttribute('aria-busy')==='true'||
+          processingTurnRoot.getAttribute('aria-busy')==='true'||
+          Array.from(processingTurnRoot.querySelectorAll(copilotBusySelector)).some(function(el){return visible(el)&&!el.closest(codeAncestorSelector);})
+        ))
+      );
+      if(latestAssistant){
+        const hasCode=Boolean(latestAssistant.querySelector('pre, code, .monaco-editor, [data-virtualized-code-find-root], table'));
+        const tempClone=latestAssistant.cloneNode(true);
+        tempClone.querySelectorAll('model-thoughts,.thoughts-container,.thought-container,[data-test-id*="thought" i],[data-testid*="thought" i],ms-thought-chunk').forEach(function(el){el.remove();});
+        tempClone.querySelectorAll(copilotStatusSelector).forEach(function(el){if(!el.closest(codeAncestorSelector)&&!el.querySelector(codeAncestorSelector))el.remove();});
+        tempClone.querySelectorAll('button,svg').forEach(function(el){el.remove();});
+        const remainingText=norm(tempClone.textContent||'');
+        const statusNodeCount=Array.from(latestAssistant.querySelectorAll(copilotStatusSelector)).filter(function(el){return visible(el)&&!el.closest(codeAncestorSelector);}).length;
+        transientStatusOnly=Boolean(
+          !hasCode&&
+          !hasFeedback&&(
+            (statusNodeCount>0&&remainingText.length===0)||
+            (turnBusy&&remainingText.length<160&&!/```|^diff --git |^FILE:/m.test(latestAssistantText))
+          )
+        );
+      }
+    }
+    return {url:location.href,routeKey:routeKey,preRouteKey:preRoute.normalized,currentRouteKey:currentRoute.normalized,preConversationId:preRoute.conversationId,currentConversationId:currentRoute.conversationId,sameConversationRoute:sameConversationRoute,committedUserStillPresent:committedUserStillPresent,domainMismatch:!arg.domainOk,landingVisible:landing,composerVisible:Boolean(editor&&visible(editor)),composerTextLength:composerText.length,userTurnCount:users.length,assistantTurnCount:assistants.length,assistantTotal:assistants.length,assistantVisible:assistants.filter(visible).length,latestUserFingerprint:latestUser.slice(0,96),latestAssistantChars:latestAssistantText.length,latestAssistantFingerprint:latestAssistantFingerprint,latestAssistantNodeSignature:latestAssistantNodeSignature,thoughtLen:thoughtLen,thoughtNodes:thoughtNodes.length,thoughtFingerprint:thoughtFingerprint,thoughtFingerprintChanged:thoughtFingerprintChanged,latestAssistantIdentityChanged:latestAssistantIdentityChanged,latestAssistantFingerprintChanged:latestAssistantFingerprintChanged,assistantPlaceholderCreated:assistantPlaceholderCreated,hasThoughtContent:hasThoughtContent,hasAssistantContent:hasAssistantContent,hasSubstantiveThinkingEvidence:hasSubstantiveThinkingEvidence,hasThinkingEvidence:hasSubstantiveThinkingEvidence,visibleProcessingSpinner:visibleProcessingSpinner,visibleStopControl:visibleStopControl,processingVisualDetected:processingVisualDetected,processingFallbackDetected:processingFallbackDetected,processingProbeSuppressed:processingProbeSuppressed,processingRootTag:processingRootTag,processingMatchCount:processingCandidates.length,processingProbeTags:processingProbeTags,activeProcessingEvidence:activeProcessingEvidence,thinkingStatusText:thinkingStatusText,inlineServiceError:inlineServiceError,inlineServiceErrorText:inlineServiceErrorText,hasFeedback:hasFeedback,turnBusy:turnBusy,transientStatusOnly:transientStatusOnly,generating:landing?false:Boolean(stop||(!arg.gem&&turnBusy)),generatingEvidence:landing?'landing-reset':(visibleStopControl?'visible-stop':(visibleProcessingSpinner?'visible-spinner':(turnBusy?'copilot-turn-busy':(thoughtLen?'thought-mutation':'none')))),attachmentChipCount:chips.length,conversationContinuity:conversationContinuity,progressFingerprint:[latestAssistantFingerprint,latestAssistantNodeSignature,thoughtFingerprint].join('|')};
+  },{gem:isGemini,meta:sendMeta,domainOk:domainMatches,serviceErrorPatterns:Array.isArray(sendMeta.serviceErrorPatterns)?sendMeta.serviceErrorPatterns:(Array.isArray(SERVICE_ERROR_PATTERNS)?SERVICE_ERROR_PATTERNS:[])});
 }
 async function snapshotSendState(targetFrame, composerToken, isGemini, attachmentNames, fingerprint) {
   return targetFrame.evaluate(function(arg){
@@ -1312,10 +1453,32 @@ async function waitForSendCommit(targetFrame, args) {
   }
   return {committed:false,evidence:last};
 }
+async function findBestFileInput(targetFrame, page) {
+  const scopes = [];
+  if (targetFrame) scopes.push(targetFrame);
+  if (page && page !== targetFrame) scopes.push(page);
+  let fallback = null;
+  for (const scope of scopes) {
+    let inputs = [];
+    try { inputs = await scope.$$('input#upload-file-button, input[type="file"]'); } catch (_) { inputs = []; }
+    for (const candidateInput of inputs) {
+      let accept = '', directory = null;
+      try {
+        accept = String((await candidateInput.getAttribute('accept')) || '').toLowerCase();
+        directory = await candidateInput.getAttribute('webkitdirectory');
+      } catch (_) {}
+      const imageOnly = accept.includes('image') && !accept.includes('*') && !accept.includes('text');
+      if (!imageOnly && directory === null) return candidateInput;
+      if (!fallback && directory === null) fallback = candidateInput;
+    }
+  }
+  return fallback;
+}
+
 async function attachFilesSafely(page, targetFrame, tabKey, projectRoot, validFiles) {
   const started=Date.now();
-  if(!validFiles.length)return {status:'ATTACHMENTS_READY',files:[],sendReady:true,elapsedMs:0};
-  const isGemini=tabKey.startsWith('gemini');
+  if(!validFiles || !validFiles.length)return {status:'ATTACHMENTS_READY',files:[],sendReady:true,elapsedMs:0};
+  const isGemini=String(tabKey||'').startsWith('gemini');
   if(isGemini && Array.isArray(validFiles)) {
     validFiles = validFiles.map(function(filePath) {
       if(typeof filePath === 'string' && path.extname(filePath).toLowerCase() === '.md') {
@@ -1325,28 +1488,90 @@ async function attachFilesSafely(page, targetFrame, tabKey, projectRoot, validFi
       return filePath;
     });
   }
-  let input=await page.$('input#upload-file-button, input[type="file"]');
-  if(input){
-    await input.setInputFiles(validFiles);
+  const directInput = await findBestFileInput(targetFrame, page);
+  if (directInput) {
+    await directInput.setInputFiles(validFiles);
   } else {
-    const uploadTools=page.locator('button[aria-label*="Upload" i], button[aria-label*="Add files" i]').filter({visible:true}).first();
-    await uploadTools.waitFor({state:'visible',timeout:15000});
-    const uploadItem=page.locator('[role="menuitem"][aria-label*="Upload files" i], [role="menuitem"][aria-label*="Shto skedar" i], gem-menu-item[role="menuitem"]:has-text("Upload files"), [role="menuitem"]:has-text("Upload files"), [role="menuitem"]:has-text("Shto skedar")').filter({visible:true}).first();
-    let menuReady=false;
-    for(let menuAttempt=1;menuAttempt<=3;menuAttempt++){
-      await uploadTools.click({timeout:5000}).catch(function(){});
-      menuReady=await uploadItem.waitFor({state:'visible',timeout:3000}).then(function(){return true;}).catch(function(){return false;});
-      if(menuReady)break;
-      const blockedOverlay=page.locator('[role="menu"],.cdk-overlay-pane,[data-radix-menu-content]').filter({visible:true}).first();
-      if(await blockedOverlay.count()>0)await page.keyboard.press('Escape').catch(function(){});
-      await page.waitForTimeout(800);
+    const scope = targetFrame || page;
+    const uploadToolsSelector = 'button[aria-label*="Upload" i], button[aria-label*="Add files" i], button[aria-label*="Add content" i], button[aria-label*="Attach" i], button[title*="Upload" i], button[title*="Attach" i], button[data-test-id*="upload" i], button[data-testid*="upload" i], button[data-testid*="attach" i], [role="button"][aria-label*="Upload" i], [role="button"][aria-label*="Attach" i], [role="button"][aria-label*="Add files" i]';
+    const uploadItemSelector = '[role="menuitem"][aria-label*="Upload" i], [role="menuitem"][aria-label*="Attach" i], [role="menuitem"][aria-label*="Shto skedar" i], [role="menuitem"][aria-label*="Ngarko" i], gem-menu-item[role="menuitem"]:has-text("Upload"), [role="menuitem"]:has-text("Upload files"), [role="menuitem"]:has-text("Upload from"), [role="menuitem"]:has-text("Upload a file"), [role="menuitem"]:has-text("Shto skedar"), [role="menuitem"]:has-text("Ngarko"), button:has-text("Upload files"), button:has-text("Upload from"), [data-testid*="upload-file" i], [data-testid*="local-upload" i]';
+    const overlaySelector = '.cdk-overlay-backdrop-showing, [role="menu"], .fui-MenuPopover';
+    const preOverlay = page.locator(overlaySelector).filter({ visible: true }).first();
+    if (await preOverlay.count().catch(function(){ return 0; }) > 0) {
+      await page.keyboard.press('Escape').catch(function(){});
+      await page.waitForTimeout(300);
     }
-    const revealedInputs=await page.$$('input#upload-file-button,input[type="file"]');
-    let targetInput=null;
-    for(const candidateInput of revealedInputs){const accept=String(await candidateInput.getAttribute('accept')||'').toLowerCase(),directory=await candidateInput.getAttribute('webkitdirectory');if(!accept.includes('image')&&directory===null){targetInput=candidateInput;break;}}
-    if(!targetInput&&revealedInputs.length)targetInput=revealedInputs[0];
-    if(targetInput){await targetInput.setInputFiles(validFiles);await page.keyboard.press('Escape').catch(function(){});}
-    else {if(!menuReady)throw new Error('ATTACHMENT_UPLOAD_FAILED: UPLOAD_MENU_NOT_READY');const chooserPromise=page.waitForEvent('filechooser',{timeout:10000});await uploadItem.click({timeout:5000});const fc=await chooserPromise;await fc.setFiles(validFiles);}
+    let uploadTools = scope.locator(uploadToolsSelector).filter({ visible: true }).first();
+    if (scope !== page && await uploadTools.count().catch(function(){ return 0; }) === 0) {
+      uploadTools = page.locator(uploadToolsSelector).filter({ visible: true }).first();
+    }
+    await uploadTools.waitFor({ state: 'visible', timeout: 15000 });
+    await uploadTools.scrollIntoViewIfNeeded().catch(function(){});
+    let uploadItem = scope.locator(uploadItemSelector).filter({ visible: true }).first();
+    const pageUploadItem = page.locator(uploadItemSelector).filter({ visible: true }).first();
+    let menuReady = false, uploadedDirect = false;
+    for (let menuAttempt = 1; menuAttempt <= 4; menuAttempt++) {
+      let directChooser = null;
+      const onChooser = function(chooser) { directChooser = chooser; };
+      if (typeof page.once === 'function') page.once('filechooser', onChooser);
+      try {
+        if (menuAttempt <= 2) {
+          await uploadTools.click({ timeout: 4000 }).catch(function(){});
+        } else if (menuAttempt === 3) {
+          await uploadTools.focus().catch(function(){});
+          await page.keyboard.press('Enter').catch(function(){});
+        } else {
+          await uploadTools.evaluate(function(el){ el.click(); }).catch(function(){});
+        }
+        const pollDeadline = Date.now() + 2250;
+        while (Date.now() < pollDeadline) {
+          if (directChooser) {
+            await directChooser.setFiles(validFiles);
+            uploadedDirect = true;
+            break;
+          }
+          const revealed = await findBestFileInput(targetFrame, page);
+          if (revealed) {
+            await revealed.setInputFiles(validFiles);
+            await page.keyboard.press('Escape').catch(function(){});
+            uploadedDirect = true;
+            break;
+          }
+          if (await uploadItem.isVisible().catch(function(){ return false; })) {
+            menuReady = true;
+            break;
+          }
+          if (scope !== page && await pageUploadItem.isVisible().catch(function(){ return false; })) {
+            uploadItem = pageUploadItem;
+            menuReady = true;
+            break;
+          }
+          await page.waitForTimeout(150);
+        }
+      } finally {
+        if (typeof page.off === 'function') page.off('filechooser', onChooser);
+        else if (typeof page.removeListener === 'function') page.removeListener('filechooser', onChooser);
+      }
+      if (uploadedDirect || menuReady) break;
+      const blockedOverlay = page.locator(overlaySelector).filter({ visible: true }).first();
+      if (await blockedOverlay.count().catch(function(){ return 0; }) > 0) {
+        await page.keyboard.press('Escape').catch(function(){});
+      }
+      await page.waitForTimeout(300);
+    }
+    if (!uploadedDirect) {
+      const lastInput = await findBestFileInput(targetFrame, page);
+      if (lastInput) {
+        await lastInput.setInputFiles(validFiles);
+        await page.keyboard.press('Escape').catch(function(){});
+      } else {
+        if (!menuReady) throw new Error('ATTACHMENT_UPLOAD_FAILED: UPLOAD_MENU_NOT_READY');
+        const chooserPromise = page.waitForEvent('filechooser', { timeout: 10000 });
+        await uploadItem.click({ timeout: 5000 });
+        const fc = await chooserPromise;
+        await fc.setFiles(validFiles);
+      }
+    }
   }
   const receipts=[];
   for(const filePath of validFiles){
@@ -1407,12 +1632,20 @@ async function extractWebAssistantContent(targetFrame,isGemini){
       });
     }
     let containers=arg.gem?Array.from(document.querySelectorAll('response-container')):Array.from(document.querySelectorAll('[data-testid="chat-turn-assistant"],[data-testid="ai-message"],[data-message-author-role="assistant"],[data-content="ai-message"],.assistant-message,[data-testid="chatOutput"],[data-testid="copilot-message-div"],.fai-CopilotMessage,[data-testid="chat-response-message"],[data-testid*="response" i],[class*="copilot-message" i],[class*="assistant-message" i],[class*="chat-turn" i],.fui-ChatMessage'));
-    if(arg.gem&&containers.length===0)containers=Array.from(document.querySelectorAll('model-response,message-content,[data-message-author-role="model"]'));
+    if(arg.gem&&containers.length===0)containers=Array.from(document.querySelectorAll('model-response,message-content,structured-content-container,.model-response-text,[data-message-author-role="model"]'));
     if(!arg.gem&&containers.length===0)containers=Array.from(document.querySelectorAll('main div[role="region"], [data-testid*="turn" i], .fui-ChatMessageContent, [class*="response-message" i], [class*="agent-response" i]')).filter(function(el){return (el.textContent||'').trim().length>10;});
     const substantiveContainers = containers.filter(function(el) { return (el.textContent || '').trim().length > 10; });
     const liveNode = substantiveContainers.length > 0 ? substantiveContainers[substantiveContainers.length - 1] : (containers[containers.length - 1] || null);
     if(!liveNode)return {text:'',metadata:{liveNodeTag:'',contentNodeTag:'',contentCharsBeforeClean:0,thoughtNodesRemoved:0,contentCharsAfterClean:0,codeBlockCount:0,hasMessageContent:false}};
-    const nested=arg.gem?liveNode.querySelector('message-content,.markdown-main-panel,.md-content'):(Array.from(liveNode.querySelectorAll('[data-testid="markdown-reply"],.fui-ChatMessageContent,[data-content="ai-message"],[class*="content" i],[class*="markdown" i]')).find(function(el){return (el.textContent||'').trim().length>10;})||null),contentNode=nested||liveNode,hasMessageContent=Boolean(nested),before=(contentNode.textContent||'').length,clone=contentNode.cloneNode(true),codeExtractionReceipts=[],virtualizedErrors=[],thoughtNodes=Array.from(clone.querySelectorAll('model-thoughts,.thoughts-container,.thought-container,[data-test-id*="thought" i],[data-testid*="thought" i],ms-thought-chunk'));thoughtNodes.forEach(function(el){el.remove();});let codeBlockCount=0,virtualizedEditorsFound=0,virtualizedBlocksExtracted=0;
+    const nested=arg.gem?(Array.from(liveNode.querySelectorAll('message-content,.markdown-main-panel,.md-content,structured-content-container,.model-response-text')).find(function(el){return (el.textContent||'').trim().length>0;})||Array.from(liveNode.querySelectorAll('.response-content')).find(function(el){const c=el.cloneNode(true);Array.from(c.querySelectorAll('model-thoughts,.thoughts-container,.thought-container,[data-test-id*="thought" i],[data-testid*="thought" i],ms-thought-chunk,thinking-overlay,thinking-dots-animation,.thinking-container,.model-response-label-announcer,.screen-reader-model-response-label')).forEach(function(n){n.remove();});return (c.textContent||'').trim().length>0;})||liveNode.querySelector('message-content,.markdown-main-panel,.md-content,structured-content-container,.model-response-text')):(Array.from(liveNode.querySelectorAll('[data-testid="markdown-reply"],.fui-ChatMessageContent,[data-content="ai-message"],[class*="content" i],[class*="markdown" i]')).find(function(el){return (el.textContent||'').trim().length>10;})||null),contentNode=nested||liveNode,hasMessageContent=Boolean(nested),before=(contentNode.textContent||'').length,clone=contentNode.cloneNode(true),codeExtractionReceipts=[],virtualizedErrors=[],thoughtNodes=Array.from(clone.querySelectorAll('model-thoughts,.thoughts-container,.thought-container,[data-test-id*="thought" i],[data-testid*="thought" i],ms-thought-chunk,thinking-overlay,thinking-dots-animation,.thinking-container,.model-response-label-announcer,.screen-reader-model-response-label'));thoughtNodes.forEach(function(el){el.remove();});let transientStatusNodesRemoved=0;
+    if(!arg.gem){
+      const codeProtect='pre, code, .monaco-editor, [data-virtualized-code-find-root]';
+      const copilotTransientNodes=Array.from(clone.querySelectorAll('[role="status"], [role="progressbar"], [aria-busy="true"], [aria-live="polite"], [aria-live="assertive"], .fui-Spinner, .fui-Skeleton, [data-testid*="thinking" i], [data-testid*="progress" i], [data-testid*="status" i], [class*="thinking" i], [class*="reasoning" i], [class*="spinner" i], [class*="loading" i], [class*="shimmer" i]'));
+      copilotTransientNodes.forEach(function(el){
+        if(el.isConnected&&!el.closest(codeProtect)&&!el.querySelector(codeProtect)){el.remove();transientStatusNodesRemoved++;}
+      });
+    }
+    let codeBlockCount=0,virtualizedEditorsFound=0,virtualizedBlocksExtracted=0;
     clone.querySelectorAll('pre').forEach(function(pre){codeBlockCount++;const code=pre.querySelector('code'),cls=((code&&code.className)||'')+' '+(pre.className||''),m=cls.match(/language-([a-zA-Z0-9_+-]+)/);let lang=(m&&m[1])?m[1]:'';if(!lang){const w=pre.closest('code-block,.code-block,.code-container'),h=w&&w.querySelector('.code-header span,.code-block-decoration span,.code-block-internal-header span'),c=h&&h.textContent?h.textContent.trim().toLowerCase():'';if(/^[a-z0-9_+-]{1,20}$/.test(c))lang=c;}const raw=(code?code.textContent:pre.textContent)||'';const fence=selectSafeMarkdownFence(raw,3);pre.replaceWith(document.createTextNode('\n\n'+fence+lang+'\n'+raw.replace(/\n+$/,'')+'\n'+fence+'\n\n'));codeExtractionReceipts.push({sourceKind:'PRE_CODE',language:lang,lineCount:raw.split('\n').length,completenessVerified:true});});
     const liveEditorRoots=collectCanonicalEditorRoots(contentNode);
     const editorRoots=collectCanonicalEditorRoots(clone);
@@ -1498,18 +1731,19 @@ async function extractWebAssistantContent(targetFrame,isGemini){
         root.replaceWith(document.createTextNode(''));
       }
     }
-    clone.querySelectorAll('button,svg,mat-icon,.code-header,.code-block-decoration,.code-block-internal-header').forEach(function(el){el.remove();});clone.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function(h){h.prepend(document.createTextNode('\n\n'+'#'.repeat(Number(h.tagName.slice(1)))+' '));h.append(document.createTextNode('\n\n'));});clone.querySelectorAll('p,div,li,tr').forEach(function(el){el.append(document.createTextNode('\n'));});clone.querySelectorAll('br').forEach(function(el){el.replaceWith(document.createTextNode('\n'));});let text=String(clone.textContent||'').replace(/\u00a0/g,' ').replace(/\r\n/g,'\n').replace(/\n{3,}/g,'\n\n').replace(/^\s*Gemini said\s*\n+/i,'').trim();const meta={liveNodeTag:liveNode.tagName.toLowerCase(),contentNodeTag:contentNode.tagName.toLowerCase(),contentCharsBeforeClean:before,thoughtNodesRemoved:thoughtNodes.length,contentCharsAfterClean:text.length,codeBlockCount:codeBlockCount,hasMessageContent:hasMessageContent,codeExtractionReceipts:codeExtractionReceipts};
+    clone.querySelectorAll('button,svg,mat-icon,.code-header,.code-block-decoration,.code-block-internal-header').forEach(function(el){el.remove();});clone.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function(h){h.prepend(document.createTextNode('\n\n'+'#'.repeat(Number(h.tagName.slice(1)))+' '));h.append(document.createTextNode('\n\n'));});clone.querySelectorAll('p,div,li,tr').forEach(function(el){el.append(document.createTextNode('\n'));});clone.querySelectorAll('br').forEach(function(el){el.replaceWith(document.createTextNode('\n'));});let text=String(clone.textContent||'').replace(/\u00a0/g,' ').replace(/\r\n/g,'\n').replace(/\n{3,}/g,'\n\n').replace(/^\s*Gemini said\s*\n+/i,'').trim();const meta={liveNodeTag:liveNode.tagName.toLowerCase(),contentNodeTag:contentNode.tagName.toLowerCase(),contentCharsBeforeClean:before,thoughtNodesRemoved:thoughtNodes.length,transientStatusNodesRemoved:transientStatusNodesRemoved,contentCharsAfterClean:text.length,codeBlockCount:codeBlockCount,hasMessageContent:hasMessageContent,codeExtractionReceipts:codeExtractionReceipts};
     if(virtualizedEditorsFound>0&&virtualizedBlocksExtracted===0&&virtualizedErrors.length>0)return {error:virtualizedErrors[0].code,text:'',metadata:meta};
-    if(before>0&&text.length===0&&(hasMessageContent||thoughtNodes.length===0))return {error:'GEMINI_EXTRACTION_OVERPRUNED',text:'',metadata:meta};return {text:text,metadata:meta};
+    if(before>0&&text.length===0&&(arg.gem||transientStatusNodesRemoved===0)&&(hasMessageContent||thoughtNodes.length===0))return {error:'GEMINI_EXTRACTION_OVERPRUNED',text:'',metadata:meta};return {text:text,metadata:meta};
   },{gem:isGemini,fence:FENCE3});
 }
 async function collectGeminiTerminalDiagnostics(args) {
   return getGeminiEngine().collectGeminiTerminalDiagnostics(args);
 }
 async function waitAndExtractCleanResponse(page,targetFrame,tabKey,projectRoot,previousCount,sendMeta){
-  sendMeta=sendMeta||{};const isGemini=tabKey.startsWith('gemini'),budgets=resolveActivityDrivenBudgets(sendMeta,isGemini),hardCapMs=budgets.runawayCapMs,firstTokenDeadlineMs=budgets.firstTokenDeadlineMs,activeThinkingFreshMs=budgets.activeThinkingFreshMs,maxThinkingWithoutDomProgressMs=budgets.maxThinkingWithoutDomProgressMs,start=Date.now(),recoveryAttempt=sendMeta.recoveryAttempt||0,silentDeadlineMs=budgets.silentDeadlineMs,terminalDiagReceipts=new Map(),preUserCount=Number(sendMeta.preUserCount||0),preAssistantCount=Number(sendMeta.preAssistantCount||0);let lastProgressAt=start,lastGeneratingPulseAt=start,lastLogAt=0,lastDeferredLogAt=0,lastSilentContinueAt=0,lastExtractionReceiptAt=0,lastExtractionChars=-1,lastProgress='',lastText='',stable=0,resetTicks=0,observedUserHighWatermark=preUserCount,observedAssistantHighWatermark=Math.max(previousCount,preAssistantCount),lastThoughtFingerprint=sendMeta.preThoughtFingerprint||'',observedSubstantiveThinkingEvidence=false,silentCheckpointCaptured=false,wasActiveProcessing=false,effectiveLoopLimitMs=budgets.baseHardCapMs;
+  sendMeta=sendMeta||{};const isGemini=tabKey.startsWith('gemini'),budgets=resolveActivityDrivenBudgets(sendMeta,isGemini),hardCapMs=budgets.runawayCapMs,firstTokenDeadlineMs=budgets.firstTokenDeadlineMs,activeThinkingFreshMs=budgets.activeThinkingFreshMs,maxThinkingWithoutDomProgressMs=budgets.maxThinkingWithoutDomProgressMs,start=Date.now(),recoveryAttempt=sendMeta.recoveryAttempt||0,silentDeadlineMs=budgets.silentDeadlineMs,terminalDiagReceipts=new Map(),preUserCount=Number(sendMeta.preUserCount||0),preAssistantCount=Number(sendMeta.preAssistantCount||0);let lastProgressAt=start,lastGeneratingPulseAt=start,lastLogAt=0,lastDeferredLogAt=0,lastSilentContinueAt=0,lastExtractionReceiptAt=0,lastExtractionChars=-1,lastProgress='',lastText='',stable=0,resetTicks=0,observedUserHighWatermark=preUserCount,observedAssistantHighWatermark=Math.max(previousCount,preAssistantCount),lastThoughtFingerprint=sendMeta.preThoughtFingerprint||'',observedSubstantiveThinkingEvidence=false,silentCheckpointCaptured=false,wasActiveProcessing=false,effectiveLoopLimitMs=budgets.baseHardCapMs,copilotTransientSinceAt=0,lastTransientLogAt=0,lastTransientPreview='';const copilotTransientBudgetMs=Number(sendMeta.copilotTransientStatusTimeoutMs)>0?Number(sendMeta.copilotTransientStatusTimeoutMs):budgets.maxThinkingWithoutDomProgressMs,copilotTransientIdleGraceMs=Number(sendMeta.copilotTransientGraceMs)>0?Number(sendMeta.copilotTransientGraceMs):Math.min(budgets.activeThinkingFreshMs||45000,35000);
   const captureTerminalDiagnosticsOnce=async function(code,state,elapsedMs,progressAgeMs){const key=code+':'+recoveryAttempt;if(terminalDiagReceipts.has(key))return terminalDiagReceipts.get(key);const receipt=typeof collectGeminiTerminalDiagnostics==='function'?await collectGeminiTerminalDiagnostics({page:page,targetFrame:targetFrame,tabKey:tabKey,projectRoot:projectRoot,dispatchId:sendMeta.diagId,errorCode:code,state:state,elapsedMs:elapsedMs,progressAgeMs:progressAgeMs}):{errorCode:'',retryVisible:false};terminalDiagReceipts.set(key,receipt);return receipt;};
   while(Date.now()-start<effectiveLoopLimitMs){const reboundFrame=findChatFrameOrPage(page);if(reboundFrame!==targetFrame){const priorUrl=await targetFrame.evaluate(function(){return location.href;}).catch(function(){return '';});const reboundUrl=await reboundFrame.evaluate(function(){return location.href;}).catch(function(){return '';});targetFrame=reboundFrame;appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','CHAT_CONTEXT_REBOUND',{priorUrl:priorUrl,reboundUrl:reboundUrl,elapsedMs:Date.now()-start});}await page.waitForTimeout(750);const state=await probeWebChatState(targetFrame,isGemini,sendMeta);const elapsed=Date.now()-start;
+    if(isGemini&&state.inlineServiceError){appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','ERROR',{code:'SERVICE_REFUSAL',elapsedMs:elapsed,inlineServiceError:true});throw new Error('WEB_SERVICE_REFUSAL: '+String(state.inlineServiceErrorText||'An error occurred').slice(0,150));}
     observedUserHighWatermark=Math.max(observedUserHighWatermark,state.userTurnCount);observedAssistantHighWatermark=Math.max(observedAssistantHighWatermark,state.assistantTurnCount);const newTurnWasObserved=Boolean(observedUserHighWatermark>preUserCount||observedAssistantHighWatermark>preAssistantCount||sendMeta.newUserTurnFingerprint||sendMeta.userTurnFingerprintMatched||(sendMeta.evidence&&sendMeta.evidence.userTurnFingerprintMatched)),countsReturnedToBaseline=Boolean(state.userTurnCount<=preUserCount&&state.assistantTurnCount<=preAssistantCount),committedTurnMissing=Boolean(!state.committedUserStillPresent),turnRolledBackAfterSend=Boolean(isGemini&&sendMeta.committed&&newTurnWasObserved&&countsReturnedToBaseline&&committedTurnMissing&&!state.generating&&!lastText),domainDriftCandidate=Boolean(isGemini&&sendMeta.committed&&state.domainMismatch&&state.userTurnCount===0&&state.assistantTurnCount===0&&!state.generating),landingResetCandidate=Boolean(isGemini&&sendMeta.committed&&state.landingVisible&&state.userTurnCount===0&&state.assistantTurnCount===0&&!state.generating&&!state.conversationContinuity),resetCandidate=Boolean(domainDriftCandidate||landingResetCandidate||turnRolledBackAfterSend),resetKind=domainDriftCandidate?'DOMAIN_DRIFT':(landingResetCandidate?'LANDING_RESET':(turnRolledBackAfterSend?'TURN_ROLLBACK':''));const resetInvariant=resetCandidate;resetTicks=resetInvariant?resetTicks+1:0;const resetMeta={preRouteKey:state.preRouteKey,currentRouteKey:state.currentRouteKey,preConversationId:state.preConversationId,currentConversationId:state.currentConversationId,committedUserStillPresent:state.committedUserStillPresent,users:state.userTurnCount,assistants:state.assistantTurnCount,preUserCount:preUserCount,preAssistantCount:preAssistantCount,observedUserHighWatermark:observedUserHighWatermark,observedAssistantHighWatermark:observedAssistantHighWatermark,countsReturnedToBaseline:countsReturnedToBaseline,committedTurnMissing:committedTurnMissing,newTurnWasObserved:newTurnWasObserved,turnRolledBackAfterSend:turnRolledBackAfterSend,resetKind:resetKind,landing:state.landingVisible,generating:state.generating,processingProbeSuppressed:state.processingProbeSuppressed,recoveryBudgetRemaining:Math.max(0,1-(sendMeta.recoveryAttempt||0))};if(resetTicks===1){appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','RESET_CANDIDATE_DETECTED',resetMeta);continue;}
     if(resetTicks>=2){const code=domainDriftCandidate?'ENGINE_DOMAIN_DRIFT_AFTER_SEND':(turnRolledBackAfterSend&&!landingResetCandidate?'GEMINI_TURN_ROLLED_BACK_AFTER_SEND':'GEMINI_CONVERSATION_RESET_AFTER_SEND'),progressAgeMs=Date.now()-lastProgressAt,receipt=await captureTerminalDiagnosticsOnce(code,state,elapsed,progressAgeMs);appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','RESET_CONFIRMED',Object.assign({code:code,elapsedMs:elapsed,resetTicks:resetTicks,screenshot:receipt&&receipt.screenshotPath},resetMeta));appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','RESET_DETECTED',Object.assign({code:code,elapsedMs:elapsed},resetMeta));const e=new Error(code);e.receipt=Object.assign({},state,{terminalDiagnostics:receipt});throw e;}
     const hasSubstantiveThinkingEvidence=state.hasSubstantiveThinkingEvidence!==undefined?Boolean(state.hasSubstantiveThinkingEvidence):Boolean(state.hasThinkingEvidence&&((state.thoughtLen||0)>0||(state.latestAssistantChars||0)>0)),activeProcessingEvidence=state.activeProcessingEvidence!==undefined?Boolean(state.activeProcessingEvidence):Boolean(state.generating&&state.visibleProcessingSpinner!==false&&state.visibleStopControl!==false&&state.conversationContinuity&&!state.landingVisible&&!state.domainMismatch),progress=[state.latestAssistantFingerprint||'',state.latestAssistantNodeSignature||'',state.thoughtFingerprint||''].join('|');if(progress!==lastProgress&&(hasSubstantiveThinkingEvidence||!lastProgress)){lastProgress=progress;if(hasSubstantiveThinkingEvidence){lastProgressAt=Date.now();lastGeneratingPulseAt=Date.now();}}
@@ -1517,7 +1751,35 @@ async function waitAndExtractCleanResponse(page,targetFrame,tabKey,projectRoot,p
     if(state.generating||activeProcessingEvidence||state.visibleStopControl||state.visibleProcessingSpinner)lastGeneratingPulseAt=Date.now();
     const domActivity=evaluateDomActivityState({state:state,budgets:budgets,now:Date.now(),start:start,lastProgressAt:lastProgressAt,lastGeneratingPulseAt:lastGeneratingPulseAt,lastText:lastText});effectiveLoopLimitMs=domActivity.effectiveLoopLimitMs;
     if(Date.now()-lastLogAt>=5000){lastLogAt=Date.now();appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','RESPONSE_POLL',{elapsedMs:elapsed,effectiveLoopLimitMs:effectiveLoopLimitMs,users:state.userTurnCount,assistantTotal:state.assistantTotal,assistantVisible:state.assistantVisible,assistantHighWatermark:observedAssistantHighWatermark,preUserCount:preUserCount,preAssistantCount:preAssistantCount,observedUserHighWatermark:observedUserHighWatermark,observedAssistantHighWatermark:observedAssistantHighWatermark,countsReturnedToBaseline:countsReturnedToBaseline,committedTurnMissing:committedTurnMissing,newTurnWasObserved:newTurnWasObserved,turnRolledBackAfterSend:turnRolledBackAfterSend,resetKind:resetKind,latestAssistantFingerprint:state.latestAssistantFingerprint,latestAssistantChanged:latestAssistantChanged,latestAssistantIdentityChanged:latestAssistantIdentityChanged,latestAssistantFingerprintChanged:latestAssistantFingerprintChanged,hasAssistantContent:hasAssistantContent,thoughtNodes:state.thoughtNodes,thoughtFingerprintChanged:thoughtFingerprintChanged,hasThoughtContent:hasThoughtContent,hasSubstantiveThinkingEvidence:hasSubstantiveThinkingEvidence,extractionEligible:extractionEligible,assistantPlaceholderCreated:Boolean(state.assistantPlaceholderCreated),activeProcessingEvidence:activeProcessingEvidence,processingVisualDetected:Boolean(state.processingVisualDetected),processingFallbackDetected:Boolean(state.processingFallbackDetected),processingRootTag:state.processingRootTag||'',processingMatchCount:state.processingMatchCount||0,processingProbeTags:state.processingProbeTags||[],visibleProcessingSpinner:Boolean(state.visibleProcessingSpinner),visibleStopControl:Boolean(state.visibleStopControl),silentCheckpointCaptured:silentCheckpointCaptured,silentDeadlineMs:silentDeadlineMs,recoveryAttempt:recoveryAttempt,recoveryBudgetRemaining:Math.max(0,1-recoveryAttempt),preRouteKey:state.preRouteKey,currentRouteKey:state.currentRouteKey,preConversationId:state.preConversationId,currentConversationId:state.currentConversationId,committedUserStillPresent:state.committedUserStillPresent,processingProbeSuppressed:state.processingProbeSuppressed,generating:state.generating,progressAgeMs:Date.now()-lastProgressAt,pulseAgeMs:domActivity.pulseAgeMs,landing:state.landingVisible,continuity:state.conversationContinuity});}
-    if(extractionEligible){const extracted=await extractWebAssistantContent(targetFrame,isGemini);const extractionChars=extracted.metadata.contentCharsAfterClean;if(extractionChars!==lastExtractionChars||Date.now()-lastExtractionReceiptAt>=(extractionChars===0?15000:5000)){lastExtractionChars=extractionChars;lastExtractionReceiptAt=Date.now();appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','EXTRACTION_RECEIPT',extracted.metadata);}if(extracted.error)throw new Error(extracted.error);const text=extracted.text;if(text&&text===lastText&&!state.generating){stable++;if(stable>=4){appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','RESPONSE_EXTRACTED',{chars:text.length});return text;}}else{stable=0;lastText=text;}}
+    if(extractionEligible){
+      const extracted=await extractWebAssistantContent(targetFrame,isGemini);
+      const extractionChars=extracted.metadata.contentCharsAfterClean;
+      if(extractionChars!==lastExtractionChars||Date.now()-lastExtractionReceiptAt>=(extractionChars===0?15000:5000)){lastExtractionChars=extractionChars;lastExtractionReceiptAt=Date.now();appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','EXTRACTION_RECEIPT',extracted.metadata);}
+      if(extracted.error)throw new Error(extracted.error);
+      const text=extracted.text;
+      const transientNow=!isGemini&&Boolean(state.transientStatusOnly||(state.turnBusy&&!state.hasFeedback&&(!text||isTransientCopilotResponse(text,state)))||isTransientCopilotResponse(text,state));
+      if(transientNow){
+        stable=0;
+        lastText='';
+        if(!copilotTransientSinceAt)copilotTransientSinceAt=Date.now();
+        lastTransientPreview=String(text||state.thinkingStatusText||'').slice(0,120);
+        const transientElapsedMs=Date.now()-copilotTransientSinceAt;
+        const progressAgeNowMs=Date.now()-lastProgressAt;
+        if(Date.now()-lastTransientLogAt>=15000){
+          lastTransientLogAt=Date.now();
+          appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','COPILOT_TRANSIENT_STATUS_SKIPPED',{elapsedMs:elapsed,transientElapsedMs:transientElapsedMs,turnBusy:Boolean(state.turnBusy),hasFeedback:Boolean(state.hasFeedback),transientStatusOnly:Boolean(state.transientStatusOnly),preview:lastTransientPreview});
+        }
+        if(!state.turnBusy&&!state.visibleStopControl&&transientElapsedMs>=copilotTransientIdleGraceMs){
+          throw new Error('COPILOT_TRANSIENT_STATUS_TIMEOUT mode=idle_stuck elapsedMs='+elapsed+' transientMs='+transientElapsedMs+' preview='+lastTransientPreview);
+        }
+        if(transientElapsedMs>=copilotTransientBudgetMs&&progressAgeNowMs>=copilotTransientBudgetMs){
+          throw new Error('COPILOT_TRANSIENT_STATUS_TIMEOUT mode=busy_stall elapsedMs='+elapsed+' transientMs='+transientElapsedMs+' preview='+lastTransientPreview);
+        }
+      }else{
+        if(text)copilotTransientSinceAt=0;
+        if(text&&text===lastText&&!state.generating&&!state.turnBusy&&!(isGemini&&state.visibleProcessingSpinner)){stable++;if(stable>=4){appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','RESPONSE_EXTRACTED',{chars:text.length});return text;}}else{stable=0;lastText=text;}
+      }
+    }
     if(hasSubstantiveThinkingEvidence)observedSubstantiveThinkingEvidence=true;const progressAgeMs=Date.now()-lastProgressAt,activeThinkingFresh=Boolean(domActivity.activeThinkingFresh||(isGemini&&state.conversationContinuity&&!state.landingVisible&&state.generating&&hasSubstantiveThinkingEvidence&&progressAgeMs<activeThinkingFreshMs));
     const lowText=String(lastText||'').toLowerCase();if(lastText.length<500&&SERVICE_ERROR_PATTERNS.some(function(p){return lowText.includes(p);})){appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','ERROR',{code:'SERVICE_REFUSAL',elapsedMs:elapsed});throw new Error('WEB_SERVICE_REFUSAL: '+lastText.slice(0,150));}
     const assistantPlaceholderCreated=state.assistantPlaceholderCreated!==undefined?Boolean(state.assistantPlaceholderCreated):Boolean(state.assistantTurnCount>(sendMeta.preAssistantCount||0)),silentCandidate=Boolean(isGemini&&state.conversationContinuity&&!state.landingVisible&&!state.domainMismatch&&state.userTurnCount>0&&state.assistantTurnCount>0&&state.latestAssistantChars===0&&!hasSubstantiveThinkingEvidence);
@@ -1529,10 +1791,10 @@ async function waitAndExtractCleanResponse(page,targetFrame,tabKey,projectRoot,p
     if(resetTicks===0&&!lastText&&elapsed>=firstTokenDeadlineMs&&!activeThinkingFresh&&!silentPreflight&&!activeProcessingEvidence&&!checkpointConsumedThisPoll){const code='GEMINI_FIRST_TOKEN_TIMEOUT',diag=isGemini?await captureTerminalDiagnosticsOnce(code,state,elapsed,progressAgeMs):null;if(diag&&diag.errorCode)throw new Error(diag.errorCode+(diag.retryVisible?' RETRY_VISIBLE':''));throw new Error(code+' elapsedMs='+elapsed+' progressAgeMs='+progressAgeMs+' deadlineMs='+firstTokenDeadlineMs);}
     if(!lastText&&elapsed>=firstTokenDeadlineMs&&activeThinkingFresh&&Date.now()-lastDeferredLogAt>=30000){lastDeferredLogAt=Date.now();appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','FIRST_TOKEN_DEADLINE_DEFERRED',{reason:'ACTIVE_THINKING',elapsedMs:elapsed,progressAgeMs:progressAgeMs,pulseAgeMs:domActivity.pulseAgeMs,effectiveLoopLimitMs:effectiveLoopLimitMs});}
   }
-  targetFrame=findChatFrameOrPage(page);const finalState=await probeWebChatState(targetFrame,isGemini,sendMeta);let finalExtract={text:'',metadata:{codeBlockCount:0}};if(finalState.assistantTurnCount>0)finalExtract=await extractWebAssistantContent(targetFrame,isGemini);if(finalExtract.error==='GEMINI_EXTRACTION_OVERPRUNED')throw new Error('GEMINI_EXTRACTION_OVERPRUNED');const finalText=String(finalExtract.text||'').trim(),finalElapsed=Date.now()-start;if(!finalState.generating&&finalState.conversationContinuity&&!finalState.landingVisible&&!finalState.domainMismatch&&finalText.length>25){appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','RESPONSE_EXTRACTED_AFTER_DEADLINE',{elapsedMs:finalElapsed,chars:finalText.length,codeBlockCount:(finalExtract.metadata&&finalExtract.metadata.codeBlockCount)||0});return finalText;}if(resetTicks===0){if(isGemini)await captureTerminalDiagnosticsOnce('GEMINI_HARD_CAP_TIMEOUT',finalState,finalElapsed,Date.now()-lastProgressAt);throw new Error('GEMINI_HARD_CAP_TIMEOUT elapsedMs='+finalElapsed+' deadlineMs='+effectiveLoopLimitMs+' route='+finalState.routeKey+' users='+finalState.userTurnCount+' assistants='+finalState.assistantTurnCount);}throw new Error('GEMINI_RESET_DEBOUNCE_INCOMPLETE elapsedMs='+finalElapsed+' resetTicks='+resetTicks);
+  targetFrame=findChatFrameOrPage(page);const finalState=await probeWebChatState(targetFrame,isGemini,sendMeta);let finalExtract={text:'',metadata:{codeBlockCount:0}};if(finalState.assistantTurnCount>0)finalExtract=await extractWebAssistantContent(targetFrame,isGemini);if(finalExtract.error==='GEMINI_EXTRACTION_OVERPRUNED')throw new Error('GEMINI_EXTRACTION_OVERPRUNED');const finalText=String(finalExtract.text||'').trim(),finalElapsed=Date.now()-start;if(!isGemini&&(finalState.transientStatusOnly||finalState.turnBusy||isTransientCopilotResponse(finalText,finalState)||(copilotTransientSinceAt>0&&!finalText))){throw new Error('COPILOT_TRANSIENT_STATUS_TIMEOUT mode=deadline elapsedMs='+finalElapsed+' preview='+(finalText||lastTransientPreview).slice(0,120));}if(!finalState.generating&&finalState.conversationContinuity&&!finalState.landingVisible&&!finalState.domainMismatch&&finalText.length>25){appendDispatchDiag(projectRoot,sendMeta.diagId||'n/a','RESPONSE_EXTRACTED_AFTER_DEADLINE',{elapsedMs:finalElapsed,chars:finalText.length,codeBlockCount:(finalExtract.metadata&&finalExtract.metadata.codeBlockCount)||0});return finalText;}if(resetTicks===0){if(isGemini)await captureTerminalDiagnosticsOnce('GEMINI_HARD_CAP_TIMEOUT',finalState,finalElapsed,Date.now()-lastProgressAt);throw new Error('GEMINI_HARD_CAP_TIMEOUT elapsedMs='+finalElapsed+' deadlineMs='+effectiveLoopLimitMs+' route='+finalState.routeKey+' users='+finalState.userTurnCount+' assistants='+finalState.assistantTurnCount);}throw new Error('GEMINI_RESET_DEBOUNCE_INCOMPLETE elapsedMs='+finalElapsed+' resetTicks='+resetTicks);
 }
 
-function classifyWebServiceFailure(input){input=input||{};const text=[input.text||'',...(input.alerts||[]).map(function(x){return typeof x==='string'?x:(x.textPreview||x.text||'');}),...(input.httpHints||[])].join(' ').toLowerCase();const groups=[['QUOTA_OR_LIMIT_ERROR','WEB_QUOTA_OR_LIMIT_ERROR',false,/quota exceeded|limit reached|reached your limit|resets in|upgrade to advanced|upgrade your plan|usage limit|too many requests|rate limit/],['POLICY_REFUSAL','WEB_POLICY_REFUSAL',false,/i can(?:not|'t) help with that|i cannot assist|violates policy|not able to comply|prefer not to continue/],['AUTH_OR_SESSION_ERROR','WEB_AUTH_OR_SESSION_ERROR',false,/sign in|session expired|authentication required|log in to continue/],['PAYLOAD_REJECTED','WEB_PAYLOAD_REJECTED_OR_OVERSIZED',true,/file too large|payload too large|context too long|maximum context|attachment.*(?:large|rejected)/],['TRANSIENT_SERVICE_ERROR','WEB_TRANSIENT_SERVICE_ERROR',true,/encountered an error doing what you asked|could you try again|something went wrong|try again later|service unavailable|oops.? something happened|response wasn.?t generated/]];for(const g of groups){const m=text.match(g[3]);if(m)return {class:g[0],retryable:g[2],code:g[1],matchedSignals:[m[0]]};}return {class:'UNKNOWN_SERVICE_ERROR',retryable:false,code:'WEB_UNKNOWN_SERVICE_ERROR',matchedSignals:[]};}
+function classifyWebServiceFailure(input){input=input||{};const text=[input.text||'',...(input.alerts||[]).map(function(x){return typeof x==='string'?x:(x.textPreview||x.text||'');}),...(input.httpHints||[])].join(' ').toLowerCase();const groups=[['QUOTA_OR_LIMIT_ERROR','WEB_QUOTA_OR_LIMIT_ERROR',false,/quota exceeded|limit reached|reached your limit|resets in|upgrade to advanced|upgrade your plan|usage limit|too many requests|rate limit/],['POLICY_REFUSAL','WEB_POLICY_REFUSAL',false,/i can(?:not|'t) help with that|i cannot assist|violates policy|not able to comply|prefer not to continue/],['AUTH_OR_SESSION_ERROR','WEB_AUTH_OR_SESSION_ERROR',false,/sign in|session expired|authentication required|log in to continue/],['PAYLOAD_REJECTED','WEB_PAYLOAD_REJECTED_OR_OVERSIZED',true,/file too large|payload too large|context too long|maximum context|attachment.*(?:large|rejected)/],['TRANSIENT_SERVICE_ERROR','WEB_TRANSIENT_SERVICE_ERROR',true,/encountered an error doing what you asked|an error occurred|error occurred|could you try again|\btry again\b|something went wrong|try again later|service unavailable|oops.? something happened|response wasn.?t generated/]];for(const g of groups){const m=text.match(g[3]);if(m)return {class:g[0],retryable:g[2],code:g[1],matchedSignals:[m[0]]};}return {class:'UNKNOWN_SERVICE_ERROR',retryable:false,code:'WEB_UNKNOWN_SERVICE_ERROR',matchedSignals:[]};}
 async function runWebDispatchWithRetryPolicy(opts){const dispatchId=opts.dispatchId||('dispatch-'+Date.now());let receipts=[];for(let attempt=1;attempt<=2;attempt++){try{return await opts.dispatch({attempt:attempt,mode:attempt===2?PACK_MODES.RETRY_COMPACT:opts.mode,dispatchId:dispatchId});}catch(err){const c=classifyWebServiceFailure({text:String(err&&err.message||err),alerts:err&&err.alerts,httpHints:err&&err.httpHints,engine:opts.engine});receipts.push({attempt:attempt,classification:c});if(typeof opts.diagnostics==='function')await opts.diagnostics({attempt:attempt,classification:c,dispatchId:dispatchId});if(!c.retryable)throw Object.assign(new Error(c.code+': '+c.matchedSignals.join(',')),{code:c.code,receipts:receipts});if(attempt===2)throw Object.assign(new Error('WEB_TRANSIENT_RETRY_EXHAUSTED'),{code:'WEB_TRANSIENT_RETRY_EXHAUSTED',receipts:receipts});const backoff=Number.isFinite(opts.backoffMs)?Math.max(0,opts.backoffMs):8000+Math.floor(Math.random()*4001);await new Promise(function(r){setTimeout(r,backoff);});const reset=await resetChatVerified({page:opts.page,targetFrame:opts.targetFrame,tabKey:opts.tabKey,projectRoot:opts.projectRoot,reason:c.code});receipts[receipts.length-1].reset=reset;if(typeof opts.reverifyModel==='function')await opts.reverifyModel();if(typeof opts.rebuildCompact==='function'&&(c.class==='PAYLOAD_REJECTED'||(opts.originalBytes||0)>384*1024||(opts.uploadMs||0)>8000))await opts.rebuildCompact(PACK_MODES.RETRY_COMPACT);}}
 }
 
@@ -1586,30 +1848,12 @@ async function runWebDispatchWithRetryPolicy(opts){const dispatchId=opts.dispatc
       const previousAssistant=await targetFrame.evaluate(function(isGem){const root=document.querySelector('main')||document.body,norm=function(v){return String(v||'').replace(/\s+/g,' ').trim();};let c=isGem?Array.from(root.querySelectorAll('response-container')):Array.from(root.querySelectorAll('[data-testid="copilot-message-div"],[data-message-author-role="assistant"],[data-testid="chat-turn-assistant"],[data-testid="ai-message"],[data-content="ai-message"],.assistant-message,.fai-CopilotMessage,[data-testid*="response" i],[class*="copilot-message" i],[class*="assistant-message" i],[class*="chat-turn" i],.fui-ChatMessage,[data-content="ai-message"]'));if(isGem&&c.length===0)c=Array.from(root.querySelectorAll('model-response,[data-message-author-role="model"]'));if(!isGem&&c.length===0)c=Array.from(root.querySelectorAll('main div[role="region"], [data-testid*="turn" i], .fui-ChatMessageContent, [class*="response-message" i], [class*="agent-response" i]')).filter(function(el){return (el.textContent||'').trim().length>10;});const n=c[c.length-1]||null;if(n&&!n.dataset.antigravityTurnId)n.dataset.antigravityTurnId='ag-turn-'+Array.from(root.querySelectorAll('*')).indexOf(n);const t=n?norm(n.textContent||''):'';return {count:c.length,fingerprint:t.slice(0,160)+'|'+t.length,nodeSignature:n?(n.tagName.toLowerCase()+'|'+n.dataset.antigravityTurnId):''};},isGemini);const previousCount=previousAssistant.count;
       console.error('[DISPATCH_STEP] tabKey=' + tabKey + ' previousCount=' + previousCount);
 
-      let combinedText = promptText;
-      const filesToUpload = [];
-
-      // Smart Attachment per Copilot: Nese motori eshte Copilot dhe specifikimet eksterne jane mbi 25k, i ngarkon si attachment fizik
-      if (!isGemini && combinedText.length > 25000) {
-        const specRegex = /=== DOKUMENTI I PLOTE I SPECIFIKIMEVE NGA PERDORUESI:\s*([^\r\n=]+)\s*===([\s\S]*?)=== FUNDI I SPECIFIKIMEVE[^=]*===/g;
-        let match;
-        while ((match = specRegex.exec(promptText)) !== null) {
-          const specName = (match[1] || 'specifikimet').trim().replace(/[^a-zA-Z0-9._-]/g, '_');
-          const specBody = match[2];
-          if (specBody && specBody.length > 5000) {
-            const exchangeDir = path.join(path.resolve(projectRoot), '.antigravity', 'bridge', 'exchange');
-            if (!fs.existsSync(exchangeDir)) fs.mkdirSync(exchangeDir, { recursive: true });
-            const tempSpecFile = path.join(exchangeDir, 'spec_' + specName + '.md');
-            fs.writeFileSync(tempSpecFile, specBody.trim(), 'utf8');
-            filesToUpload.push(tempSpecFile);
-            combinedText = combinedText.replace(match[0], NL + NL + '[UDHEZIM PER COPILOT: Dokumenti i plote i specifikimeve (' + specName + ') eshte bashkangjitur si skedar fizik. ZBATO TE GJITHA RREGULLAT 100%, ZERO-FAKE, ZERO-PLACEHOLDERS.]' + NL);
-          }
-        }
-      }
+      const offloadResult = offloadExternalSpecsFromPrompt(promptText, projectRoot, isGemini);
+      let combinedText = offloadResult.combinedText;
+      const filesToUpload = offloadResult.filesToUpload.slice();
 
       for (const fp of attachmentPaths) {
         if (!fp || !fs.existsSync(fp)) continue;
-        if (attempt === 2 && isGemini && !opts.isPlanner) continue;
         filesToUpload.push(fp);
       }
       const maxChars = 29500;
@@ -1998,7 +2242,7 @@ function classifyWorkspaceFile(rel, meta) { return autopilotEngineModule.classif
 function scoreWorkspaceFile(info) { return autopilotEngineModule.scoreWorkspaceFile ? autopilotEngineModule.scoreWorkspaceFile(info) : 0; }
 function compactWorkspaceContent(rel, content, maxBytes, classification) { return autopilotEngineModule.compactWorkspaceContent ? autopilotEngineModule.compactWorkspaceContent(rel, content, maxBytes, classification) : { text: content, summarized: false }; }
 function buildBudgetedWorkspaceBundle(projectRoot, opts) { return autopilotEngineModule.buildBudgetedWorkspaceBundle ? autopilotEngineModule.buildBudgetedWorkspaceBundle(projectRoot, opts) : { content: '', receipt: {}, files: [] }; }
-function packWorkspace(projectRoot, mode) { return getAutopilotEngine().packWorkspace(projectRoot, mode); }
+function packWorkspace(projectRoot, mode, opts) { return getAutopilotEngine().packWorkspace(projectRoot, mode, opts); }
 function getBundleAttachmentAndNote(projectRoot, targetEngine) { return getAutopilotEngine().getBundleAttachmentAndNote(projectRoot, targetEngine); }
 
 async function applyAndTestDeterministically(projectRoot) {
@@ -2173,7 +2417,11 @@ if (action === 'run_full_cycle') {
   });
 }
 if (action === 'check_cycle_progress') {
-  return await getAutopilotEngine().checkCycleProgress(cleanRoot, Number(payload.waitMs || payload.maxSliceMs) || 45000);
+  const requestedWaitMs = Number(payload.waitMs || payload.maxSliceMs);
+  const effectiveWaitMs = payload.blocking === true
+    ? 3600000
+    : (Number.isFinite(requestedWaitMs) && requestedWaitMs > 0 ? requestedWaitMs : 45000);
+  return await getAutopilotEngine().checkCycleProgress(cleanRoot, effectiveWaitMs);
 }
 if (action === 'pack_workspace') {
   const info = getAutopilotEngine().packWorkspace(cleanRoot, payload.mode || PACK_MODES.PLANNING_FULL);
@@ -2263,14 +2511,28 @@ const st = readProjectState(cleanRoot);
 if (payload.mode === 'FIX_ERROR' && st.retryCount > (st.maxRetries || 2)) {
 return { status: 'MAX_RETRIES_EXCEEDED', errorFile: errorPath };
 }
-  packWorkspace(cleanRoot, payload.mode === 'FIX_ERROR' ? PACK_MODES.RETRY_COMPACT : PACK_MODES.CODING_FOCUSED);
+const planTxt = fs.existsSync(planPath) ? fs.readFileSync(planPath, 'utf8') : '';
+packWorkspace(
+  cleanRoot,
+  payload.mode === 'FIX_ERROR' ? PACK_MODES.RETRY_COMPACT : PACK_MODES.CODING_FOCUSED,
+  engine.startsWith('gemini')
+    ? { budgetBytes: 128 * 1024 }
+    : {}
+);
 const bundle = getBundleAttachmentAndNote(cleanRoot, engine);
 let rule = fs.readFileSync(path.join(PLUGIN_ROOT, 'rules', 'coder_rules.md'), 'utf8');
 if (engine.startsWith('google_search_') || engine.startsWith('gemini')) {
   rule = rule.replace(/\([^)]*zip[^)]*\)/gi, '(Kodi i plotë ekzistues i projektit është i bashkangjitur si skedar fizik project_bundle.txt).');
 }
-const planTxt = fs.existsSync(planPath) ? fs.readFileSync(planPath, 'utf8') : '';
-let extraPrompt = bundle.note + NL + NL + '=== PLANI ARKITEKTUROR (plan.md) ===' + NL + planTxt;
+let formattedPlanSection = '=== PLANI ARKITEKTUROR (plan.md) ===' + NL + planTxt;
+const inlinePlanThreshold = engine.startsWith('gemini') ? 12000 : 18000;
+if (planTxt.length > inlinePlanThreshold) {
+  const planBoundary = crypto.createHash('sha256').update('plan.md:' + planTxt.length).digest('hex').slice(0, 8);
+  formattedPlanSection = '=== DOKUMENTI I PLOTE I SPECIFIKIMEVE NGA PERDORUESI: plan.md [BOUNDARY:' + planBoundary + '] ===' + NL +
+    planTxt + NL +
+    '=== FUNDI I SPECIFIKIMEVE [BOUNDARY:' + planBoundary + '] (ZBATIM 100% I DETYRUESHEM, ZERO-FAKE, ZERO-PLACEHOLDERS) ===';
+}
+let extraPrompt = bundle.note + NL + NL + formattedPlanSection;
 if (payload.mode === 'FIX_ERROR' && fs.existsSync(errorPath)) {
 extraPrompt += NL + NL + '=== GABIMI I TERMINALIT (AUTO-HEAL) ===' + NL + fs.readFileSync(errorPath, 'utf8').slice(-12000);
 }
@@ -2302,7 +2564,7 @@ if (!response || response.trim().length < 60 || isCodeRefusal) {
 }
 const validation = validateGeneratedCodeMarkdown(response);
 if (!validation.valid) {
-  const corrPrompt = 'KORRIGJIM FORMATI I DETYRUESHEM: ' + validation.reason + NL + 'Kthe kodin si bllok standard diff --git (diff --git a/... b/...) ose me etiketen ### FILE: rruga/skedari.ext.';
+  const corrPrompt = 'KORRIGJIM FORMATI I DETYRUESHEM: ' + validation.reason + NL + 'Kthe kodin me ### FILE: rruga/skedari.ext (permbajtje e plote ose blloqe <<<<<<< SEARCH / ======= / >>>>>>> REPLACE; diff --git opsional).';
   if (engine.startsWith('google_search_')) {
     response = await dispatchToGoogleSearchAiTab({
       tabKey: engine,
@@ -2337,7 +2599,11 @@ if (engine === 'antigravity') return { status: 'DELEGATE_TO_ANTIGRAVITY', role: 
 const rule = fs.readFileSync(path.join(PLUGIN_ROOT, 'rules', 'reviewer_rules.md'), 'utf8');
 const planTxt = fs.existsSync(planPath) ? fs.readFileSync(planPath, 'utf8') : '';
 const logTxt = fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8').slice(-8000) : 'NOT_RUN';
-const revPrompt = rule + NL + NL + '=== PLANI ===' + NL + planTxt + NL + NL + '=== BUILD/TEST LOG ===' + NL + logTxt;
+const revPlanBoundary = crypto.createHash('sha256').update('plan.md:' + planTxt.length).digest('hex').slice(0, 8);
+const revPlanSection = (engine.startsWith('gemini') && planTxt.length > 12000)
+  ? ('=== DOKUMENTI I PLOTE I SPECIFIKIMEVE NGA PERDORUESI: plan.md [BOUNDARY:' + revPlanBoundary + '] ===' + NL + planTxt + NL + '=== FUNDI I SPECIFIKIMEVE [BOUNDARY:' + revPlanBoundary + '] ===')
+  : ('=== PLANI ===' + NL + planTxt);
+const revPrompt = rule + NL + NL + revPlanSection + NL + NL + '=== BUILD/TEST LOG ===' + NL + logTxt;
 let response;
 if (engine.startsWith('google_search_')) {
   response = await dispatchToGoogleSearchAiTab({
@@ -2604,6 +2870,8 @@ const root = path.resolve(data.projectRoot || '.');
 const result = await executeCoreAction('run_full_cycle', {
   projectRoot: root,
   userRequest: data.userRequest || data.prompt || '',
+  blocking: data.blocking === true,
+  waitMs: data.waitMs,
   forceReplan: data.forceReplan === true
 });
 res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -2611,7 +2879,7 @@ return res.end(JSON.stringify(result));
 }
 if (reqPath === '/check_cycle_progress' || reqPath === '/api/check-progress' || (reqPath.startsWith('/cycle/') && reqPath.endsWith('/wait'))) {
 const root = path.resolve(data.projectRoot || '.');
-const result = await executeCoreAction('check_cycle_progress', { projectRoot: root, waitMs: data.waitMs, _internal: true });
+const result = await executeCoreAction('check_cycle_progress', { projectRoot: root, blocking: data.blocking === true, waitMs: data.waitMs, _internal: true });
 res.writeHead(200, { 'Content-Type': 'application/json' });
 return res.end(JSON.stringify(result));
 }
@@ -2623,6 +2891,8 @@ res.end(JSON.stringify({ error: err.message }));
 }
 });
 });
+httpServer.requestTimeout = 0;
+httpServer.setTimeout(0);
 httpServer.on('error', function(err) {
 if (err.code === 'EADDRINUSE') isPrimaryInstance = false;
 });
@@ -2703,12 +2973,13 @@ required: []
 },
 {
 name: 'check_cycle_progress',
-description: 'Pret ecurine e ciklit aktiv ne feta ~45s derisa te ktheje CYCLE_COMPLETED / PASSED / FAILED. Thirre ne zinxhir nese merr STILL_RUNNING_CALL_CHECK_PROGRESS. Mos perdor kurre terminal!',
+description: 'Pret ecurine e ciklit aktiv derisa te ktheje CYCLE_COMPLETED / PASSED / FAILED. Me blocking=true mbi HTTP /api/mcp-proxy (ose waitMs) pret deri ne perfundim pa e zgjuar LLM-ne cdo 45s. Mos perdor kurre timer/polling!',
 inputSchema: {
 type: 'object',
 properties: {
 projectRoot: { type: 'string', description: 'Rruga e projektit (opsionale)' },
-waitMs: { type: 'number', description: 'Opsionale: gjatesia e fetes ne ms (default 45000).' }
+blocking: { type: 'boolean', description: 'Opsionale: true pret deri ne perfundim (deri 3600000ms) pa u zgjuar cdo 45s (rekomanduar mbi HTTP /api/mcp-proxy).' },
+waitMs: { type: 'number', description: 'Opsionale: gjatesia e fetes ne ms (default 45000; deri ne 3600000).' }
 },
 required: []
 }
@@ -2782,6 +3053,17 @@ details: err.message
 }
 });
 async function closeAllContexts() {
+for (const [pName, browser] of Object.entries(cdpBrowsers)) {
+  try {
+    if (browser && typeof browser.close === 'function') {
+      await Promise.race([
+        browser.close(),
+        new Promise(function(resolve) { setTimeout(resolve, 2000); })
+      ]);
+    }
+  } catch (_) {}
+  delete cdpBrowsers[pName];
+}
 for (const [k, ctx] of Object.entries(contexts)) {
 try { await ctx.close(); } catch (_) {}
 delete contexts[k];
@@ -2797,7 +3079,53 @@ for (const k of Object.keys(tabs)) {
 process.on('SIGINT', async function() { await closeAllContexts(); process.exit(0); });
 process.on('SIGTERM', async function() { await closeAllContexts(); process.exit(0); });
 if(process.env.ANTIGRAVITY_TEST_EXPORT==='1'){module.exports={CHUNK_ENGINE_LIMITS,scanRepositoryUniversal,buildCompactRepoMap,buildDependencyGraph,partitionAnalysisChunks,analyzeRepositoryChunks,buildFinalPlanningContext,parseAndValidatePlanBatches,partitionCodingBatches,buildBatchContext,runCodingBatch,applyBatch,runBatchQuickChecks,repairBatchOnce,halveBatchAdaptively,buildCrossBatchContractSummary,buildDiffFocusedReviewContext,writeChunkContextFile,extractTargetsFromError,scoreAnalysisChunkRelevance,buildLocalStructuralChunkSummary,buildBatchMiniMap,extractBatchPlanSlice,buildMinimalBatchContext,selectCodingTransport,selectAdaptiveReasoningLevel,classifyAttachmentHandshakeStrict,getFailoverEngines,parseCodeBlocksFromMarkdown,normalizeFailureCode,isAdaptiveHalvingFailure,persistCheckpointReceiptOnce};}
-if(process.env.ANTIGRAVITY_TEST_EXPORT==='1'){Object.defineProperty(module.exports,'buildDashboardState',{value:buildDashboardState,enumerable:false});Object.defineProperty(module.exports,'WEB_ENGINE_ADAPTERS',{value:WEB_ENGINE_ADAPTERS,enumerable:false});Object.defineProperty(module.exports,'conversationIdFromUrl',{value:conversationIdFromUrl,enumerable:false});Object.defineProperty(module.exports,'probeChatCleanState',{value:probeChatCleanState,enumerable:false});Object.defineProperty(module.exports,'getProfileNameForTab',{value:getProfileNameForTab,enumerable:false});}
+function buildOffloadedSpecFilename(specName, specBody, isGemini) {
+  const cleanName = String(specName || 'specifikimet').trim().replace(/[^a-zA-Z0-9._-]/g, '_') || 'specifikimet';
+  const baseName = cleanName.replace(/\.[^.]+$/, '') || cleanName;
+  const hashPrefix = crypto.createHash('sha256').update(cleanName + ':' + String(specBody || '').length).digest('hex').slice(0, 6);
+  return hashPrefix + '_' + baseName + (isGemini ? '.txt' : '.md');
+}
+
+function offloadExternalSpecsFromPrompt(promptText, projectRoot, isGemini) {
+  if (typeof promptText !== 'string' || !promptText) {
+    return { combinedText: '', filesToUpload: [] };
+  }
+  const rawPrompt = promptText;
+  let combinedText = rawPrompt;
+  const filesToUpload = [];
+  const offloadThreshold = isGemini ? 12000 : 25000;
+  if (combinedText.length <= offloadThreshold) return { combinedText: combinedText, filesToUpload: filesToUpload };
+
+  const processSpecMatch = function(fullMatch, rawSpecName, specBody) {
+    const specName = (rawSpecName || 'specifikimet').trim().replace(/[^a-zA-Z0-9._-]/g, '_') || 'specifikimet';
+    if (specBody && specBody.length > 5000) {
+      const exchangeDir = path.join(path.resolve(projectRoot), '.antigravity', 'bridge', 'exchange');
+      if (!fs.existsSync(exchangeDir)) fs.mkdirSync(exchangeDir, { recursive: true });
+      const fileName = buildOffloadedSpecFilename(specName, specBody, Boolean(isGemini));
+      const tempSpecFile = path.join(exchangeDir, fileName);
+      fs.writeFileSync(tempSpecFile, specBody.trim(), 'utf8');
+      filesToUpload.push(tempSpecFile);
+      const placeholder = NL + NL + '[UDHEZIM: Dokumenti i plote i specifikimeve (' + specName + ') eshte bashkangjitur si skedar fizik (' + fileName + '). ZBATO TE GJITHA RREGULLAT 100%, ZERO-FAKE, ZERO-PLACEHOLDERS.]' + NL;
+      combinedText = combinedText.replace(fullMatch, function() { return placeholder; });
+    }
+  };
+
+  const boundarySpecRegex = /^=== DOKUMENTI I PLOTE I SPECIFIKIMEVE NGA PERDORUESI:\s*([^\r\n=]+?)\s*\[BOUNDARY:([a-f0-9]{8})\] ===[ \t]*\r?\n([\s\S]*?)\r?\n=== FUNDI I SPECIFIKIMEVE \[BOUNDARY:\2\][^\r\n]*===[ \t]*\r?$/gm;
+  let match;
+  while ((match = boundarySpecRegex.exec(rawPrompt)) !== null) {
+    processSpecMatch(match[0], match[1], match[3]);
+  }
+
+  const legacySource = combinedText;
+  const legacySpecRegex = /^=== DOKUMENTI I PLOTE I SPECIFIKIMEVE NGA PERDORUESI:\s*(?![^\r\n=]*\[BOUNDARY:[a-f0-9]{8}\])([^\r\n=]+?)\s*===[ \t]*\r?\n([\s\S]*?)\r?\n=== FUNDI I SPECIFIKIMEVE[^\r\n=]*===[ \t]*\r?$/gm;
+  while ((match = legacySpecRegex.exec(legacySource)) !== null) {
+    processSpecMatch(match[0], match[1], match[2]);
+  }
+
+  return { combinedText: combinedText, filesToUpload: filesToUpload };
+}
+
+if(process.env.ANTIGRAVITY_TEST_EXPORT==='1'){Object.defineProperty(module.exports,'buildDashboardState',{value:buildDashboardState,enumerable:false});Object.defineProperty(module.exports,'WEB_ENGINE_ADAPTERS',{value:WEB_ENGINE_ADAPTERS,enumerable:false});Object.defineProperty(module.exports,'conversationIdFromUrl',{value:conversationIdFromUrl,enumerable:false});Object.defineProperty(module.exports,'probeChatCleanState',{value:probeChatCleanState,enumerable:false});Object.defineProperty(module.exports,'getProfileNameForTab',{value:getProfileNameForTab,enumerable:false});Object.defineProperty(module.exports,'offloadExternalSpecsFromPrompt',{value:offloadExternalSpecsFromPrompt,enumerable:false});Object.defineProperty(module.exports,'attachFilesSafely',{value:attachFilesSafely,enumerable:false});Object.defineProperty(module.exports,'isTransientCopilotResponse',{value:isTransientCopilotResponse,enumerable:false});Object.defineProperty(module.exports,'classifyWebServiceFailure',{value:classifyWebServiceFailure,enumerable:false});Object.defineProperty(module.exports,'SERVICE_ERROR_PATTERNS',{value:SERVICE_ERROR_PATTERNS,enumerable:false});}
 if(process.env.ANTIGRAVITY_TEST_EXPORT!=='1')startDashboardAndSingletonServer();
 if(process.env.ANTIGRAVITY_TEST_EXPORT!=='1' && !process.stdin.isTTY) {
 const transport = new StdioServerTransport();

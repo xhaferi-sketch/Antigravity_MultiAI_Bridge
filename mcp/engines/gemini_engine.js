@@ -124,8 +124,12 @@ function classifyResetCandidate(state, sendMeta, preCounts) {
   );
   const countsReturnedToBaseline = Boolean((state.userTurnCount || 0) <= preUserCount && (state.assistantTurnCount || 0) <= preAssistantCount);
   const committedTurnMissing = Boolean(!state.committedUserStillPresent);
+  const currentRoute = String(state.routeKey || state.route || state.url || state.pathname || '');
+  const hasConversationRouteId = /\/(?:u\/\d+\/)?app\/[A-Za-z0-9_-]{6,}/i.test(currentRoute);
+  const hasThoughtContent = Boolean(state.hasThoughtContent || state.hasModelThoughts);
   const turnRolledBackAfterSend = Boolean(
-    sendMeta.committed && newTurnWasObserved && countsReturnedToBaseline && committedTurnMissing && !state.generating && !preCounts.lastText
+    sendMeta.committed && newTurnWasObserved && countsReturnedToBaseline && committedTurnMissing &&
+    !state.generating && !preCounts.lastText && !hasConversationRouteId && !hasThoughtContent
   );
   const domainDriftCandidate = Boolean(
     sendMeta.committed && state.domainMismatch && (state.userTurnCount || 0) === 0 && (state.assistantTurnCount || 0) === 0 && !state.generating
@@ -457,7 +461,7 @@ async function observeSessionReadiness(args) {
     return {
       documentReady: document.readyState === 'complete' || document.readyState === 'interactive',
       route: route,
-      routeStable: route === '/app' || route.indexOf('/app/') === 0,
+      routeStable: /^(?:\/u\/\d+)?\/app(?:\/|$)/.test(route),
       composerAvailable: selectors.composer.some(visible),
       modelControlAvailable: selectors.modelControl.some(visible),
       blockingOverlay: selectors.blockingOverlay.some(visible),
@@ -840,6 +844,14 @@ function createGeminiEngine(runtimeContext) {
         };
       };
 
+      const dismissOverlays = async function() {
+        document.querySelectorAll('.cdk-overlay-backdrop').forEach(function(b) { b.click(); });
+        try { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true })); } catch (_) {}
+        await sleep(200);
+      };
+
+      await dismissOverlays();
+
       let trigger = null;
       const pollStart = Date.now();
       const pollTimeoutMs = Number(required && required.timeoutMs) || 15000;
@@ -851,6 +863,7 @@ function createGeminiEngine(runtimeContext) {
       if (!trigger) return { ok: false, code: 'MODEL_TRIGGER_TIMEOUT' };
 
       let state = readTriggerState(trigger);
+      await dismissOverlays();
       if (!state.active) {
         trigger.click();
         await sleep(600);
@@ -914,9 +927,8 @@ function createGeminiEngine(runtimeContext) {
           }
         }
 
-        document.querySelectorAll('.cdk-overlay-backdrop').forEach(function(b) { b.click(); });
-        try { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true })); } catch (_) {}
-        await sleep(600);
+        await dismissOverlays();
+        await sleep(400);
 
         let pollActiveStart = Date.now();
         while (Date.now() - pollActiveStart < 8000) {
@@ -929,6 +941,7 @@ function createGeminiEngine(runtimeContext) {
         }
         if (!trigger) return { ok: false, code: 'MODEL_SELECTION_UNVERIFIED', debug: 'NO_TRIGGER' };
         if (!state.active) return { ok: false, code: 'MODEL_SELECTION_UNVERIFIED', debug: { text: state.text, aria: state.aria } };
+        await dismissOverlays();
       }
 
       let stablePolls = 0;
@@ -940,6 +953,7 @@ function createGeminiEngine(runtimeContext) {
         stablePolls++;
         if (i < 1) await sleep(500);
       }
+      await dismissOverlays();
 
       return {
         ok: true,

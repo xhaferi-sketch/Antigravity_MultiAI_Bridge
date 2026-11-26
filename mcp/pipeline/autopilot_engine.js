@@ -615,7 +615,8 @@ const CHUNK_ENGINE_LIMITS = Object.freeze({
 
 const TEXT_BUNDLE_DENIED_DIRECTORIES = new Set([
   '__pycache__', '.git', '.svn', '.hg', 'node_modules', 'bin', 'obj', 'dist',
-  'build', 'coverage', '.cache', 'cache', 'tmp', 'temp', '.venv', 'venv'
+  'build', 'coverage', '.cache', 'cache', 'tmp', 'temp', '.venv', 'venv',
+  '.hermes', '.profiles', '.antigravity', 'scratch', 'profiles'
 ]);
 
 const TEXT_BUNDLE_DENIED_EXTENSIONS = new Set([
@@ -784,6 +785,11 @@ function truncateUtf8(text, maxBytes) {
   return buf.subarray(0, maxBytes).toString('utf8');
 }
 
+function isWorkspaceTestPath(rel) {
+  const low = String(rel || '').replace(/\\/g, '/').toLowerCase();
+  return /(?:^|\/)(?:tests?|__tests__|specs?)\/|\.(?:test|spec)\.[^.]+$/i.test(low);
+}
+
 function classifyWorkspaceFile(rel, meta) {
   meta = meta || {};
   const low = String(rel || '').replace(/\\/g, '/').toLowerCase(), ext = path.extname(low), segments = low.split('/');
@@ -792,14 +798,16 @@ function classifyWorkspaceFile(rel, meta) {
   const generated = segments.some(function(x) { return /^(logs?|reports?|outputs?|artifacts?|generated|caches?|tmp|temp|backups?|archive|exports?|coverage|dist|build|node_modules|venv|\.git)$/.test(x); }) || /(?:^|[_-])\d{4}[-_]\d{2}[-_]\d{2}(?:[_-]|\.)/.test(low);
   const binary = /\.(png|jpe?g|gif|webp|zip|pdf|mp4|mov|mp3|wav|exe|dll|so|bin)$/i.test(low);
   const runtime = /\.(json|csv|ndjson|log)$/i.test(low) && /(data|queue|history|session|state|dump|lead|runtime|report)/i.test(low);
-  let tier = config ? 0 : source.has(ext) ? 1 : /(test|spec|docs?|readme|schema|migration)/i.test(low) ? 2 : 3;
+  const isTestPath = isWorkspaceTestPath(low);
+  let tier = config ? 0 : isTestPath ? 2 : source.has(ext) ? 1 : /(test|spec|docs?|readme|schema|migration)/i.test(low) ? 2 : 3;
   if (meta.explicitTarget || meta.errorReferenced || meta.entryPoint) tier = 0;
   return { tier: tier, sourceFile: source.has(ext), configFile: config, generatedSignal: generated, runtimeDataSignal: runtime, binary: binary };
 }
 
 function scoreWorkspaceFile(info) {
   const m = info.meta || {}, c = info.classification || classifyWorkspaceFile(info.rel, m);
-  return (m.explicitTarget ? 10000 : 0) + (m.errorReferenced ? 8000 : 0) + (m.entryPoint ? 6000 : 0) + (m.importedByTarget ? 4000 : 0) + (c.sourceFile ? 2500 : 0) + (c.configFile ? 2200 : 0) + (m.testForTarget ? 1800 : 0) + (m.recentlyModifiedSource ? 400 : 0) - (c.generatedSignal ? 3000 : 0) - (c.runtimeDataSignal ? 2500 : 0) - (m.duplicateContent ? 5000 : 0) - Math.floor((info.size || 0) / 65536) * 100;
+  const sourceBonus = c.sourceFile ? (c.tier <= 1 ? 2500 : 1500) : 0;
+  return (m.explicitTarget ? 10000 : 0) + (m.errorReferenced ? 8000 : 0) + (m.entryPoint ? 6000 : 0) + (m.importedByTarget ? 4000 : 0) + sourceBonus + (c.configFile ? 2200 : 0) + (m.testForTarget ? 1800 : 0) + (m.recentlyModifiedSource ? 400 : 0) - (c.generatedSignal ? 3000 : 0) - (c.runtimeDataSignal ? 2500 : 0) - (m.duplicateContent ? 5000 : 0) - Math.floor((info.size || 0) / 65536) * 100;
 }
 
 function compactWorkspaceContent(rel, content, maxBytes, classification) {
@@ -831,8 +839,12 @@ function buildBudgetedWorkspaceBundle(projectRoot, opts) {
   opts = opts || {};
   const cleanRoot = fs.realpathSync(path.resolve(projectRoot));
   const mode = PACK_MODES[opts.mode] ? opts.mode : PACK_MODES.PLANNING_FULL;
-  const budget = Math.min(512 * 1024, Math.max(4096, Number(opts.budgetBytes || (mode === PACK_MODES.CODING_FOCUSED ? 448 * 1024 : 256 * 1024))));
+  const defaultModeBudget = mode === PACK_MODES.RETRY_COMPACT ? 160 * 1024 : 256 * 1024;
+  const budget = Math.min(512 * 1024, Math.max(4096, Number(opts.budgetBytes || defaultModeBudget)));
   const targets = new Set((opts.explicitTargets || []).map(function(x) { return String(x).replace(/\\/g, '/'); }));
+  const targetBaseNames = Array.from(targets)
+    .map(function(t) { return path.posix.basename(t, path.posix.extname(t)).toLowerCase(); })
+    .filter(function(name) { return name.length >= 2; });
   const errors = new Set((opts.errorReferenced || []).map(function(x) { return String(x).replace(/\\/g, '/'); }));
   const files = [], excluded = [], hashes = new Map();
   let budgetReachedLogged = false, excludedBinaryExtensionCount = 0, excludedBinaryContentCount = 0, excludedInvalidUtf8Count = 0;
@@ -860,7 +872,13 @@ function buildBudgetedWorkspaceBundle(projectRoot, opts) {
       let st;
       try { st = fs.statSync(real); } catch (_) { continue; }
       if (!st.isFile()) { excluded.push({ rel: rel, reason: 'NON_REGULAR' }); continue; }
-      const meta = { explicitTarget: targets.has(rel), errorReferenced: errors.has(rel), entryPoint: /(^|\/)(index|main|server|app)\.[^.]+$/i.test(rel), testForTarget: /test|spec/i.test(rel) };
+      const isTestPath = isWorkspaceTestPath(rel);
+      const testBase = path.posix.basename(rel).toLowerCase();
+      const testForTarget = isTestPath && (
+        targets.has(rel) ||
+        (targets.size > 0 && targetBaseNames.some(function(base) { return testBase.includes(base); }))
+      );
+      const meta = { explicitTarget: targets.has(rel), errorReferenced: errors.has(rel), entryPoint: /(^|\/)(index|main|server|app)\.[^.]+$/i.test(rel), testForTarget: testForTarget };
       const classification = classifyWorkspaceFile(rel, meta), ext = path.extname(rel).toLowerCase();
       if (TEXT_BUNDLE_DENIED_EXTENSIONS.has(ext) || classification.binary) { excludedBinaryExtensionCount++; excluded.push({ rel: rel, reason: 'BINARY_EXTENSION' }); continue; }
       if (classification.generatedSignal && !meta.explicitTarget) { excluded.push({ rel: rel, reason: 'GENERATED' }); continue; }
@@ -955,11 +973,14 @@ function packWorkspace(projectRoot, mode, opts) {
     const txt = fs.readFileSync(plan, 'utf8');
     targets = extractPlanTargets(txt, cleanRoot).targets;
   }
+  if (Array.isArray(opts.explicitTargets) && opts.explicitTargets.length > 0) {
+    targets = Array.from(new Set(targets.concat(opts.explicitTargets)));
+  }
   if (fs.existsSync(err)) {
     const t = fs.readFileSync(err, 'utf8');
     errorRefs = Array.from(t.matchAll(/(?:^|\s)([A-Za-z0-9_.\/-]+\.[A-Za-z0-9]+)(?::\d+)?/g)).map(function(m) { return m[1]; });
   }
-  const built = buildBudgetedWorkspaceBundle(cleanRoot, { mode: mapped, explicitTargets: targets, errorReferenced: errorRefs });
+  const built = buildBudgetedWorkspaceBundle(cleanRoot, { mode: mapped, budgetBytes: opts.budgetBytes, explicitTargets: targets, errorReferenced: errorRefs });
   const txtPath = path.join(exchangeDir, 'project_bundle.txt');
   validateFinalTextArtifact(built.content, mapped);
   fs.writeFileSync(txtPath, built.content, 'utf8');
@@ -1031,9 +1052,10 @@ function resolveAndEmbedExternalFiles(userRequest) {
       if (fs.existsSync(clean) && fs.statSync(clean).isFile()) {
         readPaths.add(clean);
         const content = fs.readFileSync(clean, 'utf8');
-        embedded += NL + NL + '=== DOKUMENTI I PLOTE I SPECIFIKIMEVE NGA PERDORUESI: ' + path.basename(clean) + ' ===' + NL +
+        const boundary = crypto.createHash('sha256').update(clean + ':' + content.length).digest('hex').slice(0, 8);
+        embedded += NL + NL + '=== DOKUMENTI I PLOTE I SPECIFIKIMEVE NGA PERDORUESI: ' + path.basename(clean) + ' [BOUNDARY:' + boundary + '] ===' + NL +
                     content + NL +
-                    '=== FUNDI I SPECIFIKIMEVE (ZBATIM 100% I DETYRUESHEM, ZERO-FAKE, ZERO-PLACEHOLDERS) ===';
+                    '=== FUNDI I SPECIFIKIMEVE [BOUNDARY:' + boundary + '] (ZBATIM 100% I DETYRUESHEM, ZERO-FAKE, ZERO-PLACEHOLDERS) ===' + NL;
       }
     } catch (_) {}
   }
@@ -1939,7 +1961,8 @@ function createAutopilotEngine(deps) {
   async function executeCodingLeaf(batch, state, routing, job, opts) {
     opts = opts || {};
     const engine = opts.coderEngine || state.activeCoderEngine || (routing && routing.roles && routing.roles.coder) || 'gemini2';
-    const context = buildBatchContext(batch, state, CHUNK_ENGINE_LIMITS);
+    const batchLimits = engine.startsWith('gemini') ? Object.assign({}, CHUNK_ENGINE_LIMITS, { batchHard: Math.min(CHUNK_ENGINE_LIMITS.batchHard || 180 * 1024, 180 * 1024) }) : CHUNK_ENGINE_LIMITS;
+    const context = buildBatchContext(batch, state, batchLimits);
     const transport = selectCodingTransport(context, CHUNK_ENGINE_LIMITS);
     const exchangeDir = path.join(state.scan.projectRoot, '.antigravity', 'bridge', 'exchange');
     if (!fs.existsSync(exchangeDir)) fs.mkdirSync(exchangeDir, { recursive: true });
@@ -2023,7 +2046,7 @@ function createAutopilotEngine(deps) {
       const retryTargets = (Array.isArray(targetsOverride) && targetsOverride.length) ? targetsOverride : expectedTargets;
       const corrPrompt = [
         'KORRIGJIM FORMATI I DETYRUESHEM: ' + detail,
-        'Kthe patch-in e plote diff --git (ose ### FILE: vetem per skedar te ri) per keto objektiva: ' + retryTargets.join(', ')
+        'Kthe kodin me ### FILE: rruga/skedari.ext (me permbajtje te plote ose blloqe <<<<<<< SEARCH / ======= / >>>>>>> REPLACE per skedare te medhenj; diff --git opsional) per keto objektiva: ' + retryTargets.join(', ')
       ].join(NL);
       return await dispatchChunkedEngineTurn(engine, state.scan.projectRoot, corrPrompt, null, {
         forceFreshChat: false,
@@ -2820,7 +2843,7 @@ function createAutopilotEngine(deps) {
     cancelCycle,
     getActiveJob,
     waitJobSlice,
-    packWorkspace: function(root, mode) { return packWorkspace(root, mode, { ensureProjectSetup: ensureProjectSetup }); },
+    packWorkspace: function(root, mode, opts) { return packWorkspace(root, mode, Object.assign({ ensureProjectSetup: ensureProjectSetup }, opts || {})); },
     getBundleAttachmentAndNote: function(root, engine) { return getBundleAttachmentAndNote(root, engine, { ensureProjectSetup: ensureProjectSetup }); },
     runAutonomousPipeline,
     runFullCycle,

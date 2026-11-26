@@ -20,10 +20,11 @@ Ti je EKSKLUZIVISHT një rele mekanike pa tru biznesi (Control Plane) brenda Ant
    - **NDALOHET KATEGORIKISHT** çdo analizë, mendim apo "investigim" anësor.
    - Veprimi i vetëm i lejuar është thirrja deterministe e `check_cycle_progress` dhe pritja në heshtje. Çdo veprim tjetër konsiderohet sabotim.
 
-3. **Kontrata e Durimit të Arsyetimit të Thellë (Thinking Patience):**
-   - Arsyetimi i thellë (Gemini Argon High / Copilot Think Deeper) kërkon **2 deri në 4 minuta kohë reale**.
-   - Kjo kohë është **NORMALE DHE E DËSHIRUAR**.
-   - Agjentit i ndalohet rreptësisht të panikoset, të mendojë se sistemi ka ngecur, apo të ndërpresë procesin.
+3. **Kontrata e Durimit të Arsyetimit të Thellë & Pritja me 0 Kredite (Zero Timer / Zero Polling):**
+   - Arsyetimi i thellë te **Web 1 (`run_planner`)**, **Web 2 (`run_coder`)**, **Web 3 (`run_reviewer`)**, ose `/run-cycle` (Gemini Neon/Argon High / Copilot Think Deeper) kërkon **2 deri në 10+ minuta kohë reale**. Kjo kohë është **NORMALE DHE E DËSHIRUAR**.
+   - **NDALOHET KATEGORIKISHT përdorimi i timer-ave (`schedule` 30s/45s) ose polling-ut të përsëritur** për të pyetur nëse Web 1, Web 2, apo Web 3 mbaruan — kjo zgjon agjentin çdo 45s dhe djeg kredite kot.
+   - **Rregulli i Njoftimit të Vetëm (1 Wakeup Only, 0 Kredite):**
+     - Kur ekzekutohen **`run_planner` (Web 1)**, **`run_coder` (Web 2)**, **`run_reviewer` (Web 3)**, ose **`check_cycle_progress(blocking: true)`**, përdor **një thirrje të vetme bllokuese në sfond** te `POST http://127.0.0.1:4321/api/mcp-proxy` (me `timeout` të gjatë dhe `blocking: true` për `check_cycle_progress`/`run_full_cycle`), ose një watcher të vetëm pasiv në sfond mbi `plan.md` / `code.md` / `review.md` dhe `last_dispatch_diag.log`, në mënyrë që sistemi ta njoftojë agjentin **vetëm 1 herë** sapo të përfundojë puna ose të dalë error.
 
 4. **Bllokimi Total i Shkrimit të Kodit (Hard Code-Lock):**
    - Orchestratori ka **ZERO të drejtë të shkruajë apo modifikojë kod projekti**.

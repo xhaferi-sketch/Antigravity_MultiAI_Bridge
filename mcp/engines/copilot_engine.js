@@ -96,130 +96,272 @@ function createCopilotEngine(runtimeContext) {
     const contract = opts.contract || COPILOT_REQUIRED_MODEL;
     if (tabKey && copilotModelReceipts) copilotModelReceipts[tabKey] = null;
     const result = await targetFrame.evaluate(async function(req) {
+      const sleep = function(ms) {
+        return new Promise(function(resolve) { setTimeout(resolve, ms); });
+      };
       const visible = function(el) {
-        if (!el) return false;
+        if (!el || !el.isConnected) return false;
         const s = getComputedStyle(el), r = el.getBoundingClientRect();
-        return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 4 && r.height > 4;
+        return s.display !== 'none' && s.visibility !== 'hidden' && parseFloat(s.opacity || '1') > 0.05 && r.width > 4 && r.height > 4;
       };
       const text = function(el) {
-        return (((el && el.innerText) || '') + ' ' + ((el && el.getAttribute('aria-label')) || '')).replace(/\s+/g, ' ').trim();
+        return (
+          ((el && el.innerText) || '') + ' ' +
+          ((el && typeof el.getAttribute === 'function' && el.getAttribute('aria-label')) || '') + ' ' +
+          ((el && typeof el.getAttribute === 'function' && el.getAttribute('title')) || '')
+        ).replace(/\s+/g, ' ').trim();
       };
       const selectors = 'button[aria-label*="model" i],button[aria-label*="mode" i],[data-testid*="model-switcher" i],[data-testid*="mode-selector" i],.fui-Dropdown';
+      const menuSelector = '.fui-MenuPopover, .fui-PopoverSurface, [role="menu"], [role="listbox"], .fui-MenuList';
+      const optionSelector = '[role="option"],[role="menuitemradio"],[role="menuitem"],[role="menuitemcheckbox"],.fui-MenuItem,.fui-Option,[data-testid*="gptSubMenuModelTrigger-"],button';
+      const submenuTriggerSelector = '[data-testid*="gptSubMenuModelTrigger"],[role="menuitem"][aria-haspopup="menu"],[role="menuitem"][aria-haspopup="true"],[role="menuitem"][aria-haspopup="listbox"]';
       const isExcludedControl = function(val) {
         return /\b(dark\s*mode|light\s*mode|color\s*mode|theme|sidebar|navigation|history|voice|microphone|dictate|attach|upload|settings|cookie)\b/i.test(String(val || ''));
       };
-      const isLikelyModelControl = function(el) {
-        if (!visible(el)) return false;
-        const t = text(el);
-        if (!t || isExcludedControl(t)) return false;
-        if (el.matches('[data-testid*="model-switcher" i],[data-testid*="mode-selector" i],button[aria-label*="model" i]')) return true;
-        return /\b(gpt-5\.6|sol\s*think|think\s*deeper|quick\s*response|auto|model|smart|study)\b/i.test(t);
-      };
-      const candidates = Array.from(document.querySelectorAll(selectors)).filter(visible);
-      let button = candidates.find(isLikelyModelControl) || candidates.find(function(el) { return !isExcludedControl(text(el)); }) || null;
       const isForbiddenWeakModel = function(val) {
         const lower = String(val || '').toLowerCase();
-        return /\b(auto|quick\s*response|fast|flash|lite|mini|basic|standard|gpt-4|gpt-4o|gpt-3\.5)\b/i.test(lower);
+        return /\b(auto|quick(\s*response)?|fast|flash|lite|nano|mini|low|basic|standard|gpt-4|gpt-4o|gpt-3\.5)\b/i.test(lower);
       };
       const requiredModelVisible = function(val) {
         const lower = String(val || '').toLowerCase();
         return (lower.includes('gpt-5.6') || lower.includes('5.6 sol think') || lower.includes('sol think')) && !isForbiddenWeakModel(lower);
       };
-      const hasDeepReasoningSignal = function(val) {
+      const isDeepReasoningLabel = function(val) {
         const lower = String(val || '').toLowerCase();
-        if (lower.includes(req.reasoningLabel.toLowerCase()) || /\bdeep\b|think\s*deeper|extra\s*thorough|\bhigh\b/i.test(lower)) return true;
+        const targetLabel = String((req && req.reasoningLabel) || 'think deeper').toLowerCase();
+        return (lower.includes(targetLabel) || /\bdeep\b|think\s*deeper|extra\s*thorough|\bhigh\b/i.test(lower)) && !isForbiddenWeakModel(lower);
+      };
+      const isControlActive = function(el) {
+        if (!el) return false;
+        const getAttr = function(name) { return typeof el.getAttribute === 'function' ? el.getAttribute(name) : null; };
+        if (
+          getAttr('aria-pressed') === 'true' ||
+          getAttr('aria-checked') === 'true' ||
+          getAttr('aria-selected') === 'true' ||
+          getAttr('data-checked') === 'true' ||
+          getAttr('data-state') === 'checked'
+        ) return true;
+        if (el.classList && (
+          el.classList.contains('active') ||
+          el.classList.contains('is-active') ||
+          el.classList.contains('is-checked') ||
+          el.classList.contains('fui-MenuItem--selected')
+        )) return true;
+        if (typeof el.querySelector === 'function' && el.querySelector('input:checked')) return true;
+        if (typeof el.querySelectorAll === 'function') {
+          const hasCheckIcon = Array.from(el.querySelectorAll('svg,[class*="check" i],[data-icon*="check" i],[aria-label*="check" i],[aria-label*="selected" i]')).some(function(icon) {
+            if (!visible(icon)) return false;
+            const id = (
+              ((typeof icon.getAttribute === 'function' && icon.getAttribute('aria-label')) || '') + ' ' +
+              ((typeof icon.getAttribute === 'function' && icon.getAttribute('data-icon')) || '') + ' ' +
+              String(icon.className || '')
+            ).toLowerCase();
+            return /(check|checkmark|tick|selected)/.test(id);
+          });
+          if (hasCheckIcon) return true;
+        }
+        return false;
+      };
+      const hasDeepReasoningSignal = function(val) {
+        if (isDeepReasoningLabel(val)) return true;
         return Array.from(document.querySelectorAll('button,[role="switch"],[role="menuitemradio"],[role="option"]')).filter(visible).some(function(el) {
-          const t = text(el).toLowerCase();
-          const active = el.getAttribute('aria-pressed') === 'true' ||
-            el.getAttribute('aria-checked') === 'true' ||
-            el.getAttribute('aria-selected') === 'true' ||
-            el.getAttribute('data-checked') === 'true' ||
-            el.getAttribute('data-state') === 'checked' ||
-            el.classList.contains('active') ||
-            el.classList.contains('is-active');
-          return active && /think\s*deeper|deep|high/i.test(t);
+          const t = text(el);
+          return !isExcludedControl(t) && !isForbiddenWeakModel(t) && isControlActive(el) && isDeepReasoningLabel(t);
         });
       };
-      if (button && requiredModelVisible(text(button)) && hasDeepReasoningSignal(text(button))) {
+      const isLikelyModelControl = function(el) {
+        if (!visible(el)) return false;
+        if (typeof el.closest === 'function' && el.closest('[role="menu"],[role="listbox"],.fui-MenuPopover')) return false;
+        const t = text(el);
+        if (!t || isExcludedControl(t)) return false;
+        if (typeof el.matches === 'function' && el.matches('[data-testid*="model-switcher" i],[data-testid*="mode-selector" i],button[aria-label*="model" i]')) return true;
+        return /\b(gpt-5\.6|sol\s*think|think\s*deeper|quick\s*response|auto|model|smart|study)\b/i.test(t);
+      };
+      const getModelButton = function() {
+        const direct = Array.from(document.querySelectorAll(selectors)).filter(visible).find(isLikelyModelControl);
+        if (direct) return direct;
+        return Array.from(document.querySelectorAll('button')).filter(visible).find(function(el) {
+          if (typeof el.closest === 'function' && el.closest('[role="menu"],[role="listbox"],.fui-MenuPopover')) return false;
+          const t = text(el);
+          return !isExcludedControl(t) && /gpt-5\.6|sol\s*think|think\s*deeper|model|gpt|auto|quick/i.test(t);
+        }) || null;
+      };
+      const getVisibleMenus = function() {
+        return Array.from(document.querySelectorAll(menuSelector)).filter(function(el) {
+          if (!visible(el)) return false;
+          if (typeof el.querySelectorAll === 'function' && el.querySelectorAll('[role="option"],[role="menuitemradio"],[role="menuitem"],[role="menuitemcheckbox"],.fui-MenuItem,.fui-Option,[data-testid*="gptSubMenuModelTrigger"]').length > 0) return true;
+          return /\b(gpt-5\.6|sol\s*think|think\s*deeper|quick\s*response|auto|model|gpt|smart|study)\b/i.test(text(el));
+        });
+      };
+      const closeMenus = async function() {
+        const fireEscape = function(target) {
+          if (!target || typeof target.dispatchEvent !== 'function') return;
+          if (typeof KeyboardEvent === 'function') {
+            target.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }));
+          } else {
+            target.dispatchEvent({ type: 'keydown', key: 'Escape', code: 'Escape', bubbles: true });
+          }
+        };
+        const deadline = Date.now() + 600;
+        while (getVisibleMenus().length > 0 && Date.now() <= deadline) {
+          if (document.activeElement) fireEscape(document.activeElement);
+          fireEscape(document);
+          Array.from(document.querySelectorAll('.cdk-overlay-backdrop')).filter(visible).forEach(function(b) {
+            if (typeof b.click === 'function') b.click();
+          });
+          if (getVisibleMenus().length === 0) break;
+          await sleep(100);
+        }
+      };
+      const openModelMenuOnce = async function(btn) {
+        const existing = getVisibleMenus();
+        if (existing.length > 0) return existing;
+        if (btn && typeof btn.click === 'function') btn.click();
+        const deadline = Date.now() + 2500;
+        while (Date.now() <= deadline) {
+          const opened = getVisibleMenus();
+          if (opened.length > 0) return opened;
+          await sleep(100);
+        }
+        return getVisibleMenus();
+      };
+      const expandSubmenus = async function(menus) {
+        const seenTriggers = new Set();
+        for (const menu of (menus || [])) {
+          if (!menu || typeof menu.querySelectorAll !== 'function') continue;
+          const triggers = Array.from(menu.querySelectorAll(submenuTriggerSelector)).filter(visible);
+          for (const sub of triggers) {
+            if (seenTriggers.has(sub)) continue;
+            seenTriggers.add(sub);
+            const beforeCount = getVisibleMenus().length;
+            try {
+              if (typeof sub.dispatchEvent === 'function') {
+                sub.dispatchEvent(typeof MouseEvent === 'function' ? new MouseEvent('mouseenter', { bubbles: true }) : { type: 'mouseenter', bubbles: true });
+                sub.dispatchEvent(typeof PointerEvent === 'function' ? new PointerEvent('pointerover', { bubbles: true }) : { type: 'pointerover', bubbles: true });
+              }
+            } catch (_) {}
+            await sleep(250);
+            if (getVisibleMenus().length <= beforeCount && typeof sub.click === 'function') {
+              sub.click();
+              await sleep(300);
+            }
+          }
+        }
+        return getVisibleMenus();
+      };
+      const collectMenuOptions = function(menus) {
+        const unique = [];
+        const seen = new Set();
+        for (const menu of (menus || [])) {
+          if (!menu || typeof menu.querySelectorAll !== 'function') continue;
+          const items = Array.from(menu.querySelectorAll(optionSelector));
+          for (const el of items) {
+            if (seen.has(el) || !visible(el)) continue;
+            seen.add(el);
+            const popup = typeof el.getAttribute === 'function' ? el.getAttribute('aria-haspopup') : null;
+            if (popup === 'menu' || popup === 'true' || popup === 'listbox') continue;
+            const t = text(el);
+            if (t.length <= 2 || t.length >= 120 || isExcludedControl(t)) continue;
+            unique.push(el);
+          }
+        }
+        return unique;
+      };
+
+      let button = getModelButton();
+      if (button && requiredModelVisible(text(button)) && hasDeepReasoningSignal(text(button)) && !isForbiddenWeakModel(text(button))) {
         return { ok: true, active: text(button), reasoningLocked: true };
       }
       if (!button) {
-        const opener = Array.from(document.querySelectorAll('button')).filter(visible).find(function(el) {
+        return { ok: false, reason: 'COPILOT_REQUIRED_MODEL_NOT_ACTIVE', active: 'missing', reasoningLocked: false };
+      }
+
+      const menus = await expandSubmenus(await openModelMenuOnce(button));
+      const options = collectMenuOptions(menus);
+      const available = options.map(function(o) { return text(o); }).filter(Boolean).slice(0, 25);
+      const nonWeakOptions = options.filter(function(el) { return !isForbiddenWeakModel(text(el)); });
+      const modelOption =
+        nonWeakOptions.find(function(el) {
+          const v = text(el).toLowerCase();
+          return v.includes('gpt-5.6') && v.includes('sol think') && v.includes('think deeper');
+        }) ||
+        nonWeakOptions.find(function(el) {
+          const v = text(el).toLowerCase();
+          return v.includes('gpt-5.6') && v.includes('sol think');
+        }) ||
+        nonWeakOptions.find(function(el) {
+          const v = text(el).toLowerCase();
+          return v.includes(req.modelLabel.toLowerCase()) || v.includes('5.6 sol think') || v.includes('sol think');
+        }) || null;
+
+      if (!modelOption) {
+        await closeMenus();
+        return { ok: false, reason: 'COPILOT_REQUIRED_MODEL_UNAVAILABLE', active: text(button), available: available, hasMenu: menus.length > 0, reasoningLocked: false };
+      }
+
+      const selectedModelWasCombined = isDeepReasoningLabel(text(modelOption));
+      if (!isControlActive(modelOption) && typeof modelOption.click === 'function') {
+        modelOption.click();
+        await sleep(450);
+      }
+
+      button = getModelButton() || button;
+      if (!selectedModelWasCombined && !hasDeepReasoningSignal(text(button))) {
+        let reasoningEl = Array.from(document.querySelectorAll('button,[role="switch"],[role="option"],[role="menuitemradio"],[role="menuitem"]')).filter(function(el) {
+          if (el === button || !visible(el)) return false;
+          if (typeof el.closest === 'function' && el.closest('[role="menu"],[role="listbox"],.fui-MenuPopover')) return false;
           const t = text(el);
-          return !isExcludedControl(t) && /model|gpt|think|auto|quick/i.test(t);
+          return !isExcludedControl(t) && !isForbiddenWeakModel(t) && isDeepReasoningLabel(t);
+        })[0] || null;
+        if (!reasoningEl) {
+          const rMenus = await expandSubmenus(await openModelMenuOnce(button));
+          const rOptions = collectMenuOptions(rMenus);
+          reasoningEl = rOptions.find(function(el) {
+            const t = text(el);
+            return !isExcludedControl(t) && !isForbiddenWeakModel(t) && isDeepReasoningLabel(t);
+          }) || null;
+        }
+        if (reasoningEl && !isControlActive(reasoningEl) && typeof reasoningEl.click === 'function') {
+          reasoningEl.click();
+          await sleep(350);
+        }
+      }
+      await closeMenus();
+
+      const finalButton = getModelButton() || (button && visible(button) && isLikelyModelControl(button) ? button : null) || button;
+      const finalActive = finalButton ? text(finalButton) : '';
+      if (isForbiddenWeakModel(finalActive)) {
+        return { ok: false, reason: 'COPILOT_REQUIRED_MODEL_NOT_ACTIVE', active: finalActive, reasoningLocked: false };
+      }
+
+      const pillHasModel = requiredModelVisible(finalActive);
+      const pillHasDeep = hasDeepReasoningSignal(finalActive);
+      let menuHasForbiddenChecked = false;
+      let menuHasModel = false;
+      let menuHasDeep = false;
+      if (!(pillHasModel && pillHasDeep) && finalButton) {
+        const verifyMenus = await expandSubmenus(await openModelMenuOnce(finalButton));
+        const verifyOptions = collectMenuOptions(verifyMenus);
+        verifyOptions.forEach(function(opt) {
+          if (!isControlActive(opt)) return;
+          const ot = text(opt);
+          if (isForbiddenWeakModel(ot)) menuHasForbiddenChecked = true;
+          if (requiredModelVisible(ot)) menuHasModel = true;
+          if (isDeepReasoningLabel(ot)) menuHasDeep = true;
         });
-        if (opener) {
-          opener.click();
-          await new Promise(function(resolve) { setTimeout(resolve, 350); });
-          const refreshed = Array.from(document.querySelectorAll(selectors)).filter(visible);
-          button = refreshed.find(isLikelyModelControl) || opener;
-        }
+        if (!menuHasDeep && hasDeepReasoningSignal('')) menuHasDeep = true;
+        await closeMenus();
       }
-      if (button) {
-        button.click();
-        await new Promise(function(resolve) { setTimeout(resolve, 600); });
-        const menuContainer = Array.from(document.querySelectorAll('.fui-MenuPopover, .fui-PopoverSurface, [role="menu"], [role="listbox"], .fui-MenuList')).find(visible) || null;
-        const searchScope = menuContainer || document;
-        const optionSelector = menuContainer
-          ? '[role="option"],[role="menuitemradio"],[role="menuitem"],[role="menuitemcheckbox"],.fui-MenuItem,.fui-Option,button,div'
-          : '[role="option"],[role="menuitemradio"],[role="menuitem"],[role="menuitemcheckbox"],.fui-MenuItem,.fui-Option,button,a[role="button"]';
-        const options = Array.from(searchScope.querySelectorAll(optionSelector)).filter(function(el) {
-          if (!visible(el)) return false;
-          const t = text(el);
-          return t.length > 2 && t.length < 100 && !isExcludedControl(t);
-        });
-        const available = options.map(function(o) { return text(o); }).filter(Boolean).slice(0, 25);
-        const nonWeakOptions = options.filter(function(el) { return !isForbiddenWeakModel(text(el)); });
-        const model =
-          nonWeakOptions.find(function(el) {
-            const v = text(el).toLowerCase();
-            return v.includes('gpt-5.6') && v.includes('sol think') && v.includes('think deeper');
-          }) ||
-          nonWeakOptions.find(function(el) {
-            const v = text(el).toLowerCase();
-            return v.includes('gpt-5.6') && (v.includes('sol think') || v.includes('think deeper'));
-          }) ||
-          nonWeakOptions.find(function(el) {
-            const v = text(el).toLowerCase();
-            return v.includes(req.modelLabel.toLowerCase()) || v.includes('5.6 sol think') || v.includes('sol think');
-          }) ||
-          nonWeakOptions.find(function(el) {
-            return text(el).toLowerCase().includes('think deeper');
-          });
-        if (model) {
-          model.click();
-          await new Promise(function(resolve) { setTimeout(resolve, 500); });
-          const refreshed = Array.from(document.querySelectorAll(selectors)).filter(visible);
-          button = refreshed.find(isLikelyModelControl) || button;
-        } else {
-          return { ok: false, reason: 'COPILOT_REQUIRED_MODEL_UNAVAILABLE', active: text(button), available: available, hasMenu: Boolean(menuContainer) };
-        }
+
+      const modelVerified = !menuHasForbiddenChecked && (pillHasModel || menuHasModel);
+      const reasoningVerified = !menuHasForbiddenChecked && (pillHasDeep || menuHasDeep);
+      if (!modelVerified) {
+        return { ok: false, reason: 'COPILOT_REQUIRED_MODEL_NOT_ACTIVE', active: finalActive || 'missing', reasoningLocked: reasoningVerified };
       }
-      if (!button || !requiredModelVisible(text(button))) {
-        return { ok: false, reason: 'COPILOT_REQUIRED_MODEL_NOT_ACTIVE', active: button ? text(button) : 'missing' };
+      if (!reasoningVerified) {
+        return { ok: false, reason: 'COPILOT_REASONING_NOT_DEEP', active: finalActive, reasoningLocked: false };
       }
-      const reasoningControls = Array.from(document.querySelectorAll('button,[role="option"],[role="menuitemradio"],[role="menuitem"]')).filter(visible);
-      let reasoning = reasoningControls.find(function(el) {
-        return String(text(el)).toLowerCase().includes(req.reasoningLabel.toLowerCase());
-      });
-      if (!reasoning) {
-        const opener = reasoningControls.find(function(el) { return /reason|think/i.test(text(el)); });
-        if (opener) {
-          opener.click();
-          await new Promise(function(resolve) { setTimeout(resolve, 250); });
-          reasoning = Array.from(document.querySelectorAll('[role="option"],[role="menuitemradio"],[role="menuitem"],button')).filter(visible).find(function(el) {
-            return String(text(el)).toLowerCase().includes(req.reasoningLabel.toLowerCase());
-          });
-        }
-      }
-      if (reasoning && typeof reasoning.click === 'function') {
-        reasoning.click();
-        await new Promise(function(resolve) { setTimeout(resolve, 350); });
-      }
-      const finalButton = Array.from(document.querySelectorAll(selectors)).find(visible) || button;
-      const finalActive = text(finalButton);
-      const reasoningLocked = hasDeepReasoningSignal(finalActive);
-      return { ok: requiredModelVisible(finalActive) && reasoningLocked, reason: !reasoningLocked ? 'COPILOT_REASONING_NOT_DEEP' : undefined, active: finalActive, reasoningLocked: reasoningLocked };
+      return { ok: true, active: finalActive || req.displayLabel, reasoningLocked: true };
     }, contract);
 
     if (!result || !result.ok || result.reasoningLocked === false) {

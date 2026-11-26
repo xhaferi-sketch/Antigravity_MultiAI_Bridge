@@ -134,6 +134,25 @@ function createGoogleSearchEngine(runtimeContext) {
   const collectGeminiTerminalDiagnostics = runtimeContext.collectGeminiTerminalDiagnostics || (async function() {});
   const classifyFailure = runtimeContext.classifyWebServiceFailure || defaultClassifyWebServiceFailure;
 
+  async function ensureSearchAiMenusClosed(page) {
+    await page.keyboard.press('Escape').catch(function() {});
+    await page.waitForTimeout(150);
+    const hasOverlay = await page.evaluate(function() {
+      const blocking = Array.from(document.querySelectorAll('.o8Wipc, [role="menu"], [role="listbox"], .cdk-overlay-pane, .cdk-overlay-backdrop')).filter(function(el) {
+        if (!el || !el.isConnected) return false;
+        const st = window.getComputedStyle(el);
+        const r = el.getBoundingClientRect();
+        return st.display !== 'none' && st.visibility !== 'hidden' && parseFloat(st.opacity || '1') > 0.05 && r.width > 8 && r.height > 8;
+      });
+      return blocking.length > 0;
+    }).catch(function() { return false; });
+    if (hasOverlay) {
+      await page.mouse.click(8, 8).catch(function() {});
+      await page.keyboard.press('Escape').catch(function() {});
+      await page.waitForTimeout(250);
+    }
+  }
+
   async function selectGoogleSearchAiModel(page, targetKeyword, tabKey) {
     const target = (targetKeyword || 'carbon').toLowerCase();
     const isCarbon = target.includes('carbon') || target.includes('complex');
@@ -239,6 +258,7 @@ function createGoogleSearchEngine(runtimeContext) {
         return { ok: true, status: 'SEARCH_MODEL_VERIFIED', alreadyActive: alreadyActive, evidence: { selectedSignal: true, triggerText: triggerAfter, menuText: menuText } };
       }, { wantCarbon: isCarbon }).catch(function(err) { return { ok: false, code: 'SEARCH_AI_TARGET_UNVERIFIED', phase: 'EVALUATE', observation: err.message }; });
       if (result.ok) {
+        await ensureSearchAiMenusClosed(page);
         if (tabKey) {
           tabActiveModel[tabKey] = GOOGLE_SEARCH_AI_DISPLAY_LABEL;
           tabDiscoveredModels[tabKey] = '4 Hydrogen · Everyday help, 4 Carbon · Most complex work';
@@ -386,6 +406,13 @@ function createGoogleSearchEngine(runtimeContext) {
       } else if (fs.existsSync(txtBundle)) {
         files.push(txtBundle);
       }
+      let promptOffloadedToFile = false;
+      if (!isPlannerTask && opts.promptText && opts.promptText.length > 7400) {
+        const promptFile = path.join(exchangeDir, 'search_prompt_full.txt');
+        fs.writeFileSync(promptFile, opts.promptText, 'utf8');
+        if (!files.includes(promptFile)) files.push(promptFile);
+        promptOffloadedToFile = true;
+      }
       await attachFilesToSearchAiClean(page, files);
 
       async function sendTurnAndExtract(text, meta) {
@@ -399,11 +426,17 @@ function createGoogleSearchEngine(runtimeContext) {
         };
         console.error('[SEARCH_AI_TURN_SNAPSHOT] assistantCount=' + snapshot.assistantCount + ' latestFingerprint=' + snapshot.latestAssistantFingerprint);
 
+        await ensureSearchAiMenusClosed(page);
         const box = page.locator('textarea.ITIRGe:visible,textarea[placeholder*="Ask" i]:visible,textarea[placeholder*="Pyet" i]:visible,textarea:visible').last();
         await box.waitFor({ state: 'visible', timeout: 25000 });
+        const rawMaxLen = await box.getAttribute('maxlength').catch(function() { return null; });
+        const maxLen = (rawMaxLen && Number(rawMaxLen) > 0) ? Math.min(7800, Number(rawMaxLen) - 100) : 7800;
+        const safeText = String(text || '').length > maxLen
+          ? (String(text).slice(0, Math.floor(maxLen / 2)) + '\n...[COMPACTED]...\n' + String(text).slice(-Math.floor(maxLen / 2)))
+          : String(text || '');
         await box.click();
         await page.keyboard.press('Control+A');
-        await page.keyboard.insertText(text);
+        await page.keyboard.insertText(safeText);
 
         let send = page.locator('button[aria-label*="Send" i],button[aria-label*="Dërgo" i],button[type="submit"]').filter({ visible: true }).filter({ hasNotText: /add file|shto skedar|select a model|zgjidh një model|mic|voice/i }).last();
         if (await send.count()) await send.click({ timeout: 5000 });
@@ -522,10 +555,18 @@ function createGoogleSearchEngine(runtimeContext) {
         throw new Error('PLANNER_ESCALATION_FAILED: ' + lastError);
       }
 
-      if (!isPlannerTask && opts.useProvidedBundle === true) return sendTurnAndExtract(opts.promptText, { expectedKind: 'chunk', timeoutMs: 180000, minNeeded: 20 });
+      if (!isPlannerTask && opts.useProvidedBundle === true) {
+        const boxText = promptOffloadedToFile
+          ? 'Lexo dhe zbato 100% udhëzimet e plota të bashkëngjitura në skedarin search_prompt_full.txt së bashku me skedarin tjetër të bashkëngjitur.'
+          : opts.promptText;
+        return sendTurnAndExtract(boxText, { expectedKind: 'chunk', timeoutMs: 180000, minNeeded: 20 });
+      }
       const reviewer = opts.promptText.includes('STATUS: APPROVED') || (opts.bundlePath && opts.bundlePath.endsWith('code.md'));
       const kind = reviewer ? 'review' : 'code';
-      const prompt = buildSearchAiCleanPrompt(kind, { context: opts.promptText.slice(0, 22000) });
+      const contextText = promptOffloadedToFile
+        ? 'Udhëzimet e plota, plani dhe konteksti janë bashkëngjitur në skedarin fizik search_prompt_full.txt. Lexoje plotësisht para përgjigjes.'
+        : opts.promptText.slice(0, 7200);
+      const prompt = buildSearchAiCleanPrompt(kind, { context: contextText });
       return sendTurnAndExtract(prompt, { expectedKind: kind, timeoutMs: 180000 });
     });
   }
