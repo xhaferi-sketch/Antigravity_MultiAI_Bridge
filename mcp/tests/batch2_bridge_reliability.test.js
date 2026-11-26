@@ -296,7 +296,7 @@ test('Copilot ensureCopilotGpt56Model expands Fluent UI submenu portal and locks
   assert.equal(receipts.web1.verified, true);
 });
 
-test('Copilot ensureCopilotGpt56Model fails closed when only Think deeper exists without GPT-5.6 Sol Think', async () => {
+test('Copilot ensureCopilotGpt56Model fails closed in strict mode when Think deeper exists without GPT-5.6 Sol Think, and succeeds with default fallback', async () => {
   const { MockElement, root, withDom } = createMockDom();
   const menu = new MockElement('div', { classes: ['fui-MenuPopover'], attrs: { role: 'menu' }, visible: false });
   const pill = new MockElement('button', {
@@ -305,16 +305,34 @@ test('Copilot ensureCopilotGpt56Model fails closed when only Think deeper exists
     onClick() { menu.visible = !menu.visible; }
   });
   menu.appendChild(new MockElement('div', { innerText: 'Auto', attrs: { role: 'menuitemradio', 'aria-checked': 'true' } }));
-  menu.appendChild(new MockElement('div', { innerText: 'Think deeper', attrs: { role: 'menuitemradio', 'aria-checked': 'false' } }));
+  const deepOpt = new MockElement('div', {
+    innerText: 'Think deeper',
+    attrs: { role: 'menuitemradio', 'aria-checked': 'false' },
+    onClick(el) {
+      el.setAttribute('aria-checked', 'true');
+      pill.innerText = 'Think deeper';
+      menu.visible = false;
+    }
+  });
+  menu.appendChild(deepOpt);
   root.appendChild(pill);
   root.appendChild(menu);
 
-  const engine = createCopilotEngine({ tabAuthStatus: {}, tabActiveModel: {}, copilotModelReceipts: {} });
+  const receipts = {};
+  const engine = createCopilotEngine({ tabAuthStatus: {}, tabActiveModel: {}, copilotModelReceipts: receipts });
   await withDom(async () => {
     await assert.rejects(
-      () => engine.ensureCopilotGpt56Model({ evaluate: async (fn, arg) => fn(arg) }, 'web1'),
+      () => engine.ensureCopilotGpt56Model(
+        { evaluate: async (fn, arg) => fn(arg) },
+        'web1',
+        { contract: Object.assign({}, engine.COPILOT_REQUIRED_MODEL, { allowThinkDeeperFallback: false }) }
+      ),
       /COPILOT_MODEL_LOCK_FAILED: COPILOT_REQUIRED_MODEL_(?:UNAVAILABLE|NOT_ACTIVE)/
     );
+    const fallbackLabel = await engine.ensureCopilotGpt56Model({ evaluate: async (fn, arg) => fn(arg) }, 'web1');
+    assert.match(fallbackLabel, /Think deeper/);
+    assert.equal(receipts.web1.verified, true);
+    assert.equal(receipts.web1.gpt56TemporarilyUnavailable, true);
   });
 });
 

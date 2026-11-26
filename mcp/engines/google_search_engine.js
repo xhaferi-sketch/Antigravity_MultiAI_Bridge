@@ -300,11 +300,43 @@ function createGoogleSearchEngine(runtimeContext) {
       const clone = node.cloneNode(true);
       hiddenLive.forEach(function(el) { el.removeAttribute('data-sai-hidden'); });
       clone.querySelectorAll('[data-sai-hidden="1"],script,style,noscript,svg,textarea,input,button,[role="button"],[role="menu"],[role="toolbar"],nav,aside,[aria-label*="More options" i],[aria-label*="Copy" i],[aria-label*="Share" i],[aria-label*="Good response" i],[aria-label*="Bad response" i],[aria-label*="Search history" i]').forEach(function(el) { el.remove(); });
-      const serialize = function(root) { const block = /^(P|DIV|SECTION|ARTICLE|LI|TR|H1|H2|H3|H4|H5|H6|PRE|BLOCKQUOTE)$/; let out = ''; const walk = function(n) { if (n.nodeType === 3) { out += n.nodeValue || ''; return; } if (n.nodeType !== 1) return; const tag = n.tagName; if (tag === 'BR') { out += '\n'; return; } if (tag === 'PRE') { out += '\n\n' + (n.textContent || '') + '\n\n'; return; } const isBlock = block.test(tag); if (isBlock) out += '\n'; if (tag === 'LI') out += '- '; Array.from(n.childNodes).forEach(walk); if (tag === 'TD' || tag === 'TH') out += ' | '; if (isBlock) out += '\n'; }; walk(root); return out; };
+      const preBlocks = [];
+      const serialize = function(root) {
+        const block = /^(P|DIV|SECTION|ARTICLE|LI|TR|H1|H2|H3|H4|H5|H6|PRE|BLOCKQUOTE)$/;
+        let out = '';
+        const walk = function(n) {
+          if (n.nodeType === 3) { out += n.nodeValue || ''; return; }
+          if (n.nodeType !== 1) return;
+          const tag = n.tagName;
+          if (tag === 'BR') { out += '\n'; return; }
+          if (tag === 'PRE') {
+            const codeEl = n.querySelector('code');
+            const cls = ((codeEl && codeEl.className) || '') + ' ' + (n.className || '');
+            const lm = cls.match(/language-([a-zA-Z0-9_+-]+)/);
+            const lang = (lm && lm[1]) ? lm[1] : '';
+            const rawCode = ((codeEl ? codeEl.textContent : n.textContent) || '').replace(/\u00a0/g, ' ').replace(/\r\n?/g, '\n').replace(/\n+$/, '');
+            let fence = arg.fence;
+            while (rawCode.indexOf(fence) !== -1) fence += '`';
+            const idx = preBlocks.length;
+            preBlocks.push(fence + lang + '\n' + rawCode + '\n' + fence);
+            out += '\n\n@@SAI_PRE_' + idx + '@@\n\n';
+            return;
+          }
+          const isBlock = block.test(tag);
+          if (isBlock) out += '\n';
+          if (tag === 'LI') out += '- ';
+          Array.from(n.childNodes).forEach(walk);
+          if (tag === 'TD' || tag === 'TH') out += ' | ';
+          if (isBlock) out += '\n';
+        };
+        walk(root);
+        return out;
+      };
       let text = serialize(clone).replace(/[ \t]+\n/g, '\n').replace(/\n[ \t]+/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
       const chunks = text.split(arg.fence); for (let i = 0; i < chunks.length; i += 2) { chunks[i] = chunks[i].replace(/([^\n])\s*(FILE_TARGET:)/g, '$1\n$2').replace(/([A-Za-z0-9_.\/-]+\.[A-Za-z0-9]+)\s*([1-9][0-9]*\.\s+[A-ZÇË])/g, '$1\n$2'); } text = chunks.join(arg.fence);
       text = text.split('\n').filter(function(line) { return !/^\s*(?:AI Mode reply for .*|AI Mode response for .*|AI Mode response is ready|Përgjigjja e Modalitetit të IA-së është gati|Përgjigjja e [\x22\u201c]?Modalitetit të IA-së[\x22\u201d]? për .*|Copied to clipboard|Failed to copy|Good response|Bad response|Share|More options|Skip to previous prompt|Kalo te kërkesa e mëparshme)\s*$/i.test(line); }).join('\n').trim();
       text = text.replace(/(?:A copy of this chat will be included|Thanks for letting us know|Google may use account and system data)[\s\S]*$/i, '').trim();
+      text = text.replace(/@@SAI_PRE_(\d+)@@/g, function(_, idx) { return preBlocks[Number(idx)] || ''; });
       return text;
     }, { id: opts.id, fence: FENCE3 });
     if (result === null) throw new Error('SEARCH_AI_ASSISTANT_CONTAINER_MISSING');

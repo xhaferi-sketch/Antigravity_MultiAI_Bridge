@@ -247,9 +247,9 @@ function parseCodeBlocksFromMarkdown(markdown, expectedTargets, projectRoot) {
     if (!target) { const token = item.line.trim().split(/\s+/)[0]; target = sanitizeTargetPath(token).path || ''; }
     const targetKey = normalizeTargetKey(target);
     if (!target || (expectedMap.size && !expectedMap.has(targetKey))) return;
-    let code = (item.line.slice(target.length) + tail).trim();
+    let code = (item.line.slice(target.length) + tail).replace(/^(?:[ \t]*\r?\n)+/, '').replace(/\s+$/, '');
     code = code.replace(/\r?\nUse code with caution\.\s*$/, '');
-    code = code.replace(/^(?:python|javascript|typescript|csharp|json|html|css|bash|shell)\s*/i, '');
+    code = code.replace(/^(?:python|javascript|typescript|csharp|json|html|css|bash|shell)(?:[ \t]*\r?\n|[ \t]+|$)/i, '');
     const ext = nodePath.extname(target).slice(1).toLowerCase();
     let kind = '';
     if (ext === 'py') kind = 'py';
@@ -260,10 +260,11 @@ function parseCodeBlocksFromMarkdown(markdown, expectedTargets, projectRoot) {
     else if (ext === 'css') kind = 'css';
     else if (['sh', 'bash'].includes(ext)) kind = 'sh';
     let lexical = false;
+    const codeForStarterCheck = code.trimStart();
     if (/^(?:\/\/[^\n]*\r?\n\s*)?<<<<<<< SEARCH\r?\n/m.test(code)) lexical = true;
-    else if (kind === 'py') lexical = matchesAnyStarter(code, PYTHON_STARTERS);
-    else if (kind === 'js') lexical = matchesAnyStarter(code, JS_STARTERS);
-    else if (starters[kind]) lexical = starters[kind].test(code);
+    else if (kind === 'py') lexical = matchesAnyStarter(codeForStarterCheck, PYTHON_STARTERS);
+    else if (kind === 'js') lexical = matchesAnyStarter(codeForStarterCheck, JS_STARTERS);
+    else if (starters[kind]) lexical = starters[kind].test(codeForStarterCheck);
     if (!lexical) return;
     accept(target, code);
     const resolvedTarget = expectedMap.get(targetKey) || target;

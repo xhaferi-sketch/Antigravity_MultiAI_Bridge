@@ -68,6 +68,7 @@
   </div>
 
   <h2>📡 Statusi Live i Fletëve & Profileve të Izoluara (Mutex Pool)</h2>
+  <div id="loginNotice" style="display:none; margin:0 0 12px 0; padding:10px 14px; border-radius:8px; background:#1e293b; border:1px solid #38bdf8; color:#e2e8f0; font-size:13px;"></div>
   <div id="tabsGrid" class="grid"></div>
 
   <div class="card" style="margin-bottom: 20px;">
@@ -156,8 +157,9 @@
       }
 
       document.getElementById('tabsGrid').innerHTML = Object.entries(data.tabs).map(([k, t]) => {
-        const isErr = t.auth === 'AUTH_EXPIRED' || t.auth === 'BROWSER_ERROR';
-        const badgeCls = isErr ? 'err' : (t.open ? 'ok' : 'idle');
+        const isErr = t.auth === 'AUTH_EXPIRED' || t.auth === 'BROWSER_ERROR' || t.auth === 'ACCOUNT_PICKER';
+        const badgeCls = isErr ? 'err' : (t.auth === 'ACTIVE' ? 'ok' : (t.open ? 'ok' : 'idle'));
+        const authLabel = t.auth === 'ACCOUNT_PICKER' ? 'PICK ACCOUNT (Zgjidh 1)' : (t.auth === 'ACTIVE' ? 'ACTIVE (Logged in)' : t.auth);
         const profileName = t.profileName || k;
         const isTempChatSupported = SUPPORTED_TEMP_CHAT_TABS.has(k);
         if (isTempChatSupported && !inFlightTempChat[k]) {
@@ -169,7 +171,7 @@
           <div class="card">
             <div class="row">
               <strong>${escapeHtml(k.toUpperCase())}</strong>
-              <span class="badge ${badgeCls}">${t.open ? 'HAPUR' : 'NË GJUMË'} | ${escapeHtml(t.auth)}</span>
+              <span class="badge ${badgeCls}">${t.open ? 'HAPUR' : 'NË GJUMË'} | ${escapeHtml(authLabel)}</span>
             </div>
             <div style="font-size:11px; color:#93c5fd; margin:2px 0;">Profili i izoluar: <code>.profiles/${escapeHtml(profileName)}</code> • ${escapeHtml(t.connectionLabel || (t.open ? 'E Lidhur' : 'E Shkëputur'))}</div>
             <div style="font-size:13px; margin:4px 0;">Modeli aktiv: <b>${escapeHtml(t.model || '-')}</b></div>
@@ -330,14 +332,39 @@
     }
 
     async function loginProfile(profileName) {
-      const r = await fetch('/api/login-profile', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ profileName })
-      });
-      const d = await r.json();
-      alert(d.message || d.error);
-      loadState();
+      const box = document.getElementById('loginNotice');
+      if (box) {
+        box.style.display = 'block';
+        box.style.borderColor = '#38bdf8';
+        box.textContent = 'Po hapet dritarja e izoluar per ' + profileName + '...';
+      }
+      try {
+        const r = await fetch('/api/login-profile', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ profileName })
+        });
+        const text = await r.text();
+        let d = {};
+        try { d = JSON.parse(text); } catch (_) { d = { ok: false, error: text || ('HTTP ' + r.status) }; }
+        if (!r.ok || d.ok === false) {
+          throw new Error(d.error || ('HTTP ' + r.status));
+        }
+        if (box) {
+          box.style.borderColor = d.authState === 'ACTIVE' ? '#22c55e' : '#f59e0b';
+          box.textContent = d.message || ('U hap ' + (d.profile || profileName));
+        }
+      } catch (err) {
+        if (box) {
+          box.style.display = 'block';
+          box.style.borderColor = '#ef4444';
+          box.textContent = 'Gabim gjate hapjes se ' + profileName + ': ' + (err && err.message ? err.message : String(err));
+        } else {
+          alert('Gabim gjate hapjes se ' + profileName + ': ' + (err && err.message ? err.message : String(err)));
+        }
+      } finally {
+        loadState();
+      }
     }
 
     async function resetTab(tabKey) {

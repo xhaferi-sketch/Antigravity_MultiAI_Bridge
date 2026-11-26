@@ -8,6 +8,8 @@ const path = require('node:path');
 const {
   createCopilotEngine,
   ensureCopilotTemporaryChat,
+  inspectLiveAuthState,
+  checkAuthExpired,
   COPILOT_REQUIRED_MODEL
 } = require('../engines/copilot_engine.js');
 
@@ -117,4 +119,49 @@ test('autopilot_engine does not emit default /run-cycle WhatsApp notifications',
   const src = fs.readFileSync(path.join(__dirname, '..', 'pipeline', 'autopilot_engine.js'), 'utf8');
   assert.equal(src.includes("notifyWhatsApp('[HERMES /run-cycle]"), false, '/run-cycle must not trigger default WhatsApp notifications');
   assert.match(src, /process\.env\.ANTIGRAVITY_RUN_CYCLE_NOTIFY !== '1'/);
+});
+
+test('inspectLiveAuthState truthfully detects ACCOUNT_PICKER without auto-selecting, ACTIVE, and AUTH_EXPIRED', async () => {
+  const authMap = {};
+  let clicked = false;
+
+  const pickerPage = {
+    url: () => 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize',
+    waitForTimeout: async () => {},
+    evaluate: async () => ({
+      composerReady: false,
+      hasAccountPicker: true,
+      accounts: ['user1@example.com', 'user2@example.com']
+    })
+  };
+  const pickerRes = await inspectLiveAuthState(pickerPage, 'web2', authMap);
+  assert.equal(pickerRes.state, 'ACCOUNT_PICKER');
+  assert.deepEqual(pickerRes.accounts, ['user1@example.com', 'user2@example.com']);
+  assert.equal(authMap.web2, 'ACCOUNT_PICKER');
+  assert.equal(clicked, false, 'Must NEVER auto-click/select a user account');
+
+  const blocked = await checkAuthExpired(pickerPage, 'web2', authMap);
+  assert.equal(blocked, true);
+  assert.equal(authMap.web2, 'ACCOUNT_PICKER');
+
+  const activePage = {
+    url: () => 'https://copilot.cloud.microsoft/chat',
+    waitForTimeout: async () => {},
+    evaluate: async () => ({ composerReady: true, hasAccountPicker: false, accounts: [] })
+  };
+  const activeRes = await inspectLiveAuthState(activePage, 'web2', authMap);
+  assert.equal(activeRes.state, 'ACTIVE');
+  assert.equal(authMap.web2, 'ACTIVE');
+  assert.equal(await checkAuthExpired(activePage, 'web2', authMap), false);
+});
+
+test('server.js and dashboard.html wire isolated M365 CDP ports, live auth refresh, and non-blocking login errors', () => {
+  const srvSrc = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+  const html = fs.readFileSync(path.join(__dirname, '..', 'dashboard.html'), 'utf8');
+  assert.match(srvSrc, /m365_web1:\s*18011/);
+  assert.match(srvSrc, /m365_web2:\s*18012/);
+  assert.match(srvSrc, /refreshLiveAuthForOpenTabs/);
+  assert.match(srvSrc, /ACCOUNT_PICKER_REQUIRED/);
+  assert.ok(html.includes('loginNotice'), 'Dashboard must show non-blocking loginNotice banner instead of stealing window focus');
+  assert.ok(html.includes('if (!r.ok || d.ok === false)'), 'Dashboard must report login-profile HTTP/JSON failures instead of failing silently');
 });

@@ -28,8 +28,12 @@ const {
   buildBatchCheckpointHeader,
   extractCheckpointPlanFingerprint,
   verifyBatchCheckpoint,
-  getFailoverEngines
+  getFailoverEngines,
+  isEngineFailoverEligible,
+  parseCodeBlocksFromMarkdown
 } = require('../pipeline/autopilot_engine');
+
+const { createGoogleSearchEngine } = require('../engines/google_search_engine');
 
 function createTempRepo(prefix) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix || 'ag-guardrails-'));
@@ -549,5 +553,149 @@ test('DoD-5: Checkpoint planFingerprint Binding & Failover Guardrails (Defekti I
     assert.deepEqual(getFailoverEngines('gemini2', new Set(), lockedCtx), ['gemini1']);
     assert.deepEqual(getFailoverEngines('gemini1', new Set(), lockedCtx), ['gemini2']);
     assert.deepEqual(getFailoverEngines('gemini2', new Set(['gemini1']), lockedCtx), []);
+
+    const searchCtx = {
+      isEngineAvailable: (eng) => ['gemini1', 'gemini2', 'google_search_1', 'google_search_2', 'google_search_3'].includes(eng)
+    };
+    assert.deepEqual(
+      getFailoverEngines('google_search_2', new Set(), searchCtx),
+      ['google_search_3', 'google_search_1', 'gemini2', 'gemini1']
+    );
+    assert.equal(isEngineFailoverEligible('BATCH_SYNTAX_OR_QUICK_CHECK_FAILED: []'), true);
+    assert.equal(isEngineFailoverEligible('CYCLE_CANCELLED'), false);
+  });
+
+  await t.test('parseCodeBlocksFromMarkdown UNFENCED_FILE_FALLBACK preserves leading indentation', () => {
+    const raw = [
+      '### FILE: flows/demo.py',
+      'python',
+      '    _x = 1',
+      '    _y = 2'
+    ].join('\n');
+    const parsed = parseCodeBlocksFromMarkdown(raw, ['flows/demo.py']);
+    assert.equal(parsed.length, 1);
+    assert.ok(parsed[0].code.startsWith('    _x = 1\n    _y = 2'), 'Must preserve leading spaces on line 1');
+  });
+
+  await t.test('extractSearchAiTurnContent fences <pre> and preserves Python indentation', async () => {
+    const makeNode = (tagName, opts) => {
+      opts = opts || {};
+      return {
+        nodeType: 1,
+        tagName,
+        className: opts.className || '',
+        childNodes: opts.childNodes || [],
+        textContent: opts.textContent || '',
+        hidden: false,
+        getAttribute: () => null,
+        setAttribute: () => {},
+        removeAttribute: () => {},
+        querySelector: (sel) => (sel === 'code' ? (opts.codeChild || null) : null),
+        querySelectorAll: (sel) => {
+          if (sel === '*') return opts.allNodes || [];
+          return [];
+        },
+        cloneNode: function() { return this; },
+        remove: () => {}
+      };
+    };
+    const codeText = 'import sys\nif True:\n    print("ok")\n';
+    const codeEl = makeNode('CODE', { className: 'language-python', textContent: codeText });
+    const preEl = makeNode('PRE', { codeChild: codeEl, textContent: codeText });
+    const proseEl = makeNode('P', { childNodes: [{ nodeType: 3, nodeValue: '    Prose with extra lead' }] });
+    const rootNode = makeNode('ARTICLE', { childNodes: [proseEl, preEl], allNodes: [proseEl, preEl, codeEl] });
+
+    const gsEngine = createGoogleSearchEngine({
+      getOrCreateTab: async () => null,
+      withTabLock: async (_k, fn) => fn(),
+      checkAuthExpired: async () => false,
+      captureSupportEvidence: async () => {},
+      packWorkspace: () => {},
+      generateSmartArchitectureMap: () => '',
+      resolveAndEmbedExternalFiles: () => '',
+      assembleFinalContextArtifact: () => ({ text: '', receipt: {} }),
+      validateFinalTextArtifact: () => {},
+      dispatchToWebTab: async () => '',
+      activeProjectPerTab: {},
+      tabAuthStatus: {},
+      tabActiveModel: {},
+      tabDiscoveredModels: {},
+      getState: () => ({}),
+      resetChatVerified: async () => {}
+    });
+
+    const mockPage = {
+      evaluate: async (fn, arg) => {
+        const prevDoc = global.document;
+        const prevGetComputedStyle = global.getComputedStyle;
+        global.document = { querySelector: () => rootNode };
+        global.getComputedStyle = () => ({ display: 'block', visibility: 'visible' });
+        try {
+          return fn(arg);
+        } finally {
+          global.document = prevDoc;
+          global.getComputedStyle = prevGetComputedStyle;
+        }
+      }
+    };
+
+    const receipt = await gsEngine.extractSearchAiTurnContent(mockPage, { id: 'sai-1', turnIndex: 0 });
+    assert.ok(receipt.text.includes('Prose with extra lead'), 'Prose should be present and cleaned');
+    assert.ok(!receipt.text.includes('    Prose with extra lead'), 'Prose leading whitespace should still normalize');
+    assert.ok(receipt.text.includes('```python\nimport sys\nif True:\n    print("ok")\n```'), 'Code inside <pre> must stay fenced and indented');
+  });
+
+  await t.test('BATCH_SYNTAX_OR_QUICK_CHECK_FAILED captures excerpt into repairFormat and allows 1 failover', async () => {
+    const repo = createTempRepo('ag-syntax-failover-');
+    const exchangeDir = path.join(repo, '.antigravity', 'bridge', 'exchange');
+    fs.mkdirSync(path.join(repo, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(repo, 'src', 'app.py'), 'def ok():\n    return 0\n', 'utf8');
+
+    const reqText = 'Fix src/app.py cleanly';
+    const planBody = buildValidPlanBody('src/app.py');
+    const signedPlan = embedPlanMetadataHeader(planBody, {
+      requestFingerprint: computeRequestFingerprint(reqText),
+      planFingerprint: computePlanFingerprint(planBody),
+      projectRoot: repo
+    });
+    fs.writeFileSync(path.join(exchangeDir, 'plan.md'), signedPlan, 'utf8');
+    fs.writeFileSync(path.join(repo, '.antigravity', 'bridge', 'state.json'), JSON.stringify({
+      phase: 'PLANNED',
+      lastStatus: 'PLAN_READY',
+      requestFingerprint: computeRequestFingerprint(reqText),
+      planFingerprint: computePlanFingerprint(planBody)
+    }, null, 2));
+
+    const calls = [];
+    const engine = createAutopilotEngine({
+      ensureProjectSetup: () => ({ projectRoot: repo, roles: { planner: 'google_search_1', coder: 'google_search_2', reviewer: 'off' } }),
+      isEngineAvailable: (eng) => ['google_search_1', 'google_search_2', 'google_search_3'].includes(eng),
+      dispatchChunkedEngineTurn: async (eng, _root, prompt, attachment, opts) => {
+        calls.push({ eng, prompt, attachment, opts });
+        if (calls.length <= 2) {
+          return '### FILE: src/app.py\n```python\ndef ok():\nreturn 1\n```\n';
+        }
+        return '### FILE: src/app.py\n```python\ndef ok():\n    return 1\n```\n';
+      },
+      runBatchQuickChecks: ({ projectRoot, writtenFiles }) => {
+        const content = fs.readFileSync(path.join(projectRoot, writtenFiles[0]), 'utf8');
+        if (!content.includes('    return 1')) {
+          return { status: 'CHECK_FAILED', receipts: [{ command: 'syntax ' + writtenFiles[0], status: 1, output: 'IndentationError: expected an indented block (app.py, line 2)' }] };
+        }
+        return { status: 'CHECK_PASSED', receipts: [{ command: 'syntax ' + writtenFiles[0], status: 0, output: '' }] };
+      },
+      runFinalBuildAndTests: async () => ({ status: 'CHECK_PASSED', receipts: [] })
+    });
+
+    const res = await engine.runAutonomousPipeline(repo, reqText);
+    assert.equal(res.status, 'CYCLE_COMPLETED');
+    assert.equal(calls.length, 3, 'Should run initial turn, focused repairFormat, then 1 engine failover');
+    assert.equal(calls[0].eng, 'google_search_2');
+    assert.equal(calls[1].eng, 'google_search_2');
+    assert.equal(calls[1].opts.forceFreshChat, true, 'Syntax repairFormat must use fresh chat');
+    assert.ok(calls[1].prompt.includes('>> L2:'), 'repairFormat prompt must include numbered broken excerpt');
+    assert.ok(calls[1].attachment && calls[1].attachment.endsWith('_ctx.txt'), 'Search AI syntax repair must attach compact repair context instead of project_bundle.txt');
+    assert.equal(calls[2].eng, 'google_search_3', 'Must fail over once to google_search_3 after repairFormat fails syntax');
+    assert.ok(fs.existsSync(path.join(exchangeDir, 'last_failed_batch.txt')), 'Must persist last_failed_batch.txt');
   });
 });

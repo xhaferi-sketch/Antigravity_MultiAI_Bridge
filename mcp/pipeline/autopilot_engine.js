@@ -1784,6 +1784,12 @@ function getFailoverEngines(primaryEngine, excludedSet, runtimeContext) {
     pool = ['gemini2', 'gemini3', 'web2'];
   } else if (primary === 'gemini3') {
     pool = ['gemini1', 'gemini2', 'web2'];
+  } else if (primary === 'google_search_2') {
+    pool = ['google_search_3', 'google_search_1', 'gemini2', 'gemini1'];
+  } else if (primary === 'google_search_1') {
+    pool = ['google_search_3', 'google_search_2', 'gemini1', 'gemini2'];
+  } else if (primary === 'google_search_3') {
+    pool = ['google_search_2', 'google_search_1', 'gemini2', 'gemini1'];
   } else if (primary === 'web1') {
     pool = ['web2'];
   } else if (primary === 'web2') {
@@ -1803,10 +1809,71 @@ function getFailoverEngines(primaryEngine, excludedSet, runtimeContext) {
 function isEngineFailoverEligible(code) {
   const text = String(code || '');
   if (!text) return false;
-  if (/CYCLE_CANCELLED|PLAN_NO_VALID_TARGETS|BATCH_SYNTAX_OR_QUICK_CHECK_FAILED/i.test(text)) {
+  if (/CYCLE_CANCELLED|PLAN_NO_VALID_TARGETS/i.test(text)) {
     return false;
   }
-  return /RATE_LIMIT|QUOTA|TIMEOUT|STALL|AUTH_EXPIRED|MODEL_LOCK|CRITICAL_MODEL|SERVICE_ERROR|REFUSED|EMPTY_RESPONSE|UNAVAILABLE|DISPATCH|429|503|502|ECONNRESET|ETIMEDOUT|TARGET_CLOSED|BROWSER/i.test(text);
+  return /RATE_LIMIT|QUOTA|TIMEOUT|STALL|AUTH_EXPIRED|MODEL_LOCK|CRITICAL_MODEL|SERVICE_ERROR|REFUSED|EMPTY_RESPONSE|UNAVAILABLE|DISPATCH|BATCH_SYNTAX_OR_QUICK_CHECK_FAILED|429|503|502|ECONNRESET|ETIMEDOUT|TARGET_CLOSED|BROWSER/i.test(text);
+}
+
+/**
+ * Extract numbered source lines around reported syntax/quick-check errors
+ * and persist a diagnostic snapshot before backups restore the working tree.
+ */
+function captureBrokenSyntaxContext(projectRoot, exchangeDir, batchId, receipts, writtenFiles, rawOutput) {
+  const list = Array.isArray(receipts) ? receipts : [];
+  const excerptBlocks = [];
+  const candidates = [];
+
+  for (const r of list) {
+    const cmd = String((r && r.command) || '');
+    const out = String((r && r.output) || '');
+    const cmdTarget = cmd.startsWith('syntax ') ? cmd.slice(7).trim() : '';
+    if (r && r.status === 0) continue;
+    const lineMatch = out.match(/\bline\s+(\d+)\b/i) || out.match(/:(\d+)(?::\d+)?\b/);
+    const errLine = lineMatch ? Math.max(1, Number(lineMatch[1])) : 1;
+    const rel = cmdTarget || (Array.isArray(writtenFiles) && writtenFiles[0]) || '';
+    if (rel) candidates.push({ rel: rel, errLine: errLine, output: out });
+  }
+  if (!candidates.length && Array.isArray(writtenFiles)) {
+    for (const rel of writtenFiles) {
+      candidates.push({ rel: rel, errLine: 1, output: '' });
+    }
+  }
+
+  for (const item of candidates) {
+    const abs = path.join(projectRoot, item.rel);
+    if (!fs.existsSync(abs)) continue;
+    try {
+      const lines = fs.readFileSync(abs, 'utf8').replace(/\r\n?/g, '\n').split('\n');
+      const startIdx = Math.max(0, item.errLine - 16);
+      const endIdx = Math.min(lines.length, item.errLine + 15);
+      const numbered = [];
+      for (let i = startIdx; i < endIdx; i++) {
+        const mark = (i + 1 === item.errLine) ? '>> ' : '   ';
+        numbered.push(mark + 'L' + (i + 1) + ': ' + lines[i]);
+      }
+      excerptBlocks.push('--- BROKEN FILE: ' + item.rel + ' (error near line ' + item.errLine + ') ---' + NL + numbered.join(NL));
+    } catch (_) {}
+  }
+
+  const brokenExcerpt = truncateUtf8(excerptBlocks.join(NL + NL), 12 * 1024);
+  if (exchangeDir) {
+    try {
+      if (!fs.existsSync(exchangeDir)) fs.mkdirSync(exchangeDir, { recursive: true });
+      const snapshot = [
+        'BATCH_ID: ' + String(batchId || ''),
+        'TIMESTAMP: ' + new Date().toISOString(),
+        'RECEIPTS: ' + JSON.stringify(list),
+        '',
+        brokenExcerpt || '(no file excerpt available)',
+        '',
+        '=== RAW CODER OUTPUT ===',
+        truncateUtf8(String(rawOutput || ''), 48 * 1024)
+      ].join(NL);
+      fs.writeFileSync(path.join(exchangeDir, 'last_failed_batch.txt'), snapshot, 'utf8');
+    } catch (_) {}
+  }
+  return brokenExcerpt;
 }
 
 function createAutopilotEngine(deps) {
@@ -2041,15 +2108,26 @@ function createAutopilotEngine(deps) {
       return { parsed: parsed, missing: missing, extra: extra };
     };
 
-    const repairFormat = async function(detail, targetsOverride) {
+    const repairFormat = async function(detail, targetsOverride, repairOpts) {
       job.retriesUsed = (job.retriesUsed || 0) + 1;
+      repairOpts = repairOpts || {};
       const retryTargets = (Array.isArray(targetsOverride) && targetsOverride.length) ? targetsOverride : expectedTargets;
+      const excerptSection = repairOpts.brokenExcerpt ? (NL + NL + repairOpts.brokenExcerpt) : '';
       const corrPrompt = [
         'KORRIGJIM FORMATI I DETYRUESHEM: ' + detail,
-        'Kthe kodin me ### FILE: rruga/skedari.ext (me permbajtje te plote ose blloqe <<<<<<< SEARCH / ======= / >>>>>>> REPLACE per skedare te medhenj; diff --git opsional) per keto objektiva: ' + retryTargets.join(', ')
+        'Kthe kodin me ### FILE: rruga/skedari.ext (me permbajtje te plote ose blloqe <<<<<<< SEARCH / ======= / >>>>>>> REPLACE per skedare te medhenj; diff --git opsional) per keto objektiva: ' + retryTargets.join(', ') + excerptSection
       ].join(NL);
-      return await dispatchChunkedEngineTurn(engine, state.scan.projectRoot, corrPrompt, null, {
-        forceFreshChat: false,
+      let repairAttachment = null;
+      if (repairOpts.brokenExcerpt && (!transport.inline || engine.startsWith('google_search_'))) {
+        try {
+          repairAttachment = path.join(exchangeDir, 'repair_' + String(batch.batchId || '1').replace(/[^a-zA-Z0-9_-]/g, '_') + '_ctx.txt');
+          fs.writeFileSync(repairAttachment, [detail, '', repairOpts.brokenExcerpt, '', 'TARGETS: ' + retryTargets.join(', ')].join(NL), 'utf8');
+        } catch (_) {
+          repairAttachment = null;
+        }
+      }
+      return await dispatchChunkedEngineTurn(engine, state.scan.projectRoot, corrPrompt, repairAttachment, {
+        forceFreshChat: Boolean(repairOpts.forceFreshChat),
         useProvidedBundle: false,
         disableInternalRetry: engine.startsWith('gemini'),
         reasoningLevel: 'high',
@@ -2084,15 +2162,17 @@ function createAutopilotEngine(deps) {
     let applied = executor.applyBatch({ projectRoot: state.scan.projectRoot, batch: batch, parsedFiles: parsedResult.parsed, batchOutput: output });
     let quick = executor.runBatchQuickChecks({ projectRoot: state.scan.projectRoot, writtenFiles: applied.filesWritten });
     if (quick.status !== 'CHECK_PASSED') {
+      const brokenExcerpt = captureBrokenSyntaxContext(state.scan.projectRoot, exchangeDir, batch.batchId, quick.receipts, applied.filesWritten, output);
       restoreAppliedBackups(applied);
       const detail = 'BATCH_SYNTAX_OR_QUICK_CHECK_FAILED: ' + JSON.stringify(quick.receipts || []);
       state.lastErrorReceipt = detail;
-      output = await repairFormat(detail);
+      output = await repairFormat(detail, null, { brokenExcerpt: brokenExcerpt, forceFreshChat: true });
       parsedResult = parseExpected(output);
       if (parsedResult.missing.length) throw new Error('BATCH_OUTPUT_INCOMPLETE: missing=[' + parsedResult.missing.join(',') + '] extra=[' + parsedResult.extra.join(',') + ']');
       applied = executor.applyBatch({ projectRoot: state.scan.projectRoot, batch: batch, parsedFiles: parsedResult.parsed, batchOutput: output });
       quick = executor.runBatchQuickChecks({ projectRoot: state.scan.projectRoot, writtenFiles: applied.filesWritten });
       if (quick.status !== 'CHECK_PASSED') {
+        captureBrokenSyntaxContext(state.scan.projectRoot, exchangeDir, batch.batchId, quick.receipts, applied.filesWritten, output);
         restoreAppliedBackups(applied);
         throw new Error('BATCH_SYNTAX_OR_QUICK_CHECK_FAILED: ' + JSON.stringify(quick.receipts || []));
       }
@@ -2196,7 +2276,8 @@ function createAutopilotEngine(deps) {
       }
 
       const exhausted = 'BATCH_RECOVERY_EXHAUSTED: ' + batchToHalve.batchId + ' ' + String(err && err.message || err);
-      if (!isEngineFailoverEligible(exhausted) || failoverScope.localFailoverCount >= 2) throw new Error(exhausted);
+      const maxFailovers = /BATCH_SYNTAX_OR_QUICK_CHECK_FAILED/i.test(exhausted) ? 1 : 2;
+      if (!isEngineFailoverEligible(exhausted) || failoverScope.localFailoverCount >= maxFailovers) throw new Error(exhausted);
       failoverScope.batchLocalFailedEngines.add(initialEngine);
       state.failedEngines.add(initialEngine);
       const nextEngine = getFailoverEngines(initialEngine, failoverScope.batchLocalFailedEngines, runtimeContext)[0];

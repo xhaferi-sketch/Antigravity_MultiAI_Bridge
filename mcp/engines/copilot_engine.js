@@ -10,12 +10,18 @@ const LOGIN_MS = 'microsoft' + 'online.com';
 const LOGIN_LIVE = 'login.' + 'live.com';
 const LOGIN_GOOGLE = 'accounts.' + 'google.com';
 
+// NOTE (2026-11-24 Microsoft global rollout — NOT a user credit limit):
+// Microsoft temporarily removed 'GPT-5.6 Sol' globally from the Copilot dropdown.
+// Keep COPILOT_REQUIRED_MODEL ('GPT-5.6 Sol Think') intact as priority #1;
+// allowThinkDeeperFallback enables 'Think deeper' while GPT-5.6 Sol is missing.
+// Flip allowThinkDeeperFallback to false once Microsoft restores GPT-5.6 Sol.
 const COPILOT_REQUIRED_MODEL = Object.freeze({
   family: 'gpt-5.6-sol-think',
   modelLabel: 'GPT-5.6 Sol Think',
   displayLabel: 'GPT-5.6 Sol Think (Deep / High)',
   reasoningLabel: 'Think deeper',
-  reasoning: 'high'
+  reasoning: 'high',
+  allowThinkDeeperFallback: true
 });
 
 const COPILOT_OUTPUT_CONTRACT = [
@@ -39,31 +45,80 @@ function findChatFrameOrPage(page) {
   return page;
 }
 
+async function inspectLiveAuthState(page, tabKey, authStatusMap) {
+  if (!page || typeof page.url !== 'function') {
+    return { state: 'UNKNOWN', accounts: [], url: '', reason: 'NO_PAGE' };
+  }
+  const u = (page.url() || '').toLowerCase();
+  const onLogin =
+    u.includes(LOGIN_MS) ||
+    u.includes(LOGIN_LIVE) ||
+    u.includes('login.windows.net') ||
+    u.includes(LOGIN_GOOGLE);
+
+  const target = findChatFrameOrPage(page);
+  const domProbe = await target.evaluate(function() {
+    const bodyText = String((document.body && document.body.innerText) || '');
+    const composerReady = Boolean(document.querySelector('rich-textarea, div[contenteditable="true"], [role="textbox"], textarea'));
+    const pickerHeading = /pick an account|choose an account|zgjidhni nj[eë] llogari/i.test(bodyText);
+    const tileNodes = Array.from(document.querySelectorAll(
+      '[data-test-id="accountTile"], #tilesHolder .tile-container, [role="listitem"], .table[role="button"]'
+    ));
+    const accounts = [];
+    tileNodes.forEach(function(el) {
+      const t = String(el.innerText || '').replace(/\s+/g, ' ').trim();
+      const mail = t.match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/);
+      if (mail && !accounts.includes(mail[0])) accounts.push(mail[0]);
+    });
+    const hasAccountPicker = pickerHeading || (accounts.length >= 1 && /signed in|use another account/i.test(bodyText));
+    return { composerReady: composerReady, hasAccountPicker: hasAccountPicker, accounts: accounts };
+  }).catch(function() {
+    return { composerReady: false, hasAccountPicker: false, accounts: [] };
+  });
+
+  let result;
+  if (domProbe.hasAccountPicker) {
+    result = {
+      state: 'ACCOUNT_PICKER',
+      accounts: domProbe.accounts || [],
+      url: page.url() || '',
+      reason: domProbe.accounts && domProbe.accounts.length
+        ? ('MICROSOFT_PICK_AN_ACCOUNT: ' + domProbe.accounts.join(', '))
+        : 'MICROSOFT_PICK_AN_ACCOUNT'
+    };
+  } else if (!onLogin && u.startsWith('http') && !u.includes('chromewebdata') && domProbe.composerReady) {
+    result = { state: 'ACTIVE', accounts: [], url: page.url() || '', reason: 'CHAT_COMPOSER_READY' };
+  } else if (onLogin) {
+    result = { state: 'AUTH_EXPIRED', accounts: [], url: page.url() || '', reason: 'LOGIN_HOST_REDIRECT' };
+  } else if (!u || u === 'about:blank') {
+    result = { state: 'CHECKING', accounts: [], url: page.url() || '', reason: 'BLANK_OR_LOADING' };
+  } else {
+    result = { state: 'AUTH_EXPIRED', accounts: [], url: page.url() || '', reason: 'COMPOSER_NOT_READY' };
+  }
+
+  if (authStatusMap && tabKey && result.state !== 'CHECKING') {
+    authStatusMap[tabKey] = result.state;
+  }
+  return result;
+}
+
 async function checkAuthExpired(page, tabKey, authStatusMap) {
   if (!page || typeof page.url !== 'function') return false;
+  let lastState = { state: 'AUTH_EXPIRED', accounts: [], url: '', reason: '' };
   for (let i = 0; i < 15; i++) {
-    const u = (page.url() || '').toLowerCase();
-    const onLogin =
-      u.includes(LOGIN_MS) ||
-      u.includes(LOGIN_LIVE) ||
-      u.includes('login.windows.net') ||
-      u.includes(LOGIN_GOOGLE);
-
-    if (!onLogin && u.startsWith('http') && !u.includes('chromewebdata')) {
-      const target = findChatFrameOrPage(page);
-      const ready = await target.evaluate(function() {
-        return Boolean(document.querySelector('rich-textarea, div[contenteditable="true"], [role="textbox"], textarea'));
-      }).catch(function() { return false; });
-
-      if (ready) {
-        if (typeof page.waitForTimeout === 'function') await page.waitForTimeout(800);
-        if (authStatusMap && tabKey) authStatusMap[tabKey] = 'ACTIVE';
-        return false;
-      }
+    lastState = await inspectLiveAuthState(page, tabKey, authStatusMap);
+    if (lastState.state === 'ACTIVE') {
+      if (typeof page.waitForTimeout === 'function') await page.waitForTimeout(800);
+      if (authStatusMap && tabKey) authStatusMap[tabKey] = 'ACTIVE';
+      return false;
+    }
+    // Keep polling up to 15s only for blank/loading or redirects; stop early once Pick-an-Account is clearly settled.
+    if (lastState.state === 'ACCOUNT_PICKER' && i >= 2) {
+      break;
     }
     if (typeof page.waitForTimeout === 'function') await page.waitForTimeout(1000);
   }
-  if (authStatusMap && tabKey) authStatusMap[tabKey] = 'AUTH_EXPIRED';
+  if (authStatusMap && tabKey) authStatusMap[tabKey] = lastState.state === 'ACCOUNT_PICKER' ? 'ACCOUNT_PICKER' : 'AUTH_EXPIRED';
   return true;
 }
 
@@ -294,14 +349,28 @@ function createCopilotEngine(runtimeContext) {
           return v.includes(req.modelLabel.toLowerCase()) || v.includes('5.6 sol think') || v.includes('sol think');
         }) || null;
 
-      if (!modelOption) {
+      let activeOption = modelOption;
+      let usingThinkDeeperFallback = false;
+      if (!activeOption && req.allowThinkDeeperFallback) {
+        // Microsoft global incident (2026-11-24): GPT-5.6 Sol absent from menu; select Think deeper (excluding weak models).
+        activeOption = nonWeakOptions.find(function(el) {
+          return isDeepReasoningLabel(text(el));
+        }) || null;
+        if (activeOption) {
+          usingThinkDeeperFallback = true;
+        } else if (hasDeepReasoningSignal(text(button)) && !isForbiddenWeakModel(text(button))) {
+          usingThinkDeeperFallback = true;
+        }
+      }
+
+      if (!activeOption && !usingThinkDeeperFallback) {
         await closeMenus();
         return { ok: false, reason: 'COPILOT_REQUIRED_MODEL_UNAVAILABLE', active: text(button), available: available, hasMenu: menus.length > 0, reasoningLocked: false };
       }
 
-      const selectedModelWasCombined = isDeepReasoningLabel(text(modelOption));
-      if (!isControlActive(modelOption) && typeof modelOption.click === 'function') {
-        modelOption.click();
+      const selectedModelWasCombined = activeOption ? isDeepReasoningLabel(text(activeOption)) : usingThinkDeeperFallback;
+      if (activeOption && !isControlActive(activeOption) && typeof activeOption.click === 'function') {
+        activeOption.click();
         await sleep(450);
       }
 
@@ -339,7 +408,7 @@ function createCopilotEngine(runtimeContext) {
       let menuHasForbiddenChecked = false;
       let menuHasModel = false;
       let menuHasDeep = false;
-      if (!(pillHasModel && pillHasDeep) && finalButton) {
+      if (!(pillHasModel && pillHasDeep) && !(usingThinkDeeperFallback && pillHasDeep) && finalButton) {
         const verifyMenus = await expandSubmenus(await openModelMenuOnce(finalButton));
         const verifyOptions = collectMenuOptions(verifyMenus);
         verifyOptions.forEach(function(opt) {
@@ -353,7 +422,7 @@ function createCopilotEngine(runtimeContext) {
         await closeMenus();
       }
 
-      const modelVerified = !menuHasForbiddenChecked && (pillHasModel || menuHasModel);
+      const modelVerified = !menuHasForbiddenChecked && (pillHasModel || menuHasModel || (req.allowThinkDeeperFallback && (pillHasDeep || menuHasDeep)));
       const reasoningVerified = !menuHasForbiddenChecked && (pillHasDeep || menuHasDeep);
       if (!modelVerified) {
         return { ok: false, reason: 'COPILOT_REQUIRED_MODEL_NOT_ACTIVE', active: finalActive || 'missing', reasoningLocked: reasoningVerified };
@@ -361,7 +430,12 @@ function createCopilotEngine(runtimeContext) {
       if (!reasoningVerified) {
         return { ok: false, reason: 'COPILOT_REASONING_NOT_DEEP', active: finalActive, reasoningLocked: false };
       }
-      return { ok: true, active: finalActive || req.displayLabel, reasoningLocked: true };
+      return {
+        ok: true,
+        active: finalActive || (usingThinkDeeperFallback ? 'Think deeper (GPT-5.6 Sol temporarily unavailable)' : req.displayLabel),
+        reasoningLocked: true,
+        fallbackUsed: Boolean(usingThinkDeeperFallback && !(pillHasModel || menuHasModel))
+      };
     }, contract);
 
     if (!result || !result.ok || result.reasoningLocked === false) {
@@ -369,14 +443,21 @@ function createCopilotEngine(runtimeContext) {
       const reason = (result && result.reason) || (result && result.reasoningLocked === false ? 'COPILOT_REASONING_NOT_DEEP' : 'COPILOT_REQUIRED_MODEL_NOT_ACTIVE');
       throw new Error('COPILOT_MODEL_LOCK_FAILED: ' + reason + ' (active: ' + ((result && result.active) || 'unknown') + availInfo + ')');
     }
+    const resolvedDisplay = result.fallbackUsed ? 'Think deeper (GPT-5.6 Sol disabled 2026-11-24)' : contract.displayLabel;
     if (tabKey) {
-      tabActiveModel[tabKey] = contract.displayLabel;
-      tabDiscoveredModels[tabKey] = result.active || contract.displayLabel;
+      tabActiveModel[tabKey] = resolvedDisplay;
+      tabDiscoveredModels[tabKey] = result.active || resolvedDisplay;
       if (copilotModelReceipts) {
-        copilotModelReceipts[tabKey] = { verified: true, family: contract.family, observedLabel: result.active || contract.displayLabel, reasoningLocked: true };
+        copilotModelReceipts[tabKey] = {
+          verified: true,
+          family: contract.family,
+          observedLabel: result.active || resolvedDisplay,
+          reasoningLocked: true,
+          gpt56TemporarilyUnavailable: Boolean(result.fallbackUsed)
+        };
       }
     }
-    return contract.displayLabel;
+    return resolvedDisplay;
   }
 
   return {
@@ -617,6 +698,7 @@ module.exports = {
   COPILOT_OUTPUT_CONTRACT,
   M365_CHAT_URL,
   findChatFrameOrPage,
+  inspectLiveAuthState,
   checkAuthExpired,
   buildCopilotPromptWithContract,
   COPILOT_TEMP_CHAT_ALLOWLIST,

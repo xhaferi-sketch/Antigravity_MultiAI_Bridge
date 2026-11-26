@@ -24,6 +24,8 @@ const HOST = '127.0.0.1';
 const PLUGIN_ROOT = path.resolve(__dirname, '..');
 const PROFILES_DIR = path.join(PLUGIN_ROOT, '.profiles');
 const GEMINI_CDP_PORTS = Object.freeze({ gemini1: 18001, gemini2: 18002, gemini3: 18003 });
+const M365_CDP_PORTS = Object.freeze({ m365_web1: 18011, m365_web2: 18012 });
+const PROFILE_CDP_PORTS = Object.freeze(Object.assign({}, GEMINI_CDP_PORTS, M365_CDP_PORTS));
 const cdpBrowsers = {};
 const REGISTRY_PATH = path.join(PLUGIN_ROOT, 'projects_registry.json');
 const SCORES_PATH = path.join(__dirname, 'model_scores.json');
@@ -92,6 +94,7 @@ const COPILOT_OUTPUT_CONTRACT = copilotEngineModule.COPILOT_OUTPUT_CONTRACT;
 const M365_CHAT_URL = copilotEngineModule.M365_CHAT_URL;
 const ensureCopilotTemporaryChat = copilotEngineModule.ensureCopilotTemporaryChat;
 const inspectCopilotTemporaryChatDom = copilotEngineModule.inspectCopilotTemporaryChatDom;
+const inspectLiveAuthState = copilotEngineModule.inspectLiveAuthState;
 
 const copilotModelReceipts = {
   web1: null,
@@ -175,6 +178,7 @@ function getAutopilotEngine() {
       isEngineAvailable: function(engine) {
         if (engine === 'web1' || engine === 'web2') return true;
         if (engine === 'gemini1' || engine === 'gemini2' || engine === 'gemini3') return true;
+        if (engine === 'google_search_1' || engine === 'google_search_2' || engine === 'google_search_3') return true;
         return false;
       }
     });
@@ -435,8 +439,8 @@ async function getOrLaunchContext(profileName, headless) {
   const userDataDir = path.join(PROFILES_DIR, profileName);
   if (!fs.existsSync(userDataDir)) fs.mkdirSync(userDataDir, { recursive: true });
 
-  if (Object.prototype.hasOwnProperty.call(GEMINI_CDP_PORTS, profileName)) {
-    const port = GEMINI_CDP_PORTS[profileName];
+  if (Object.prototype.hasOwnProperty.call(PROFILE_CDP_PORTS, profileName)) {
+    const port = PROFILE_CDP_PORTS[profileName];
     const endpoint = 'http://127.0.0.1:' + port;
     let browser = null;
     try {
@@ -458,30 +462,35 @@ async function getOrLaunchContext(profileName, headless) {
       child.on('error', function() {});
       child.unref();
       const ready = await waitForCdpEndpoint(port, 20000);
-      if (!ready) {
+      if (ready) {
+        browser = await chromium.connectOverCDP(endpoint, { timeout: 15000 });
+      } else if (!Object.prototype.hasOwnProperty.call(GEMINI_CDP_PORTS, profileName)) {
+        browser = null;
+      } else {
         throw new Error('CDP_ENDPOINT_TIMEOUT: Chrome nuk u pergjigj ne ' + endpoint);
       }
-      browser = await chromium.connectOverCDP(endpoint, { timeout: 15000 });
     }
 
-    const defaultCtx = browser.contexts()[0];
-    if (!defaultCtx) {
-      throw new Error('CDP_DEFAULT_CONTEXT_MISSING per ' + profileName);
-    }
-    const clearCdpState = function() {
-      delete cdpBrowsers[profileName];
-      delete contexts[profileName];
-      delete contextModes[profileName];
-      for (const k of Object.keys(tabs)) {
-        if (getProfileNameForTab(k) === profileName) tabs[k] = null;
+    if (browser) {
+      const defaultCtx = browser.contexts()[0];
+      if (!defaultCtx) {
+        throw new Error('CDP_DEFAULT_CONTEXT_MISSING per ' + profileName);
       }
-    };
-    browser.on('disconnected', clearCdpState);
-    defaultCtx.on('close', clearCdpState);
-    cdpBrowsers[profileName] = browser;
-    contexts[profileName] = defaultCtx;
-    contextModes[profileName] = 'cdp';
-    return defaultCtx;
+      const clearCdpState = function() {
+        delete cdpBrowsers[profileName];
+        delete contexts[profileName];
+        delete contextModes[profileName];
+        for (const k of Object.keys(tabs)) {
+          if (getProfileNameForTab(k) === profileName) tabs[k] = null;
+        }
+      };
+      browser.on('disconnected', clearCdpState);
+      defaultCtx.on('close', clearCdpState);
+      cdpBrowsers[profileName] = browser;
+      contexts[profileName] = defaultCtx;
+      contextModes[profileName] = 'cdp';
+      return defaultCtx;
+    }
   }
 
   const launchArgs = [
@@ -1808,6 +1817,9 @@ async function runWebDispatchWithRetryPolicy(opts){const dispatchId=opts.dispatc
     for(let attempt=1;attempt<=2;attempt++){
       const page = await getOrCreateTab(tabKey);
       if (await checkAuthExpired(page, tabKey)) {
+        if (tabAuthStatus[tabKey] === 'ACCOUNT_PICKER') {
+          await captureSupportEvidence(page, projectRoot, tabKey, 'ACCOUNT_PICKER_REQUIRED', 'Ekrani Microsoft "Pick an account" po pret zgjedhjen tende manuale ne profilin e izoluar (' + getProfileNameForTab(tabKey) + '). Hap dritaren dhe mbaj vetem 1 llogari.');
+        }
         await captureSupportEvidence(page, projectRoot, tabKey, 'AUTH_EXPIRED', 'Kerkon Login ne Dashboard 4321.');
       }
       let targetFrame = findChatFrameOrPage(page);
@@ -2648,7 +2660,21 @@ const html = fs.readFileSync(path.join(__dirname, 'dashboard.html'), 'utf8');
 res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
 return res.end(html);
 }
+async function refreshLiveAuthForOpenTabs() {
+  if (typeof inspectLiveAuthState !== 'function') return;
+  const openKeys = Object.keys(tabs).filter(function(k) {
+    return tabs[k] && typeof tabs[k].isClosed === 'function' && !tabs[k].isClosed();
+  });
+  await Promise.all(openKeys.map(function(k) {
+    return Promise.race([
+      inspectLiveAuthState(tabs[k], k, tabAuthStatus),
+      new Promise(function(resolve) { setTimeout(resolve, 600); })
+    ]).catch(function() {});
+  }));
+}
+
 if (req.method === 'GET' && req.url === '/api/state') {
+await refreshLiveAuthForOpenTabs();
 const reg = readRegistryState(REGISTRY_PATH);
 const resolvedActive = pickDefaultActiveProjectRoot(reg, PLUGIN_ROOT);
 const projectsData = reg.projects.filter(function(p) { return fs.existsSync(p); }).map(function(p) {
@@ -2823,6 +2849,16 @@ return res.end(JSON.stringify({ ok: true }));
       const linkedTab = profile === 'm365_web1' ? 'web1' : (profile === 'm365_web2' ? 'web2' : reqName);
       const targetUrl = getTargetUrl(linkedTab);
 
+      // If an older Playwright non-CDP window was left behind in the background, close ONLY this profile cleanly so real Chrome CDP launches in the foreground.
+      if (contexts[profile] && contextModes[profile] !== 'cdp') {
+        try { await contexts[profile].close(); } catch (_) {}
+        delete contexts[profile];
+        delete contextModes[profile];
+        for (const k of Object.keys(tabs)) {
+          if (getProfileNameForTab(k) === profile) tabs[k] = null;
+        }
+      }
+
       const visibleCtx = await getOrLaunchContext(profile, false);
       const pages = visibleCtx.pages();
       const existingTab = Object.prototype.hasOwnProperty.call(tabs, linkedTab) && tabs[linkedTab] && !tabs[linkedTab].isClosed()
@@ -2845,13 +2881,19 @@ return res.end(JSON.stringify({ ok: true }));
         await loginPage.goto(targetUrl, { waitUntil: 'domcontentloaded' }).catch(function() {});
       }
       await loginPage.bringToFront().catch(function() {});
+      await loginPage.evaluate(function() { try { window.focus(); } catch (_) {} }).catch(function() {});
+      const liveAuth = typeof inspectLiveAuthState === 'function'
+        ? await inspectLiveAuthState(loginPage, linkedTab, tabAuthStatus).catch(function() { return { state: 'UNKNOWN', reason: '' }; })
+        : { state: tabAuthStatus[linkedTab] || 'UNKNOWN', reason: '' };
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({
         ok: true,
         profile: profile,
         tabKey: linkedTab,
-        message: 'Dritarja e dukshme e izoluar per [' + linkedTab + ' -> .profiles/' + profile + '] u hap me sukses!\n\n1. Identifikohu me llogarine tende (mund te kesh account tjeter ne Web 1 vs Web 2).\n2. Zgjidh ose verifiko modelin / cookies nese kerkohen.\n3. Mund ta lesh hapur ose ta mbyllesh me [X] qe cookies, localStorage dhe sesioni te ruhen vecmas.'
+        authState: liveAuth.state,
+        authReason: liveAuth.reason || '',
+        message: 'Dritarja e izoluar [' + linkedTab + ' -> .profiles/' + profile + '] u hap (gjendja aktuale: ' + liveAuth.state + '). Identifikohu ose zgjidh 1 llogari vetem ti.'
       }));
     }
 if (req.url === '/api/kill-all') {
