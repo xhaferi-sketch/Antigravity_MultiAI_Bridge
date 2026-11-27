@@ -175,6 +175,7 @@
             </div>
             <div style="font-size:11px; color:#93c5fd; margin:2px 0;">Profili i izoluar: <code>.profiles/${escapeHtml(profileName)}</code> • ${escapeHtml(t.connectionLabel || (t.open ? 'E Lidhur' : 'E Shkëputur'))}</div>
             <div style="font-size:13px; margin:4px 0;">Modeli aktiv: <b>${escapeHtml(t.model || '-')}</b></div>
+            ${t.lockedModel ? `<div style="font-size:12px; color:#6ee7b7; margin:2px 0;">Zgjedhur nga User: <b>${escapeHtml(t.lockedModel)}</b></div>` : ''}
             <div style="font-size:11px; color:#94a3b8; margin:4px 0; word-break:break-word;">Modelet në ueb: <i>${escapeHtml(t.discoveredModels && t.discoveredModels !== '-' ? t.discoveredModels : 'Ende pa zbuluar')}</i></div>
             <div style="font-size:13px;">Projekti aktiv: <b>${escapeHtml(t.activeProject)}</b></div>
             <div style="margin-top:10px; display:flex; gap:8px;">

@@ -52,6 +52,10 @@ const {
 } = require('./pipeline/local_executor.js');
 
 const {
+  readModelLocks,
+  getTabModelLock
+} = require('./pipeline/model_locks');
+const {
   resolveActivityDrivenBudgets,
   evaluateDomActivityState
 } = require('./pipeline/dom_liveness_wait.js');
@@ -271,12 +275,14 @@ function persistTabConfig() {
 
 function buildDashboardState(projects, activeProjectRoot) {
   const isTestExport = process.env.ANTIGRAVITY_TEST_EXPORT === '1' && process.env.ANTIGRAVITY_TRUTHFUL_TEST !== '1';
+  const modelLocksStore = readModelLocks();
   const tabStates = {};
   for (const k of Object.keys(tabs)) {
     const isGemini = k.startsWith('gemini');
     const isCopilot = k.startsWith('web');
     const isSearch = k.startsWith('google_search_');
     const isOpen = Boolean(tabs[k] && !tabs[k].isClosed());
+    const userLock = (modelLocksStore && modelLocksStore.locks && modelLocksStore.locks[k]) || null;
     const isVerified = isGemini
       ? Boolean(geminiModelReceipts[k] && geminiModelReceipts[k].verified === true)
       : (isCopilot
@@ -286,13 +292,14 @@ function buildDashboardState(projects, activeProjectRoot) {
       open: isOpen,
       profileName: getProfileNameForTab(k),
       auth: isOpen ? tabAuthStatus[k] : 'UNKNOWN',
+      lockedModel: userLock ? (userLock.displayLabel + ' 🔒') : null,
       model: isTestExport
         ? tabActiveModel[k]
         : (isVerified ? tabActiveModel[k] : (isOpen ? 'Duke u verifikuar...' : '-')),
       connectionLabel: isTestExport
-        ? (isGemini ? (isVerified ? 'E Lidhur (Neon)' : (isOpen ? 'Duke u lidhur...' : 'E Shkëputur')) : 'E Lidhur')
+        ? (isGemini ? (isVerified ? (userLock ? ('E Lidhur (' + userLock.displayLabel + ')') : 'E Lidhur (Neon)') : (isOpen ? 'Duke u lidhur...' : 'E Shkëputur')) : (userLock ? ('E Lidhur (' + userLock.displayLabel + ')') : 'E Lidhur'))
         : (isVerified
-          ? (isGemini ? 'E Lidhur (Neon)' : (isCopilot ? 'E Lidhur (GPT-5.6)' : 'E Lidhur (Search AI)'))
+          ? (userLock ? ('E Lidhur (' + userLock.displayLabel + ')') : (isGemini ? 'E Lidhur (Neon)' : (isCopilot ? 'E Lidhur (GPT-5.6)' : 'E Lidhur (Search AI)')))
           : (isOpen ? 'Duke u lidhur...' : 'E Shkëputur')),
       geminiReceipt: geminiModelReceipts[k] || null,
       copilotReceipt: isCopilot ? (copilotModelReceipts[k] || null) : undefined,

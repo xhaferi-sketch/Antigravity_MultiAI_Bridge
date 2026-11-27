@@ -17,5 +17,5 @@ Kur përdoruesi jep `/run-cycle` me çfarëdo argumenti (tekst i thjeshtë, rrug
 
 3. **Raporti Përfundimtar (Vetëm në fund):**
    - **Statusi:** `PASSED | FAILED | BLOCKED`
-   - **Projekti & Modelet:** Emri/rruga e projektit + modelet e verifikuara Web 1 / Web 2 / Web 3
+   - **Projekti & Modelet:** Emri/rruga e projektit + modelet e verifikuara Web 1 / Web 2 / Web 3 (respekto zgjedhjet `lockedByUser: true` te `.antigravity/bridge/model_locks.json` pa bllokuar kur përdoruesi ka kyçur p.sh. `4 Neon (Medium)` ose `Think deeper`).
    - **Skedarët & Testet:** Dëshmitë reale nga disku.

@@ -3,7 +3,17 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
+
+const PREV_LOCKS_ENV = process.env.ANTIGRAVITY_MODEL_LOCKS_PATH;
+test.before(() => {
+  process.env.ANTIGRAVITY_MODEL_LOCKS_PATH = path.join(os.tmpdir(), 'ag-no-locks-truthful-' + process.pid + '.json');
+});
+test.after(() => {
+  if (PREV_LOCKS_ENV === undefined) delete process.env.ANTIGRAVITY_MODEL_LOCKS_PATH;
+  else process.env.ANTIGRAVITY_MODEL_LOCKS_PATH = PREV_LOCKS_ENV;
+});
 const { createCopilotEngine } = require(path.join(__dirname, '..', 'engines', 'copilot_engine.js'));
 const { ensureGeminiTemporaryChat, inspectGeminiTemporaryChatDom } = require(path.join(__dirname, '..', 'engines', 'gemini_engine.js'));
 

@@ -11,6 +11,15 @@ const { execFileSync } = require('node:child_process');
 const { createCopilotEngine } = require('../engines/copilot_engine.js');
 const { createLocalExecutor } = require('../pipeline/local_executor.js');
 
+const PREV_LOCKS_ENV = process.env.ANTIGRAVITY_MODEL_LOCKS_PATH;
+test.before(() => {
+  process.env.ANTIGRAVITY_MODEL_LOCKS_PATH = path.join(os.tmpdir(), 'ag-no-locks-batch2-' + process.pid + '.json');
+});
+test.after(() => {
+  if (PREV_LOCKS_ENV === undefined) delete process.env.ANTIGRAVITY_MODEL_LOCKS_PATH;
+  else process.env.ANTIGRAVITY_MODEL_LOCKS_PATH = PREV_LOCKS_ENV;
+});
+
 function createMockDom() {
   const allElements = [];
 

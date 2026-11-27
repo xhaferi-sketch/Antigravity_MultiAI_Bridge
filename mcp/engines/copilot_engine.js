@@ -2,6 +2,7 @@
 
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { buildCopilotLockContract } = require('../pipeline/model_locks');
 
 const NL = String.fromCharCode(10);
 const FENCE3 = String.fromCharCode(96, 96, 96);
@@ -146,16 +147,178 @@ function createCopilotEngine(runtimeContext) {
     return checkAuthExpired(page, tabKey, tabAuthStatus);
   }
 
+  async function discoverCopilotLiveOptions(targetFrame, opts) {
+    opts = opts || {};
+    const collectFromTarget = async function(frameOrPage, arg) {
+      return await frameOrPage.evaluate(async function(a) {
+        const sleep = function(ms) { return new Promise(function(resolve) { setTimeout(resolve, ms); }); };
+        const visible = function(el) {
+          if (!el || el.isConnected === false) return false;
+          const s = getComputedStyle(el), r = el.getBoundingClientRect();
+          return s.display !== 'none' && s.visibility !== 'hidden' && parseFloat(s.opacity || '1') > 0.05 && r.width > 4 && r.height > 4;
+        };
+        const rawTextOf = function(el) {
+          const inner = String((el && el.innerText) || '').trim();
+          const aria = String((el && typeof el.getAttribute === 'function' && el.getAttribute('aria-label')) || '').trim();
+          const title = String((el && typeof el.getAttribute === 'function' && el.getAttribute('title')) || '').trim();
+          return { inner: inner, aria: aria, title: title };
+        };
+        const text = function(el) {
+          const t = rawTextOf(el);
+          return (t.inner + ' ' + t.aria + ' ' + t.title).replace(/\s+/g, ' ').trim();
+        };
+        const cleanOptionLabel = function(el) {
+          const t = rawTextOf(el);
+          const primary = t.inner || t.aria || t.title || '';
+          const lines = primary.split(/\r?\n/).map(function(l) { return l.replace(/\s+/g, ' ').trim(); }).filter(Boolean);
+          const shortLabel = lines[0] || primary.replace(/\s+/g, ' ').trim();
+          const fullLabel = lines.join(' — ') || shortLabel;
+          return { shortLabel: shortLabel, label: fullLabel };
+        };
+        const isControlActive = function(el) {
+          if (!el || typeof el.getAttribute !== 'function') return false;
+          if (el.getAttribute('aria-checked') === 'true' || el.getAttribute('aria-selected') === 'true' || el.getAttribute('aria-pressed') === 'true') return true;
+          return Boolean(typeof el.querySelector === 'function' && el.querySelector('[aria-checked="true"], [data-icon-name*="Check"], svg[data-icon-name*="Check"]'));
+        };
+        const fireRealishClick = function(el) {
+          if (el && typeof el.click === 'function') el.click();
+        };
+
+        const selectors = 'button[aria-label*="model" i],button[aria-label*="mode" i],[data-testid*="model-switcher" i],[data-testid*="mode-selector" i],.fui-Dropdown';
+        const menuSelector = '.fui-MenuPopover, .fui-PopoverSurface, [role="menu"], [role="listbox"], [role="dialog"], [role="radiogroup"], .fui-MenuList, [data-popper-placement], [class*="MenuPopover" i], [class*="PopoverSurface" i]';
+        const optionSelector = '[role="option"],[role="menuitemradio"],[role="menuitem"],[role="menuitemcheckbox"],[role="radio"],.fui-MenuItem,.fui-Option,[data-testid*="gptSubMenuModelTrigger-"],[data-testid*="model" i] button,button,[role="button"]';
+
+        const findTrigger = function() {
+          const tagged = document.querySelector('[data-ag-model-trigger="1"]');
+          if (tagged && visible(tagged)) return tagged;
+          const direct = Array.from(document.querySelectorAll(selectors)).filter(visible).find(function(el) {
+            return !el.closest('[role="menu"], [role="listbox"], .fui-MenuPopover') &&
+              !/\b(dark\s*mode|light\s*mode|color\s*mode|theme|sidebar|navigation)\b/i.test(text(el));
+          }) || null;
+          if (direct) return direct;
+          return Array.from(document.querySelectorAll('button,[role="button"]')).filter(visible).find(function(el) {
+            if (el.closest('[role="menu"], [role="listbox"], .fui-MenuPopover')) return false;
+            return /model selector|gpt-5\.6|sol\s*think|think\s*deeper|quick\s*response|\bauto\b/i.test(text(el)) &&
+              !/\b(dark\s*mode|light\s*mode|color\s*mode|theme|sidebar|navigation)\b/i.test(text(el));
+          }) || null;
+        };
+
+        const btn = findTrigger();
+        let activeLabel = btn ? cleanOptionLabel(btn).shortLabel : '';
+        if (!btn && !a.collectOnly) {
+          return { ok: false, reason: 'COPILOT_MODEL_TRIGGER_NOT_FOUND', active: '', options: [] };
+        }
+        if (btn && typeof btn.setAttribute === 'function') {
+          btn.setAttribute('data-ag-model-trigger', '1');
+          const tBtn = rawTextOf(btn);
+          activeLabel = (tBtn.inner || tBtn.aria || '').replace(/\s+/g, ' ').trim() || activeLabel;
+        }
+
+        const getVisibleMenus = function() {
+          return Array.from(document.querySelectorAll(menuSelector)).filter(visible);
+        };
+
+        if (!a.collectOnly && getVisibleMenus().length === 0 && btn) {
+          fireRealishClick(btn);
+          const openDeadline = Date.now() + 1400;
+          while (getVisibleMenus().length === 0 && Date.now() < openDeadline) {
+            await sleep(100);
+          }
+        } else if (a.collectOnly) {
+          const waitDeadline = Date.now() + 1800;
+          while (getVisibleMenus().length === 0 && Date.now() < waitDeadline) {
+            await sleep(100);
+          }
+        }
+
+        const menus = getVisibleMenus();
+        for (const m of menus) {
+          const subs = Array.from(m.querySelectorAll('[role="menuitem"][aria-haspopup="menu"],[role="menuitem"][aria-haspopup="true"],[role="menuitem"][aria-haspopup="listbox"],[aria-haspopup="menu"],[aria-haspopup="true"],[aria-haspopup="listbox"]')).filter(function(el) {
+            if (!visible(el)) return false;
+            const role = typeof el.getAttribute === 'function' ? el.getAttribute('role') : null;
+            return role !== 'menuitemradio' && role !== 'option' && role !== 'radio';
+          });
+          for (const s of subs) {
+            if (typeof s.dispatchEvent === 'function' && typeof MouseEvent === 'function') {
+              try { s.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true })); } catch (_) {}
+            }
+            if (typeof s.click === 'function') { s.click(); await sleep(250); }
+          }
+        }
+
+        const allMenus = getVisibleMenus();
+        const options = [];
+        const seen = new Set();
+        for (const m of allMenus) {
+          for (const el of Array.from(m.querySelectorAll(optionSelector))) {
+            if (seen.has(el) || !visible(el) || el === btn) continue;
+            seen.add(el);
+            const popup = el.getAttribute ? el.getAttribute('aria-haspopup') : null;
+            if (popup === 'menu' || popup === 'true' || popup === 'listbox') continue;
+            const rawCombined = text(el);
+            if (rawCombined.length <= 1 || rawCombined.length >= 260 || /\b(dark\s*mode|light\s*mode|theme|sidebar|settings|cookie)\b/i.test(rawCombined)) continue;
+            const parsed = cleanOptionLabel(el);
+            if (!parsed.shortLabel || parsed.shortLabel.length < 2) continue;
+            if (!options.some(function(o) { return (o.shortLabel || o.label).toLowerCase() === parsed.shortLabel.toLowerCase(); })) {
+              options.push({
+                label: parsed.label,
+                shortLabel: parsed.shortLabel,
+                selected: isControlActive(el)
+              });
+            }
+          }
+        }
+
+        if (a.closeAfter !== false && (options.length > 0 || a.forceClose)) {
+          try { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true })); } catch (_) {}
+        }
+        return {
+          ok: true,
+          active: activeLabel,
+          options: options,
+          debug: { menuCount: allMenus.length }
+        };
+      }, arg).catch(function(err) {
+        return { ok: false, reason: String(err && err.message || err), active: '', options: [] };
+      });
+    };
+
+    let res = await collectFromTarget(targetFrame, { collectOnly: false, closeAfter: false });
+    if (res && res.ok && (!res.options || res.options.length === 0) && typeof targetFrame.locator === 'function') {
+      try {
+        await targetFrame.locator('[data-ag-model-trigger="1"]').first().click({ timeout: 5000 });
+        await new Promise(function(r) { setTimeout(r, 700); });
+        res = await collectFromTarget(targetFrame, { collectOnly: true, closeAfter: true, forceClose: true });
+        if ((!res.options || res.options.length === 0) && typeof targetFrame.page === 'function') {
+          const parentPage = targetFrame.page();
+          if (parentPage && parentPage !== targetFrame) {
+            const pageRes = await collectFromTarget(parentPage, { collectOnly: true, closeAfter: true, forceClose: true });
+            if (pageRes && pageRes.options && pageRes.options.length > 0) {
+              pageRes.active = res.active || pageRes.active;
+              res = pageRes;
+            }
+          }
+        }
+      } catch (_) {}
+    } else if (res && res.ok && res.options && res.options.length > 0) {
+      await targetFrame.evaluate(function() {
+        try { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true })); } catch (_) {}
+      }).catch(function() {});
+    }
+    return res;
+  }
+
   async function ensureCopilotGpt56Model(targetFrame, tabKey, opts) {
     opts = opts || {};
-    const contract = opts.contract || COPILOT_REQUIRED_MODEL;
+    const contract = opts.contract || buildCopilotLockContract(tabKey, COPILOT_REQUIRED_MODEL, opts.locksPath);
     if (tabKey && copilotModelReceipts) copilotModelReceipts[tabKey] = null;
-    const result = await targetFrame.evaluate(async function(req) {
+    const evaluateEnsure = async function() {
+      return await targetFrame.evaluate(async function(req) {
       const sleep = function(ms) {
         return new Promise(function(resolve) { setTimeout(resolve, ms); });
       };
       const visible = function(el) {
-        if (!el || !el.isConnected) return false;
+        if (!el || el.isConnected === false) return false;
         const s = getComputedStyle(el), r = el.getBoundingClientRect();
         return s.display !== 'none' && s.visibility !== 'hidden' && parseFloat(s.opacity || '1') > 0.05 && r.width > 4 && r.height > 4;
       };
@@ -167,9 +330,9 @@ function createCopilotEngine(runtimeContext) {
         ).replace(/\s+/g, ' ').trim();
       };
       const selectors = 'button[aria-label*="model" i],button[aria-label*="mode" i],[data-testid*="model-switcher" i],[data-testid*="mode-selector" i],.fui-Dropdown';
-      const menuSelector = '.fui-MenuPopover, .fui-PopoverSurface, [role="menu"], [role="listbox"], .fui-MenuList';
-      const optionSelector = '[role="option"],[role="menuitemradio"],[role="menuitem"],[role="menuitemcheckbox"],.fui-MenuItem,.fui-Option,[data-testid*="gptSubMenuModelTrigger-"],button';
-      const submenuTriggerSelector = '[data-testid*="gptSubMenuModelTrigger"],[role="menuitem"][aria-haspopup="menu"],[role="menuitem"][aria-haspopup="true"],[role="menuitem"][aria-haspopup="listbox"]';
+      const menuSelector = '.fui-MenuPopover, .fui-PopoverSurface, [role="menu"], [role="listbox"], [role="dialog"], [role="radiogroup"], .fui-MenuList, [data-popper-placement], [class*="MenuPopover" i], [class*="PopoverSurface" i]';
+      const optionSelector = '[role="option"],[role="menuitemradio"],[role="menuitem"],[role="menuitemcheckbox"],[role="radio"],.fui-MenuItem,.fui-Option,[data-testid*="gptSubMenuModelTrigger-"],[data-testid*="model" i] button,button,[role="button"]';
+      const submenuTriggerSelector = '[role="menuitem"][aria-haspopup="menu"],[role="menuitem"][aria-haspopup="true"],[role="menuitem"][aria-haspopup="listbox"],[aria-haspopup="menu"],[aria-haspopup="true"],[aria-haspopup="listbox"]';
       const isExcludedControl = function(val) {
         return /\b(dark\s*mode|light\s*mode|color\s*mode|theme|sidebar|navigation|history|voice|microphone|dictate|attach|upload|settings|cookie)\b/i.test(String(val || ''));
       };
@@ -271,6 +434,7 @@ function createCopilotEngine(runtimeContext) {
       const openModelMenuOnce = async function(btn) {
         const existing = getVisibleMenus();
         if (existing.length > 0) return existing;
+        if (btn && typeof btn.setAttribute === 'function') btn.setAttribute('data-ag-model-trigger', '1');
         if (btn && typeof btn.click === 'function') btn.click();
         const deadline = Date.now() + 2500;
         while (Date.now() <= deadline) {
@@ -316,7 +480,7 @@ function createCopilotEngine(runtimeContext) {
             const popup = typeof el.getAttribute === 'function' ? el.getAttribute('aria-haspopup') : null;
             if (popup === 'menu' || popup === 'true' || popup === 'listbox') continue;
             const t = text(el);
-            if (t.length <= 2 || t.length >= 120 || isExcludedControl(t)) continue;
+            if (t.length <= 2 || t.length >= 260 || isExcludedControl(t)) continue;
             unique.push(el);
           }
         }
@@ -324,6 +488,42 @@ function createCopilotEngine(runtimeContext) {
       };
 
       let button = getModelButton();
+      if (req.customLocked) {
+        const want = String(req.modelLabel || '').toLowerCase().trim();
+        const curText = button ? text(button).toLowerCase() : '';
+        if (button && want && curText.includes(want)) {
+          return { ok: true, active: text(button), reasoningLocked: true, customLocked: true };
+        }
+        if (!button) {
+          return { ok: false, reason: 'COPILOT_REQUIRED_MODEL_NOT_ACTIVE', active: 'missing', reasoningLocked: false };
+        }
+        const menus = await expandSubmenus(await openModelMenuOnce(button));
+        const options = collectMenuOptions(menus);
+        const available = options.map(function(o) { return text(o); }).filter(Boolean).slice(0, 25);
+        const match = options.find(function(el) {
+          const v = text(el).toLowerCase();
+          return v === want || v.includes(want);
+        }) || null;
+        if (!match) {
+          await closeMenus();
+          return { ok: false, reason: 'COPILOT_USER_LOCKED_MODEL_UNAVAILABLE', active: text(button), available: available, hasMenu: menus.length > 0, reasoningLocked: false };
+        }
+        if (!isControlActive(match) && typeof match.click === 'function') {
+          if (typeof match.setAttribute === 'function') match.setAttribute('data-ag-model-option', '1');
+          match.click();
+          await sleep(450);
+        }
+        await closeMenus();
+        const finalBtn = getModelButton() || button;
+        const finalTxt = finalBtn ? text(finalBtn) : '';
+        return {
+          ok: true,
+          active: finalTxt || req.modelLabel,
+          needsPlaywrightOptionClick: Boolean(want && !finalTxt.toLowerCase().includes(want)),
+          reasoningLocked: true,
+          customLocked: true
+        };
+      }
       if (button && requiredModelVisible(text(button)) && hasDeepReasoningSignal(text(button)) && !isForbiddenWeakModel(text(button))) {
         return { ok: true, active: text(button), reasoningLocked: true };
       }
@@ -436,7 +636,29 @@ function createCopilotEngine(runtimeContext) {
         reasoningLocked: true,
         fallbackUsed: Boolean(usingThinkDeeperFallback && !(pillHasModel || menuHasModel))
       };
-    }, contract);
+      }, contract);
+    };
+    let result = await evaluateEnsure();
+    if (typeof targetFrame.locator === 'function') {
+      if ((!result || !result.ok) && result && result.hasMenu === false) {
+        try {
+          await targetFrame.locator('[data-ag-model-trigger="1"]').first().click({ timeout: 5000 });
+          await new Promise(function(r) { setTimeout(r, 700); });
+          result = await evaluateEnsure();
+        } catch (_) {}
+      }
+      if (result && result.ok && result.needsPlaywrightOptionClick) {
+        try {
+          await targetFrame.locator('[data-ag-model-trigger="1"]').first().click({ timeout: 5000 });
+          await new Promise(function(r) { setTimeout(r, 500); });
+          if (await targetFrame.locator('[data-ag-model-option="1"]').count() > 0) {
+            await targetFrame.locator('[data-ag-model-option="1"]').first().click({ timeout: 5000 });
+            await new Promise(function(r) { setTimeout(r, 600); });
+            result = await evaluateEnsure();
+          }
+        } catch (_) {}
+      }
+    }
 
     if (!result || !result.ok || result.reasoningLocked === false) {
       const availInfo = Array.isArray(result && result.available) && result.available.length ? (', available: [' + result.available.join(' | ') + ']') : '';
@@ -463,6 +685,7 @@ function createCopilotEngine(runtimeContext) {
   return {
     findChatFrameOrPage,
     checkAuthExpired: checkAuth,
+    discoverCopilotLiveOptions,
     ensureCopilotGpt56Model,
     buildCopilotPromptWithContract,
     COPILOT_REQUIRED_MODEL,

@@ -2,6 +2,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { buildGeminiLockContract } = require('../pipeline/model_locks');
 
 const GEMINI_APP_URL = 'https://' + 'gemini.' + 'google.com' + '/app';
 
@@ -57,6 +58,8 @@ function resolveGeminiHardCapMs(args) {
 
   if (
     normalizedReasoning === 'high' ||
+    normalizedReasoning === 'medium' ||
+    normalizedReasoning === 'balanced' ||
     normalizedReasoning === 'extra_thorough' ||
     normalizedReasoning === 'extra thorough'
   ) {
@@ -64,8 +67,9 @@ function resolveGeminiHardCapMs(args) {
   }
 
   if (
-    /(?:^|[\s_.-])(neon|argon|pro|thinking|reasoning)[\s_.-]*high(?:$|[\s_.-])/.test(tier) ||
+    /(?:^|[\s_.-])(neon|argon|pro|thinking|reasoning)[\s_.-]*(?:high|medium)(?:$|[\s_.-])/.test(tier) ||
     tier === 'high' ||
+    tier === 'medium' ||
     tier === 'high_reasoning'
   ) {
     return HIGH_REASONING_HARD_CAP_MS;
@@ -74,7 +78,7 @@ function resolveGeminiHardCapMs(args) {
   if (
     normalizedReasoning !== 'low' &&
     /\b(neon|argon|pro)\b/.test(active) &&
-    /\b(high|extra\s+thorough)\b/.test(active) &&
+    /\b(high|medium|extra\s+thorough)\b/.test(active) &&
     !/\b(low|fast|flash|lite)\b/.test(active)
   ) {
     return HIGH_REASONING_HARD_CAP_MS;
@@ -792,22 +796,188 @@ function createGeminiEngine(runtimeContext) {
   const captureSupportEvidence = runtimeContext.captureSupportEvidence || (async function() {});
   const dispatchToWebTab = runtimeContext.dispatchToWebTab || null;
 
+  async function discoverGeminiLiveOptions(targetFrame, opts) {
+    opts = opts || {};
+    return await targetFrame.evaluate(async function(arg) {
+      const sleep = function(ms) { return new Promise(function(r) { setTimeout(r, ms); }); };
+      const normalize = function(s) { return String(s || '').toLowerCase().replace(/\s+/g, ' ').trim(); };
+      const actionable = function(el) {
+        if (!el || el.isConnected === false) return false;
+        const st = window.getComputedStyle(el);
+        const r = el.getBoundingClientRect();
+        if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') <= 0.05 || r.width <= 3 || r.height <= 3) return false;
+        const pane = typeof el.closest === 'function' ? el.closest('.cdk-overlay-pane, [role="menu"], .mat-mdc-menu-panel') : null;
+        if (pane) {
+          const pst = window.getComputedStyle(pane);
+          if (pst.display === 'none' || pst.visibility === 'hidden' || parseFloat(pst.opacity || '1') <= 0.05) return false;
+        }
+        return true;
+      };
+      const isChecked = function(el) {
+        return el.getAttribute('aria-checked') === 'true' ||
+          el.getAttribute('aria-selected') === 'true' ||
+          Boolean(el.querySelector && el.querySelector('mat-icon[fonticon="check"], [aria-label*="selected" i]'));
+      };
+      const dismissOverlays = async function() {
+        document.querySelectorAll('.cdk-overlay-backdrop').forEach(function(b) { b.click(); });
+        try { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true })); } catch (_) {}
+        await sleep(200);
+      };
+      const findTrigger = function() {
+        const candidates = Array.from(document.querySelectorAll('button[data-test-id*="model"], bard-mode-switcher button, button[aria-haspopup="menu"], button[aria-haspopup="true"], button, [role="button"], [role="combobox"]'))
+          .filter(function(el) { return actionable(el) && !el.closest('[role="menu"], [role="listbox"], .cdk-overlay-pane'); });
+        return candidates.find(function(el) {
+          const txt = normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('data-test-id') || ''));
+          return /currently neon|open mode picker|mode picker|model selector|zgjidh modelin|deeper analysis|4 neon|\bneon\b|\bcarbon\b|\bhydrogen\b|code & complex|everyday help|currently\s*(?:fast|flash|auto|pro|thinking|carbon|hydrogen|neon)/i.test(txt);
+        }) || null;
+      };
+      const extractModelShortLabel = function(rawText) {
+        const lines = String(rawText || '').split(/\r?\n/).map(function(s) { return s.trim(); }).filter(Boolean);
+        if (lines.length === 0) return '';
+        const canonical = lines.find(function(line) {
+          return /^(?:\d+(?:\.\d+)?\s+)?(?:auto|hydrogen|neon|carbon|flash|pro|ultra|gemini)\b/i.test(line);
+        }) || lines.find(function(line) {
+          return /^\d+(?:\.\d+)?\s+[a-z]/i.test(line);
+        }) || lines[0];
+        return canonical;
+      };
+      const extractReasonShortLabel = function(rawText) {
+        const line = String(rawText || '').split(/\r?\n/).map(function(s) { return s.trim(); }).filter(Boolean)[0] || '';
+        const m = line.match(/^(low|medium|high|fast)\b/i);
+        if (m) return m[1].charAt(0).toUpperCase() + m[1].slice(1).toLowerCase();
+        return line.replace(/\s*\([^)]*\)\s*$/, '').trim() || line;
+      };
+
+      await dismissOverlays();
+      const trigger = findTrigger();
+      if (!trigger) return { ok: false, reason: 'MODEL_TRIGGER_NOT_FOUND', models: [], thinkingLevels: [] };
+      const activeText = String(trigger.innerText || '').trim();
+      const activeAria = String(trigger.getAttribute('aria-label') || '').trim();
+
+      trigger.click();
+      await sleep(600);
+
+      const getMenuOptions = function() {
+        const menus = Array.from(document.querySelectorAll('[role="menu"], [role="listbox"], mat-menu-content, .cdk-overlay-pane'));
+        return menus.flatMap(function(m) {
+          return Array.from(m.querySelectorAll('[role="menuitemradio"], [role="menuitem"], [role="option"], gem-menu-item'));
+        }).filter(actionable);
+      };
+
+      let rawOptions = getMenuOptions();
+      const optDeadline = Date.now() + 1800;
+      while (rawOptions.length === 0 && Date.now() < optDeadline) {
+        await sleep(150);
+        rawOptions = getMenuOptions();
+      }
+      const models = [];
+      rawOptions.forEach(function(el) {
+        const txt = String(el.innerText || el.getAttribute('aria-label') || '').trim();
+        const norm = normalize(txt);
+        if (!txt || /thinking level|reasoning level|niveli i mendimit/i.test(norm)) return;
+        if (/^(?:low|medium|high)\b|fast and efficient|balanced depth|extra thorough/i.test(norm)) return;
+        const shortLabel = extractModelShortLabel(txt);
+        if (!models.some(function(m) { return normalize(m.label) === norm; })) {
+          models.push({ label: txt, shortLabel: shortLabel, selected: isChecked(el) });
+        }
+      });
+
+      if (arg && arg.preselectModelLabel) {
+        const want = normalize(arg.preselectModelLabel);
+        const match = rawOptions.find(function(el) {
+          const t = normalize(el.innerText || el.getAttribute('aria-label') || '');
+          return t === want || t.includes(want);
+        });
+        if (match && !isChecked(match)) {
+          match.click();
+          await sleep(800);
+        }
+      }
+
+      let afterOptions = getMenuOptions();
+      let thinkItem = afterOptions.find(function(el) {
+        return /thinking level|reasoning level|niveli i mendimit/i.test(normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || '')));
+      }) || null;
+      if (!thinkItem) {
+        const tr2 = findTrigger();
+        if (tr2) {
+          tr2.click();
+          await sleep(500);
+          afterOptions = getMenuOptions();
+          thinkItem = afterOptions.find(function(el) {
+            return /thinking level|reasoning level|niveli i mendimit/i.test(normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || '')));
+          }) || null;
+        }
+      }
+
+      const thinkingLevels = [];
+      const collectLevels = function() {
+        const subOpts = getMenuOptions();
+        subOpts.forEach(function(el) {
+          const txt = String(el.innerText || el.getAttribute('aria-label') || '').trim();
+          const norm = normalize(txt);
+          if (!txt || /thinking level|reasoning level|niveli i mendimit/i.test(norm)) return;
+          if (models.some(function(m) { return normalize(m.label) === norm; })) return;
+          if (/\b(?:4\s*hydrogen|4\s*neon|4\s*carbon|adapts\s*to\s*your\s*needs|everyday\s*help|deeper\s*analysis|code\s*&\s*complex)\b/i.test(norm)) return;
+          if (!thinkingLevels.some(function(lv) { return normalize(lv.label) === norm; })) {
+            thinkingLevels.push({ label: txt, shortLabel: extractReasonShortLabel(txt), selected: isChecked(el) });
+          }
+        });
+      };
+      collectLevels();
+      if (thinkingLevels.length === 0 && thinkItem) {
+        thinkItem.click();
+        const tlDeadline = Date.now() + 1200;
+        while (thinkingLevels.length === 0 && Date.now() < tlDeadline) {
+          await sleep(150);
+          collectLevels();
+        }
+        if (thinkingLevels.length === 0) {
+          thinkItem.click();
+          const tlDeadline2 = Date.now() + 1000;
+          while (thinkingLevels.length === 0 && Date.now() < tlDeadline2) {
+            await sleep(150);
+            collectLevels();
+          }
+        }
+      }
+
+      await dismissOverlays();
+      return { ok: true, activeText: activeText, activeAria: activeAria, models: models, thinkingLevels: thinkingLevels };
+    }, opts).catch(function(err) {
+      return { ok: false, reason: String(err && err.message || err), models: [], thinkingLevels: [] };
+    });
+  }
+
   async function ensureGeminiNeonModel(targetFrame, tabKey, opts) {
     opts = opts || {};
     invalidateGeminiReceipt(tabKey);
+    const activeContract = opts.lockContract || buildGeminiLockContract(tabKey, GEMINI_REQUIRED_MODEL, opts.locksPath);
 
     const receipt = await targetFrame.evaluate(async function(required) {
       const sleep = function(ms) { return new Promise(function(r) { setTimeout(r, ms); }); };
       const normalize = function(s) { return String(s || '').toLowerCase().replace(/\s+/g, ' ').trim(); };
       const actionable = function(el) {
-        if (!el) return false;
+        if (!el || el.isConnected === false) return false;
         const st = window.getComputedStyle(el);
         const r = el.getBoundingClientRect();
-        return st.display !== 'none' && st.visibility !== 'hidden' && r.width > 3 && r.height > 3;
+        if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') <= 0.05 || r.width <= 3 || r.height <= 3) return false;
+        const pane = typeof el.closest === 'function' ? el.closest('.cdk-overlay-pane, [role="menu"], .mat-mdc-menu-panel') : null;
+        if (pane) {
+          const pst = window.getComputedStyle(pane);
+          if (pst.display === 'none' || pst.visibility === 'hidden' || parseFloat(pst.opacity || '1') <= 0.05) return false;
+        }
+        return true;
       };
 
       const menuRe = new RegExp(required.menuPattern, 'i');
       const activeRe = new RegExp(required.activePattern, 'i');
+      const isCustom = Boolean(required.customLocked);
+      const rawCustomReason = String(required.reasoningLabel || '').trim() ||
+        (normalize(required.reasoning || '') === 'custom' ? '' : String(required.reasoning || '').trim());
+      const customReasonNorm = normalize(rawCustomReason);
+      const customModelNorm = normalize(required.modelLabel || '');
+      const customModelBare = customModelNorm.replace(/^\d+(?:\.\d+)?\s+/, '').trim();
 
       const findTrigger = function() {
         const candidates = Array.from(document.querySelectorAll('button[data-test-id*="model"], bard-mode-switcher button, button[aria-haspopup="menu"], button[aria-haspopup="true"], button, [role="button"], [role="combobox"]'))
@@ -816,7 +986,7 @@ function createGeminiEngine(runtimeContext) {
           });
         return candidates.find(function(el) {
           const txt = normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('data-test-id') || ''));
-          return /currently neon|open mode picker|mode picker|model selector|zgjidh modelin|deeper analysis|4 neon|\bneon\b|currently\s*(?:fast|flash|auto|pro|thinking)/i.test(txt);
+          return /currently neon|open mode picker|mode picker|model selector|zgjidh modelin|deeper analysis|4 neon|\bneon\b|\bcarbon\b|\bhydrogen\b|code & complex|everyday help|currently\s*(?:fast|flash|auto|pro|thinking|carbon|hydrogen|neon)/i.test(txt);
         }) || null;
       };
 
@@ -826,11 +996,21 @@ function createGeminiEngine(runtimeContext) {
       // DETYRIM LIGJOR: VETËM "NEON HIGH" (EXTRA THOROUGH).
       // BUTONI DUHET TË KETË TEKSTIN 'Neon\nHigh' DHE ARIA 'Open mode picker, currently Neon High'.
       // ÇDO AGJENT DUHET TË RESPEKTOJË KËTË BLLOKIM PA ASNJË MODIFIKIM!
+      // (Kur përdoruesi ka kyçur eksplicitisht një zgjedhje në model_locks.json,
+      //  customLocked=true zbaton vetëm zgjedhjen e kyçur të përdoruesit.)
       // ============================================================================
       const readTriggerState = function(trigger) {
         const text = String(trigger ? (trigger.innerText || '') : '').trim();
         const aria = String(trigger ? (trigger.getAttribute('aria-label') || '') : '').trim();
         const combined = normalize(text + ' ' + aria);
+        if (isCustom) {
+          const hasCustomModel = activeRe.test(combined) ||
+            (customModelNorm && combined.includes(customModelNorm)) ||
+            (customModelBare && customModelBare.length >= 3 && combined.includes(customModelBare)) ||
+            menuRe.test(combined);
+          const hasCustomReason = !customReasonNorm || combined.includes(customReasonNorm);
+          return { text: text, aria: aria, active: Boolean(hasCustomModel && hasCustomReason) };
+        }
         const isNeonHighAria = /currently\s*neon\s*high/i.test(aria);
         const isNeonHighText = /neon[\s\n]+high/i.test(text);
         const isNeonLowAria = /currently\s*neon$/i.test(aria) || /currently\s*neon\s*(?:low|fast)/i.test(aria) || /currently\s*(?:flash|auto|quick|low|fast)/i.test(aria);
@@ -875,7 +1055,9 @@ function createGeminiEngine(runtimeContext) {
 
         const neonMatches = options.filter(function(el) {
           const txt = normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || ''));
-          return menuRe.test(txt);
+          return menuRe.test(txt) ||
+            (isCustom && customModelNorm && txt.includes(customModelNorm)) ||
+            (isCustom && customModelBare && customModelBare.length >= 3 && txt.includes(customModelBare));
         });
         const neonOption = neonMatches.length > 0 ? neonMatches[neonMatches.length - 1] : null;
 
@@ -887,7 +1069,6 @@ function createGeminiEngine(runtimeContext) {
         neonOption.click();
         await sleep(800);
 
-        // Siguro përzgjedhjen e Thinking Level -> High Extra thorough (RREGULL I KYÇUR)
         const findThinkItem = function() {
           return Array.from(document.querySelectorAll('[role="menuitemradio"], [role="menuitem"], [role="option"], gem-menu-item, button'))
             .filter(actionable)
@@ -897,7 +1078,7 @@ function createGeminiEngine(runtimeContext) {
             }) || null;
         };
         let thinkItem = findThinkItem();
-        if (!thinkItem) {
+        if (!isCustom && !thinkItem) {
           const directHigh = Array.from(document.querySelectorAll('gem-menu-item, [role="menuitemradio"], [role="menuitem"], [role="option"]'))
             .filter(actionable)
             .find(function(el) {
@@ -912,17 +1093,30 @@ function createGeminiEngine(runtimeContext) {
             directHigh.click();
             await sleep(500);
           }
+        } else if (isCustom && customReasonNorm && !thinkItem) {
+          trigger = findTrigger();
+          if (trigger) { trigger.click(); await sleep(500); }
+          thinkItem = findThinkItem();
         }
-        if (thinkItem) {
+        if (thinkItem && (!isCustom || customReasonNorm)) {
           thinkItem.click();
           await sleep(500);
           const subOptions = Array.from(document.querySelectorAll('gem-menu-item, [role="menuitemradio"], [role="menuitem"], [role="option"]')).filter(actionable);
-          const highOption = subOptions.find(function(el) {
-            const txt = normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || ''));
-            return (/high.*thorough|extra\s*thorough|(^|\s)high(\s|$)/i.test(txt)) && !/\b(?:low|fast)\b/i.test(txt);
-          });
-          if (highOption) {
-            highOption.click();
+          const desiredOption = isCustom
+            ? (subOptions.find(function(el) {
+                const txt = normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || ''));
+                return txt === customReasonNorm || txt.includes(customReasonNorm);
+              }) || null)
+            : (subOptions.find(function(el) {
+                const txt = normalize((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || ''));
+                return (/high.*thorough|extra\s*thorough|(^|\s)high(\s|$)/i.test(txt)) && !/\b(?:low|fast)\b/i.test(txt);
+              }) || null);
+          if (isCustom && customReasonNorm && !desiredOption) {
+            await dismissOverlays();
+            return { ok: false, code: 'MODEL_LOCK_REASONING_NOT_FOUND', debug: { wantedReasoning: customReasonNorm } };
+          }
+          if (desiredOption) {
+            desiredOption.click();
             await sleep(500);
           }
         }
@@ -967,13 +1161,15 @@ function createGeminiEngine(runtimeContext) {
         thinkingSelectorRequired: false
       };
     }, {
-      family: GEMINI_REQUIRED_MODEL.family,
-      menuPattern: GEMINI_REQUIRED_MODEL.menuPattern,
-      activePattern: GEMINI_REQUIRED_MODEL.activePattern,
-      modelLabel: GEMINI_REQUIRED_MODEL.modelLabel,
-      displayLabel: GEMINI_REQUIRED_MODEL.displayLabel,
-      reasoning: GEMINI_REQUIRED_MODEL.reasoning,
-      reasoningSource: GEMINI_REQUIRED_MODEL.reasoningSource,
+      family: activeContract.family,
+      menuPattern: activeContract.menuPattern,
+      activePattern: activeContract.activePattern,
+      modelLabel: activeContract.modelLabel,
+      displayLabel: activeContract.displayLabel,
+      reasoning: activeContract.reasoning,
+      reasoningLabel: activeContract.reasoningLabel || '',
+      reasoningSource: activeContract.reasoningSource,
+      customLocked: Boolean(activeContract.customLocked),
       timeoutMs: opts.timeoutMs || 15000
     });
 
@@ -986,21 +1182,22 @@ function createGeminiEngine(runtimeContext) {
 
     geminiModelReceipts[tabKey] = {
       verified: true,
-      family: GEMINI_REQUIRED_MODEL.family,
-      modelLabel: GEMINI_REQUIRED_MODEL.modelLabel,
-      displayLabel: GEMINI_REQUIRED_MODEL.displayLabel,
-      reasoning: GEMINI_REQUIRED_MODEL.reasoning,
-      reasoningSource: GEMINI_REQUIRED_MODEL.reasoningSource,
+      family: activeContract.family,
+      modelLabel: activeContract.modelLabel,
+      displayLabel: activeContract.displayLabel,
+      reasoning: activeContract.reasoning,
+      reasoningSource: activeContract.reasoningSource,
       stablePolls: 2,
-      thinkingSelectorRequired: false
+      thinkingSelectorRequired: false,
+      customLocked: Boolean(activeContract.customLocked)
     };
 
-    tabActiveModel[tabKey] = GEMINI_REQUIRED_MODEL.displayLabel;
-    tabDiscoveredModels[tabKey] = GEMINI_REQUIRED_MODEL.menuLabel;
+    tabActiveModel[tabKey] = activeContract.displayLabel;
+    tabDiscoveredModels[tabKey] = activeContract.menuLabel;
 
-    console.error('[MODEL_STATE_OBSERVED] tabKey=' + tabKey + ' model=' + GEMINI_REQUIRED_MODEL.modelLabel + ' reasoning=' + GEMINI_REQUIRED_MODEL.reasoning);
+    console.error('[MODEL_STATE_OBSERVED] tabKey=' + tabKey + ' model=' + activeContract.modelLabel + ' reasoning=' + activeContract.reasoning);
     console.error('[MODEL_STATE_VERIFIED] tabKey=' + tabKey + ' receipt=' + JSON.stringify(geminiModelReceipts[tabKey]));
-    return GEMINI_REQUIRED_MODEL.displayLabel;
+    return activeContract.displayLabel;
   }
 
   async function handleDiagnostics(args) {
@@ -1022,6 +1219,7 @@ function createGeminiEngine(runtimeContext) {
   }
 
   return {
+    discoverGeminiLiveOptions,
     ensureGeminiNeonModel,
     inspectGeminiTemporaryChatDom,
     ensureGeminiTemporaryChat,
